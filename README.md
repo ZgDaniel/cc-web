@@ -2,6 +2,9 @@
 
 Claude Code 轻量级 Web 远程工具 — 在浏览器中与 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 交互。
 
+![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-blue)
+
 Vibe产物，readme比较絮叨，建议直接丢给CC，拷打一番就好。
 
 ## 一键部署：claude
@@ -9,8 +12,6 @@ Vibe产物，readme比较絮叨，建议直接丢给CC，拷打一番就好。
 https://github.com/ZgDaniel/cc-web 给我装！
 ```
 
-![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-blue)
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/ae974fcd-b6a7-4bdf-8553-bfcf2e7038a4" alt="截图1" width="30%" />
