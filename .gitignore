@@ -1,0 +1,6 @@
+node_modules/
+sessions/
+logs/
+.env
+config/notify.json
+config/auth.json

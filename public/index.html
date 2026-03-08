@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>CC-Web</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+</head>
+<body>
+  <!-- Login -->
+  <div id="login-overlay" class="login-overlay">
+    <div class="login-box">
+      <div class="login-logo">CC</div>
+      <h2>CC-Web</h2>
+      <p>Claude Code Web Chat</p>
+      <form id="login-form">
+        <input type="password" id="login-password" placeholder="输入密码" autocomplete="current-password" autofocus>
+        <label class="remember-label">
+          <input type="checkbox" id="remember-pw"> 记住密码
+        </label>
+        <button type="submit">登录</button>
+      </form>
+      <div id="login-error" class="login-error" hidden>密码错误</div>
+    </div>
+  </div>
+
+  <!-- Main App -->
+  <div id="app" class="app" hidden>
+    <!-- Sidebar -->
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <button id="new-chat-btn" class="new-chat-btn">+ 新会话</button>
+      </div>
+      <div id="session-list" class="session-list"></div>
+      <div class="sidebar-footer">
+        <button id="settings-btn" class="settings-btn" title="设置">⚙</button>
+        <span class="brand">CC-Web</span>
+      </div>
+    </aside>
+
+    <div id="sidebar-overlay" class="sidebar-overlay" hidden></div>
+
+    <!-- Chat -->
+    <main class="chat-main">
+      <header class="chat-header">
+        <button id="menu-btn" class="menu-btn" title="菜单">☰</button>
+        <span id="chat-title" class="chat-title">新会话</span>
+        <select id="mode-select" class="mode-select" title="权限模式">
+          <option value="yolo">YOLO</option>
+          <option value="default">默认</option>
+          <option value="plan">Plan</option>
+        </select>
+        <span id="cost-display" class="cost-display"></span>
+      </header>
+
+      <div id="messages" class="messages">
+        <div class="welcome-msg">
+          <div class="welcome-icon">✿</div>
+          <h3>欢迎使用 CC-Web</h3>
+          <p>开始与 Claude Code 对话</p>
+        </div>
+      </div>
+
+      <!-- Slash command menu -->
+      <div id="cmd-menu" class="cmd-menu" hidden></div>
+
+      <div class="input-area">
+        <div class="input-wrapper">
+          <textarea id="msg-input" rows="1" placeholder="输入消息… 输入 / 查看指令" autocomplete="off"></textarea>
+          <button id="send-btn" class="send-btn" title="发送">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+            </svg>
+          </button>
+          <button id="abort-btn" class="abort-btn" title="停止" hidden>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
