@@ -15,18 +15,13 @@ Claude Code 轻量级 Web 聊天界面 — 在浏览器中与 [Claude Code](http
 ## 功能特性
 
 - **实时对话** — WebSocket 流式传输，逐字显示 Claude 回复
-- **工具调用折叠** — 自动折叠/展开 Claude 的工具调用过程，不干扰阅读
-- **Markdown 渲染** — 完整的 Markdown + 代码高亮（highlight.js）
 - **多会话管理** — 创建、切换、重命名、删除会话，自动保存历史
-- **会话续接** — 基于 `--resume` 实现跨消息上下文保持
-- **模型切换** — Opus / Sonnet / Haiku 随时切换
-- **权限模式** — YOLO（全自动）/ Plan（确认后执行）/ Default（标准审批）
+- **会话续接** — 基于 `--resume` 实现跨消息上下文保持，也可通过SSH使用tmux attach -t claude命令加入会话
 - **后台任务** — 关闭浏览器后 Claude 进程继续运行，完成后推送通知
 - **多渠道通知** — 支持 PushPlus / Telegram / Server酱 / 飞书机器人 / QQ（Qmsg），Web UI 内可视化配置
 - **进程持久化** — detached 进程 + PID 文件，服务重启不丢失运行中的任务
 - **移动端适配** — 响应式布局，支持 PWA 通知
 - **密码认证** — 自动生成初始密码、首次登录强制改密、Web UI 修改密码
-- **斜杠指令** — `/clear` `/model` `/mode` `/cost` `/compact` `/help`
 
 ## 前提条件
 
