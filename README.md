@@ -1,6 +1,7 @@
 # CC-Web
 
 Claude Code 轻量级 Web 远程工具 — 在浏览器中与 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 交互。
+Vibe产物，readme比较絮叨，建议直接丢给CC阅读。
 
 ## 一键部署：claude
 ```
