@@ -300,7 +300,7 @@ function killProcess(pid, force = false) {
     if (IS_WIN) {
       const args = ['/T', '/PID', String(pid)];
       if (force) args.unshift('/F');
-      spawn('taskkill', args, { windowsHide: true });
+      spawn('taskkill', args, { windowsHide: true, stdio: 'ignore' });
     } else {
       process.kill(pid, force ? 'SIGKILL' : 'SIGTERM');
     }
@@ -1077,7 +1077,7 @@ function handleMessage(ws, msg) {
       env,
       cwd: process.env.HOME || process.env.USERPROFILE || process.cwd(),
       stdio: [inputFd, outputFd, errorFd],
-      detached: true,
+      detached: !IS_WIN,
       windowsHide: true,
     });
   } catch (err) {
