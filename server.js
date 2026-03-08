@@ -284,6 +284,8 @@ function modelShortName(fullModel) {
   return entry ? entry[0] : null;
 }
 
+const IS_WIN = process.platform === 'win32';
+
 function isProcessRunning(pid) {
   try {
     process.kill(pid, 0);
@@ -291,6 +293,18 @@ function isProcessRunning(pid) {
   } catch {
     return false;
   }
+}
+
+function killProcess(pid, force = false) {
+  try {
+    if (IS_WIN) {
+      const args = ['/T', '/PID', String(pid)];
+      if (force) args.unshift('/F');
+      spawn('taskkill', args, { windowsHide: true });
+    } else {
+      process.kill(pid, force ? 'SIGKILL' : 'SIGTERM');
+    }
+  } catch {}
 }
 
 function cleanRunDir(sessionId) {
@@ -731,7 +745,7 @@ function handleSlashCommand(ws, text, sessionId) {
       if (session) {
         if (activeProcesses.has(sessionId)) {
           const entry = activeProcesses.get(sessionId);
-          try { process.kill(entry.pid, 'SIGTERM'); } catch {}
+          killProcess(entry.pid);
           if (entry.tailer) entry.tailer.stop();
           activeProcesses.delete(sessionId);
           cleanRunDir(sessionId);
@@ -899,7 +913,7 @@ function handleLoadSession(ws, sessionId) {
 function handleDeleteSession(ws, sessionId) {
   if (activeProcesses.has(sessionId)) {
     const entry = activeProcesses.get(sessionId);
-    try { process.kill(entry.pid, 'SIGTERM'); } catch {}
+    try { killProcess(entry.pid); } catch {}
     if (entry.tailer) entry.tailer.stop();
     activeProcesses.delete(sessionId);
     if (entry.ws) wsSend(entry.ws, { type: 'done', sessionId });
@@ -961,9 +975,9 @@ function handleAbort(ws) {
   if (!entry) return;
 
   plog('INFO', 'user_abort', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
-  try { process.kill(entry.pid, 'SIGTERM'); } catch {}
+  killProcess(entry.pid);
   setTimeout(() => {
-    try { process.kill(entry.pid, 'SIGKILL'); } catch {}
+    killProcess(entry.pid, true);
   }, 3000);
   // handleProcessComplete will be triggered by the PID monitor
 }
@@ -1061,9 +1075,10 @@ function handleMessage(ws, msg) {
   try {
     proc = spawn(CLAUDE_PATH, args, {
       env,
-      cwd: process.env.HOME || process.cwd(),
+      cwd: process.env.HOME || process.env.USERPROFILE || process.cwd(),
       stdio: [inputFd, outputFd, errorFd],
       detached: true,
+      windowsHide: true,
     });
   } catch (err) {
     fs.closeSync(inputFd);

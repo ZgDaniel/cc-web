@@ -38,20 +38,27 @@ https://github.com/ZgDaniel/cc-web 给我装！
 
 ## 快速开始
 
+### Linux / macOS
+
 ```bash
-# 克隆项目
-git clone https://github.com/your-username/cc-web.git
+git clone https://github.com/ZgDaniel/cc-web.git
 cd cc-web
-
-# 安装依赖
 npm install
-
-# 创建配置文件（可选，不设密码则首次启动自动生成）
-cp .env.example .env
-
-# 启动
+cp .env.example .env    # 可选，不设密码则首次启动自动生成
 npm start
 ```
+
+### Windows
+
+```cmd
+git clone https://github.com/ZgDaniel/cc-web.git
+cd cc-web
+npm install
+copy .env.example .env  & REM 可选
+```
+然后双击 `start.bat`，或在终端运行 `node server.js`。
+
+---
 
 启动后访问 `http://localhost:8002`，输入密码即可使用。
 
@@ -106,6 +113,7 @@ cc-web/
 ├── sessions/               # 对话历史 JSON 文件（运行时生成）
 ├── logs/                   # 进程生命周期日志（运行时生成）
 ├── .env.example            # 环境变量模板
+├── start.bat               # Windows 一键启动脚本
 ├── .gitignore
 ├── package.json
 └── README.md
@@ -210,6 +218,24 @@ server {
 }
 ```
 
+### Windows 部署
+
+适用于在个人电脑上运行 CC-Web，通过手机远程控制 Claude Code。
+
+**启动方式**：双击 `start.bat`，或在终端运行：
+```cmd
+cd cc-web
+npm install
+node server.js
+```
+
+**局域网访问**（手机和电脑在同一 WiFi）：
+- 直接访问 `http://电脑局域网IP:8002`
+
+**远程访问**（外出时用手机控制家里电脑）：
+- 推荐使用 [Tailscale](https://tailscale.com/) — 电脑和手机各安装一个，自动组网，免费够用
+- 或使用 [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)（需域名）
+
 ## 技术栈
 
 - **后端**：Node.js + [ws](https://github.com/websockets/ws)（唯一依赖）
@@ -219,5 +245,5 @@ server {
 
 ## 补充说明
 
-- 暂时只支持linux服务器，后续再vibe电脑端
-- 暂时只支持claude code，后续再vibe codex
+- 支持 Linux 服务器和 Windows 个人电脑部署
+- 暂时只支持 Claude Code，后续再 vibe codex
