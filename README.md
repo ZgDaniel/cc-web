@@ -2,6 +2,11 @@
 
 Claude Code 轻量级 Web 聊天界面 — 在浏览器中与 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 交互。
 
+## 一键部署：claude
+```
+https://github.com/ZgDaniel/cc-web 给我装！
+```
+
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
@@ -205,19 +210,6 @@ server {
 }
 ```
 
-## 斜杠指令
-
-在输入框中输入 `/` 可查看所有指令：
-
-| 指令 | 说明 |
-|------|------|
-| `/clear` | 清除当前会话（含 Claude 上下文） |
-| `/model [名称]` | 查看/切换模型（opus, sonnet, haiku） |
-| `/mode [模式]` | 查看/切换权限模式（yolo, plan, default） |
-| `/cost` | 查看当前会话累计费用 |
-| `/compact` | 压缩上下文（重置 Claude 会话但保留聊天记录） |
-| `/help` | 显示帮助 |
-
 ## 技术栈
 
 - **后端**：Node.js + [ws](https://github.com/websockets/ws)（唯一依赖）
@@ -225,6 +217,7 @@ server {
 - **CDN**：[marked.js](https://marked.js.org/)（Markdown）+ [highlight.js](https://highlightjs.org/)（代码高亮）
 - **CLI**：[Claude Code](https://docs.anthropic.com/en/docs/claude-code)
 
-## 许可证
+## 补充说明
 
-MIT
+- 暂时只支持linux服务器，后续再vibe电脑端
+- 暂时只支持claude code，后续再vibe codex
