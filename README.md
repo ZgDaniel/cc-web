@@ -1,6 +1,6 @@
 # CC-Web
 
-Claude Code 轻量级 Web 聊天界面 — 在浏览器中与 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 交互。
+Claude Code 轻量级 Web 远程工具 — 在浏览器中与 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 交互。
 
 ## 一键部署：claude
 ```
