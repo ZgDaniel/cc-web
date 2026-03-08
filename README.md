@@ -5,9 +5,11 @@ Claude Code 轻量级 Web 聊天界面 — 在浏览器中与 [Claude Code](http
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
-![Screenshot_2026-03-08-18-30-55-751_com quark brow](https://github.com/user-attachments/assets/ae974fcd-b6a7-4bdf-8553-bfcf2e7038a4)
-![Screenshot_2026-03-08-18-31-18-686_com quark brow](https://github.com/user-attachments/assets/eb0291c1-2b38-4379-9a07-8eecc6c87d8f)
-![Screenshot_2026-03-08-18-31-28-138_com quark brow](https://github.com/user-attachments/assets/09cec007-a949-44cf-9f2a-88c1eda60082)
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/ae974fcd-b6a7-4bdf-8553-bfcf2e7038a4" alt="截图1" width="30%" />
+  <img src="https://github.com/user-attachments/assets/eb0291c1-2b38-4379-9a07-8eecc6c87d8f" alt="截图2" width="30%" />
+  <img src="https://github.com/user-attachments/assets/09cec007-a949-44cf-9f2a-88c1eda60082" alt="截图3" width="30%" />
+</p>
 
 
 ## 功能特性
