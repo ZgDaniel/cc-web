@@ -236,14 +236,7 @@ node server.js
 - 推荐使用 [Tailscale](https://tailscale.com/) — 电脑和手机各安装一个，自动组网，免费够用
 - 或使用 [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)（需域名）
 
-## 技术栈
-
-- **后端**：Node.js + [ws](https://github.com/websockets/ws)（唯一依赖）
-- **前端**：原生 HTML/CSS/JS，无构建步骤
-- **CDN**：[marked.js](https://marked.js.org/)（Markdown）+ [highlight.js](https://highlightjs.org/)（代码高亮）
-- **CLI**：[Claude Code](https://docs.anthropic.com/en/docs/claude-code)
 
 ## 补充说明
 
-- 支持 Linux 服务器和 Windows 个人电脑部署
 - 暂时只支持 Claude Code，后续再 vibe codex
