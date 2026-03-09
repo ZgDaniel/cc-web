@@ -227,6 +227,12 @@ let PASSWORD = authConfig.password;
 
 const activeTokens = new Set();
 
+// Pending slash command metadata: sessionId -> { kind: string }
+const pendingSlashCommands = new Map();
+
+// Pending compact retry metadata: sessionId -> { text: string, mode: string }
+const pendingCompactRetries = new Map();
+
 // Active processes: sessionId -> { pid, ws, fullText, toolCalls, lastCost, tailer }
 const activeProcesses = new Map();
 
@@ -396,6 +402,9 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     ? ((new Date(completeTime) - new Date(entry.wsDisconnectTime)) / 1000).toFixed(1) + 's'
     : null;
 
+  const pendingRetry = pendingCompactRetries.get(sessionId) || null;
+  let requestTooLarge = false;
+
   // Read stderr for error clues
   let stderrSnippet = '';
   try {
@@ -405,6 +414,8 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       if (content) stderrSnippet = content.slice(-500);
     }
   } catch {}
+
+  requestTooLarge = /Request too large \(max 20MB\)/i.test(entry.fullText || '') || /Request too large \(max 20MB\)/i.test(stderrSnippet || '');
 
   plog(exitCode === 0 || exitCode === null ? 'INFO' : 'WARN', 'process_complete', {
     sessionId: sessionId.slice(0, 8),
@@ -418,6 +429,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     toolCallCount: (entry.toolCalls || []).length,
     cost: entry.lastCost,
     stderr: stderrSnippet || null,
+    requestTooLarge,
   });
 
   // Final read
@@ -425,6 +437,9 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     entry.tailer.readNew();
     entry.tailer.stop();
   }
+
+  const pendingSlash = pendingSlashCommands.get(sessionId) || null;
+  if (pendingSlash) pendingSlashCommands.delete(sessionId);
 
   // Save result to session
   const session = loadSession(sessionId);
@@ -440,8 +455,38 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     saveSession(session);
   }
 
+  if (pendingSlash?.kind === 'compact' && session) {
+    if (entry.lastCost) {
+      session.totalCost = Math.max(0, (session.totalCost || 0) - entry.lastCost);
+    }
+    session.updated = new Date().toISOString();
+    saveSession(session);
+  }
+
+  let shouldReturnForFollowup = false;
+
   // Notify client
   if (entry.ws) {
+    if (pendingSlash?.kind === 'compact') {
+      wsSend(entry.ws, { type: 'system_message', message: '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。' });
+      const retry = pendingCompactRetries.get(sessionId);
+      if (retry?.text) {
+        if (requestTooLarge) {
+          pendingCompactRetries.delete(sessionId);
+          wsSend(entry.ws, { type: 'system_message', message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
+        } else {
+          wsSend(entry.ws, { type: 'system_message', message: '检测到上一条请求因上下文过大失败，现已自动按压缩计划继续执行。' });
+          shouldReturnForFollowup = true;
+        }
+      }
+    }
+
+    if (requestTooLarge && !pendingSlash && session && session.claudeSessionId) {
+      pendingCompactRetries.set(sessionId, { text: pendingRetry?.text || '', mode: pendingRetry?.mode || session.permissionMode || 'yolo' });
+      wsSend(entry.ws, { type: 'system_message', message: '检测到上下文达到上限，正在按 Claude Code 原版策略自动执行 /compact，然后继续当前任务…' });
+      shouldReturnForFollowup = true;
+    }
+
     wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost || null });
     sendSessionList(entry.ws);
   } else {
@@ -470,6 +515,28 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 
   activeProcesses.delete(sessionId);
   cleanRunDir(sessionId);
+  pendingSlashCommands.delete(sessionId);
+
+  if (!shouldReturnForFollowup && !requestTooLarge && pendingRetry && pendingRetry.text === (entry.fullText || '').trim()) {
+    pendingCompactRetries.delete(sessionId);
+  }
+
+  if (shouldReturnForFollowup && entry.ws && entry.ws.readyState === 1 && session) {
+    if (pendingSlash?.kind === 'compact') {
+      const retry = pendingCompactRetries.get(sessionId);
+      if (retry?.text) {
+        pendingCompactRetries.delete(sessionId);
+        handleMessage(entry.ws, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
+      }
+      return;
+    }
+
+    if (requestTooLarge && !pendingSlash && session.claudeSessionId) {
+      pendingSlashCommands.set(sessionId, { kind: 'compact' });
+      handleMessage(entry.ws, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
+      return;
+    }
+  }
 }
 
 // Global PID monitor: detect process completion (especially after server restart)
@@ -791,12 +858,22 @@ function handleSlashCommand(ws, text, sessionId) {
     }
 
     case '/compact': {
-      if (session) {
-        session.claudeSessionId = null;
-        session.updated = new Date().toISOString();
-        saveSession(session);
+      if (!sessionId || !session) {
+        wsSend(ws, { type: 'system_message', message: '当前没有可压缩的会话。请先进入一个已进行过对话的会话后再执行 /compact。' });
+        break;
       }
-      wsSend(ws, { type: 'system_message', message: '上下文已压缩（Claude 会话 ID 已重置，下次发送将开始新的 Claude 会话，但聊天记录保留）。' });
+      if (activeProcesses.has(sessionId)) {
+        wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止，再执行 /compact。' });
+        break;
+      }
+      if (!session.claudeSessionId) {
+        wsSend(ws, { type: 'system_message', message: '当前会话尚未建立 Claude 上下文，暂时无需压缩。' });
+        break;
+      }
+
+      wsSend(ws, { type: 'system_message', message: '正在执行 Claude 原生 /compact 压缩上下文，请稍候…' });
+      pendingSlashCommands.set(session.id, { kind: 'compact' });
+      handleMessage(ws, { text: '/compact', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
       break;
     }
 
@@ -831,7 +908,7 @@ function handleSlashCommand(ws, text, sessionId) {
           '/model [名称] — 查看/切换模型（opus, sonnet, haiku）\n' +
           '/mode [模式] — 查看/切换权限模式（default, plan, yolo）\n' +
           '/cost — 查看当前会话累计费用\n' +
-          '/compact — 压缩上下文（重置 Claude 会话但保留聊天记录）\n' +
+          '/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）\n' +
           '/help — 显示本帮助',
       });
       break;
@@ -912,6 +989,8 @@ function handleLoadSession(ws, sessionId) {
 }
 
 function handleDeleteSession(ws, sessionId) {
+  pendingSlashCommands.delete(sessionId);
+  pendingCompactRetries.delete(sessionId);
   if (activeProcesses.has(sessionId)) {
     const entry = activeProcesses.get(sessionId);
     try { killProcess(entry.pid); } catch {}
@@ -984,9 +1063,12 @@ function handleAbort(ws) {
 }
 
 // === Claude Message Handler ===
-function handleMessage(ws, msg) {
+function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
+  const { hideInHistory = false } = options;
   if (!text || !text.trim()) return;
+
+  const normalizedText = text.trim();
 
   if (sessionId && activeProcesses.has(sessionId)) {
     return wsSend(ws, { type: 'error', message: '正在处理中，请先点击停止按钮。' });
@@ -1013,11 +1095,17 @@ function handleMessage(ws, msg) {
     session.permissionMode = mode;
   }
 
+  if (!hideInHistory && normalizedText !== '/compact' && session.claudeSessionId) {
+    pendingCompactRetries.set(session.id, { text: normalizedText, mode: session.permissionMode || 'yolo' });
+  }
+
   if (session.title === 'New Chat' || session.title === 'Untitled') {
     session.title = text.slice(0, 60).replace(/\n/g, ' ');
   }
 
-  session.messages.push({ role: 'user', content: text, timestamp: new Date().toISOString() });
+  if (!hideInHistory) {
+    session.messages.push({ role: 'user', content: text, timestamp: new Date().toISOString() });
+  }
   session.updated = new Date().toISOString();
   saveSession(session);
 
