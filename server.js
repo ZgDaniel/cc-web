@@ -1155,7 +1155,8 @@ function processClaudeEvent(entry, event, sessionId) {
           entry.fullText += block.text;
           wsSend(entry.ws, { type: 'text_delta', text: block.text });
         } else if (block.type === 'tool_use') {
-          const tc = { name: block.name, id: block.id, input: truncateObj(block.input, 500), done: false };
+          const toolInput = sanitizeToolInput(block.name, block.input);
+          const tc = { name: block.name, id: block.id, input: toolInput, done: false };
           entry.toolCalls.push(tc);
           wsSend(entry.ws, { type: 'tool_start', name: block.name, toolUseId: block.id, input: tc.input });
         } else if (block.type === 'tool_result') {
@@ -1200,6 +1201,29 @@ function truncateObj(obj, maxLen) {
   const s = JSON.stringify(obj);
   if (s.length <= maxLen) return obj;
   return s.slice(0, maxLen) + '...';
+}
+
+function safeJsonParse(input) {
+  if (input === null || input === undefined) return input;
+  if (typeof input !== 'string') return input;
+  const trimmed = input.trim();
+  if (!trimmed) return input;
+  if (!((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']')))) {
+    return input;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return input;
+  }
+}
+
+function sanitizeToolInput(toolName, input) {
+  const parsed = safeJsonParse(input);
+  if (toolName === 'AskUserQuestion') {
+    return parsed;
+  }
+  return truncateObj(parsed, 500);
 }
 
 // === Startup ===

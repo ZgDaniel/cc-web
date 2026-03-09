@@ -410,15 +410,115 @@
         for (const tc of m.toolCalls) {
           const details = document.createElement('details');
           details.className = 'tool-call';
-          const contentText = tc.result || (typeof tc.input === 'string' ? tc.input : (tc.input ? JSON.stringify(tc.input, null, 2) : ''));
-          details.innerHTML = `<summary><span class="tool-call-icon done"></span> ${escapeHtml(tc.name)}</summary>
-            <div class="tool-call-content">${escapeHtml(contentText)}</div>`;
+          details.dataset.toolName = tc.name || '';
+          if (tc.name === 'AskUserQuestion') details.open = true;
+
+          const summary = document.createElement('summary');
+          summary.innerHTML = `<span class="tool-call-icon done"></span> ${escapeHtml(tc.name)}`;
+          details.appendChild(summary);
+
+          const displayInput = tc.name === 'AskUserQuestion' ? tc.input : (tc.result || tc.input);
+          details.appendChild(buildToolContentElement(tc.name, displayInput));
+
           bubble.insertBefore(details, bubble.firstChild);
         }
       }
       messagesDiv.appendChild(el);
     }
     scrollToBottom();
+  }
+
+  function normalizeAskUserInput(input) {
+    if (input === null || input === undefined) return null;
+    if (typeof input === 'string') {
+      const trimmed = input.trim();
+      if (!trimmed) return null;
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        return null;
+      }
+    }
+    return input;
+  }
+
+  function extractAskUserQuestions(input) {
+    const parsed = normalizeAskUserInput(input);
+    if (!parsed || !Array.isArray(parsed.questions)) return [];
+    return parsed.questions;
+  }
+
+  function appendAskOptionToInput(question, option) {
+    const header = (question?.header || '').trim() || '问题';
+    const line = `【${header}】${option?.label || ''}`;
+    const current = msgInput.value.trim();
+    msgInput.value = current ? `${current}\n${line}` : line;
+    autoResize();
+    msgInput.focus();
+  }
+
+  function createAskUserQuestionView(questions) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'ask-user-question';
+
+    questions.forEach((q, idx) => {
+      const card = document.createElement('div');
+      card.className = 'ask-question-card';
+
+      const header = document.createElement('div');
+      header.className = 'ask-question-header';
+      header.textContent = `${idx + 1}. ${q.header || '问题'}`;
+      card.appendChild(header);
+
+      const body = document.createElement('div');
+      body.className = 'ask-question-text';
+      body.textContent = q.question || '';
+      card.appendChild(body);
+
+      if (Array.isArray(q.options) && q.options.length > 0) {
+        const opts = document.createElement('div');
+        opts.className = 'ask-question-options';
+        q.options.forEach((opt, i) => {
+          const item = document.createElement('button');
+          item.type = 'button';
+          item.className = 'ask-option-item';
+          item.addEventListener('click', () => appendAskOptionToInput(q, opt));
+
+          const title = document.createElement('div');
+          title.className = 'ask-option-label';
+          title.textContent = `${i + 1}. ${opt.label || ''}`;
+          item.appendChild(title);
+
+          if (opt.description) {
+            const desc = document.createElement('div');
+            desc.className = 'ask-option-desc';
+            desc.textContent = opt.description;
+            item.appendChild(desc);
+          }
+
+          opts.appendChild(item);
+        });
+        card.appendChild(opts);
+      }
+
+      wrapper.appendChild(card);
+    });
+
+    return wrapper;
+  }
+
+  function buildToolContentElement(name, input) {
+    if (name === 'AskUserQuestion') {
+      const questions = extractAskUserQuestions(input);
+      if (questions.length > 0) {
+        return createAskUserQuestionView(questions);
+      }
+    }
+    const inputStr = typeof input === 'string' ? input : (input ? JSON.stringify(input, null, 2) : '');
+    const content = document.createElement('div');
+    content.className = 'tool-call-content';
+    content.textContent = inputStr;
+    return content;
   }
 
   function appendToolCall(toolUseId, name, input, done) {
@@ -430,11 +530,14 @@
     const details = document.createElement('details');
     details.className = 'tool-call';
     details.id = `tool-${toolUseId}`;
-    const inputStr = typeof input === 'string' ? input : (input ? JSON.stringify(input, null, 2) : '');
-    details.innerHTML = `
-      <summary><span class="tool-call-icon ${done ? 'done' : 'running'}"></span> ${escapeHtml(name)}</summary>
-      <div class="tool-call-content">${escapeHtml(inputStr)}</div>
-    `;
+    details.dataset.toolName = name || '';
+    if (name === 'AskUserQuestion') details.open = true;
+
+    const summary = document.createElement('summary');
+    summary.innerHTML = `<span class="tool-call-icon ${done ? 'done' : 'running'}"></span> ${escapeHtml(name)}`;
+    details.appendChild(summary);
+    details.appendChild(buildToolContentElement(name, input));
+
     bubble.appendChild(details);
     scrollToBottom();
   }
@@ -445,6 +548,9 @@
     const icon = el.querySelector('.tool-call-icon');
     if (icon) { icon.classList.remove('running'); icon.classList.add('done'); }
     if (result) {
+      if (el.dataset.toolName === 'AskUserQuestion') {
+        return;
+      }
       const content = el.querySelector('.tool-call-content');
       if (content) content.textContent = result;
     }

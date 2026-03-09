@@ -571,6 +571,63 @@ body {
   font-family: 'SF Mono', monospace;
 }
 
+/* AskUserQuestion preview */
+.ask-user-question {
+  padding: 10px 12px;
+  background: var(--bg-primary);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ask-question-card {
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: #fff;
+  padding: 10px;
+}
+.ask-question-header {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+.ask-question-text {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+.ask-question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ask-option-item {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 8px;
+  background: var(--bg-secondary);
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.ask-option-item:hover {
+  background: var(--accent-light);
+  border-color: var(--accent);
+}
+.ask-option-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.ask-option-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+  margin-top: 4px;
+}
+
 /* Typing indicator */
 .typing-indicator {
   display: inline-flex;
