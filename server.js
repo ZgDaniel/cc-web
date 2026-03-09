@@ -140,10 +140,11 @@ function sendNotification(title, content) {
 
     const parsed = new URL(url);
     const contentType = isFormData ? 'application/x-www-form-urlencoded' : 'application/json';
-    const req = https.request(parsed, {
+    const reqOptions = {
       method: 'POST',
       headers: { 'Content-Type': contentType, 'Content-Length': Buffer.byteLength(data) },
-    }, (res) => {
+    };
+    const req = https.request(parsed, reqOptions, (res) => {
       let body = '';
       res.on('data', (c) => body += c);
       res.on('end', () => {

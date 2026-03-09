@@ -807,6 +807,10 @@
     msgInput.style.height = Math.min(msgInput.scrollHeight, max) + 'px';
   }
 
+  function isMobileInputMode() {
+    return window.matchMedia('(max-width: 768px), (pointer: coarse)').matches;
+  }
+
   // --- Event Listeners ---
   loginForm.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -864,6 +868,14 @@
       if (e.key === 'Escape') { hideCmdMenu(); return; }
     }
     if (e.key === 'Enter' && !e.shiftKey) {
+      if (isMobileInputMode()) {
+        if (!cmdMenu.hidden) {
+          e.preventDefault();
+          selectCmdMenuItem();
+        }
+        return;
+      }
+
       e.preventDefault();
       if (!cmdMenu.hidden) {
         // If menu is open and user presses Enter, select the item
