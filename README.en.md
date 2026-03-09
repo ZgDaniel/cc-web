@@ -13,21 +13,6 @@ A lightweight web interface for [Claude Code](https://docs.anthropic.com/en/docs
   <img src="https://github.com/user-attachments/assets/09cec007-a949-44cf-9f2a-88c1eda60082" alt="Screenshot 3" width="30%" />
 </p>
 
-## Release Notes
-
-- **v1.2.2**
-  - Aligned context compression with Claude Code native behavior: `/compact` is now actually sent to CLI instead of doing a local pseudo-reset.
-  - Added automatic overflow recovery: when `Request too large (max 20MB)` occurs, CC-Web runs `/compact` and replays the failed prompt automatically.
-  - Added retry guard: if context is still too large after compacting, CC-Web stops auto-retry and asks for a narrower prompt range.
-- **v1.2.1**
-  - Fixed missing `AskUserQuestion` options in Web UI by preserving structured tool input in backend and rendering question/option cards on frontend.
-  - Added option-to-input shortcut: click an option to append it into the input box for quick confirmation.
-- **v1.2**
-  - Fixed layout overflow caused by long code blocks in messages. The page no longer stretches horizontally; code blocks scroll within the block.
-  - Improved mobile input behavior: Enter inserts newline by default, and sending is done via the send button.
-- **v1.1**
-  - Added compatibility improvements for Claude Code CLI on Windows.
-
 ## Features
 
 - **Lightweight runtime**: low backend overhead, browser-based control panel.
@@ -248,6 +233,21 @@ node server.js
 **Remote access**:
 - Recommended: [Tailscale](https://tailscale.com/) for secure private networking.
 - Alternative: [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) (requires domain setup).
+
+## Release Notes
+
+- **v1.2.2**
+  - Aligned context compression with Claude Code native behavior: `/compact` is now actually sent to CLI instead of doing a local pseudo-reset.
+  - Added automatic overflow recovery: when `Request too large (max 20MB)` occurs, CC-Web runs `/compact` and replays the failed prompt automatically.
+  - Added retry guard: if context is still too large after compacting, CC-Web stops auto-retry and asks for a narrower prompt range.
+- **v1.2.1**
+  - Fixed missing `AskUserQuestion` options in Web UI by preserving structured tool input in backend and rendering question/option cards on frontend.
+  - Added option-to-input shortcut: click an option to append it into the input box for quick confirmation.
+- **v1.2**
+  - Fixed layout overflow caused by long code blocks in messages. The page no longer stretches horizontally; code blocks scroll within the block.
+  - Improved mobile input behavior: Enter inserts newline by default, and sending is done via the send button.
+- **v1.1**
+  - Added compatibility improvements for Claude Code CLI on Windows.
 
 ## Notes
 
