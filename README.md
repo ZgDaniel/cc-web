@@ -5,6 +5,8 @@ Claude Code 轻量级 Web 远程工具 — 在浏览器中与 [Claude Code](http
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
+English README: [README.en.md](./README.en.md)
+
 Vibe产物，readme比较絮叨，建议直接丢给CC，拷打一番就好。
 
 ## 一键部署：claude
