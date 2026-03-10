@@ -47,6 +47,7 @@
   let currentMode = localStorage.getItem('cc-web-mode') || 'yolo';
   let currentModel = 'opus';
   let loginPasswordValue = ''; // store login password for force-change flow
+  let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
 
   // --- DOM ---
   const $ = (sel) => document.querySelector(sel);
@@ -324,6 +325,16 @@
 
     const msgEl = createMsgElement('assistant', '');
     msgEl.id = 'streaming-msg';
+    // 流式消息 bubble 拆为 .msg-text 和 .msg-tools 两个子容器
+    const bubble = msgEl.querySelector('.msg-bubble');
+    bubble.innerHTML = '';
+    const textDiv = document.createElement('div');
+    textDiv.className = 'msg-text';
+    textDiv.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+    const toolsDiv = document.createElement('div');
+    toolsDiv.className = 'msg-tools';
+    bubble.appendChild(textDiv);
+    bubble.appendChild(toolsDiv);
     messagesDiv.appendChild(msgEl);
     scrollToBottom();
   }
@@ -361,7 +372,9 @@
     if (!streamEl) return;
     const bubble = streamEl.querySelector('.msg-bubble');
     if (!bubble) return;
-    bubble.innerHTML = renderMarkdown(pendingText);
+    let textDiv = bubble.querySelector('.msg-text');
+    if (!textDiv) { textDiv = bubble; }
+    textDiv.innerHTML = renderMarkdown(pendingText);
     scrollToBottom();
   }
 
@@ -391,6 +404,7 @@
     bubble.className = 'msg-bubble';
 
     if (role === 'user') {
+      bubble.style.whiteSpace = 'pre-wrap';
       bubble.textContent = content;
     } else {
       bubble.innerHTML = content ? renderMarkdown(content) : '<div class="typing-indicator"><span></span><span></span><span></span></div>';
@@ -401,35 +415,69 @@
     return div;
   }
 
+  let renderEpoch = 0;
+
+  function buildMsgElement(m) {
+    const el = createMsgElement(m.role, m.content);
+    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
+      const bubble = el.querySelector('.msg-bubble');
+      for (const tc of m.toolCalls) {
+        const details = document.createElement('details');
+        details.className = 'tool-call';
+        details.dataset.toolName = tc.name || '';
+        if (tc.name === 'AskUserQuestion') details.open = true;
+        const summary = document.createElement('summary');
+        summary.innerHTML = `<span class="tool-call-icon done"></span> ${escapeHtml(tc.name)}`;
+        details.appendChild(summary);
+        const displayInput = tc.name === 'AskUserQuestion' ? tc.input : (tc.result || tc.input);
+        details.appendChild(buildToolContentElement(tc.name, displayInput));
+        bubble.appendChild(details);
+      }
+    }
+    return el;
+  }
+
   function renderMessages(messages) {
+    renderEpoch++;
+    const epoch = renderEpoch;
     messagesDiv.innerHTML = '';
     if (messages.length === 0) {
       messagesDiv.innerHTML = '<div class="welcome-msg"><div class="welcome-icon">✿</div><h3>欢迎使用 CC-Web</h3><p>开始与 Claude Code 对话</p></div>';
       return;
     }
-    for (const m of messages) {
-      const el = createMsgElement(m.role, m.content);
-      if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
-        const bubble = el.querySelector('.msg-bubble');
-        for (const tc of m.toolCalls) {
-          const details = document.createElement('details');
-          details.className = 'tool-call';
-          details.dataset.toolName = tc.name || '';
-          if (tc.name === 'AskUserQuestion') details.open = true;
-
-          const summary = document.createElement('summary');
-          summary.innerHTML = `<span class="tool-call-icon done"></span> ${escapeHtml(tc.name)}`;
-          details.appendChild(summary);
-
-          const displayInput = tc.name === 'AskUserQuestion' ? tc.input : (tc.result || tc.input);
-          details.appendChild(buildToolContentElement(tc.name, displayInput));
-
-          bubble.insertBefore(details, bubble.firstChild);
-        }
-      }
-      messagesDiv.appendChild(el);
+    // Batch render: last 10 first, then next 20, then the rest
+    const batches = [];
+    const len = messages.length;
+    if (len <= 10) {
+      batches.push([0, len]);
+    } else if (len <= 30) {
+      batches.push([len - 10, len]);
+      batches.push([0, len - 10]);
+    } else {
+      batches.push([len - 10, len]);
+      batches.push([len - 30, len - 10]);
+      batches.push([0, len - 30]);
     }
+
+    // Render first batch immediately
+    const frag0 = document.createDocumentFragment();
+    for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i]));
+    messagesDiv.appendChild(frag0);
     scrollToBottom();
+
+    // Render remaining batches asynchronously, prepending each
+    let delay = 0;
+    for (let b = 1; b < batches.length; b++) {
+      const [start, end] = batches[b];
+      delay += 16;
+      setTimeout(() => {
+        if (renderEpoch !== epoch) return; // session switched, abort stale render
+        const frag = document.createDocumentFragment();
+        for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i]));
+        messagesDiv.insertBefore(frag, messagesDiv.firstChild);
+        updateScrollbar();
+      }, delay);
+    }
   }
 
   function normalizeAskUserInput(input) {
@@ -530,6 +578,8 @@
     if (!streamEl) return;
     const bubble = streamEl.querySelector('.msg-bubble');
     if (!bubble) return;
+    let toolsDiv = bubble.querySelector('.msg-tools');
+    if (!toolsDiv) { toolsDiv = bubble; }
 
     const details = document.createElement('details');
     details.className = 'tool-call';
@@ -542,7 +592,7 @@
     details.appendChild(summary);
     details.appendChild(buildToolContentElement(name, input));
 
-    bubble.appendChild(details);
+    toolsDiv.appendChild(details);
     scrollToBottom();
   }
 
@@ -558,6 +608,36 @@
       const content = el.querySelector('.tool-call-content');
       if (content) content.textContent = result;
     }
+  }
+
+  function showDeleteConfirm(onConfirm) {
+    const overlay = document.createElement('div');
+    overlay.className = 'settings-overlay';
+    overlay.style.zIndex = '10002';
+
+    const box = document.createElement('div');
+    box.className = 'settings-panel';
+    box.innerHTML = `
+      <div style="font-size:0.9em;color:var(--text-primary);margin-bottom:20px;line-height:1.7">删除本会话将同步删去本地 Claude 中的会话历史，不可恢复。确认删除？</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button id="del-confirm-ok" style="width:100%;padding:10px;border:none;border-radius:10px;background:var(--accent);color:#fff;font-size:0.95em;font-weight:600;cursor:pointer;font-family:inherit">确认删除</button>
+        <button id="del-confirm-skip" style="width:100%;padding:9px;border:1px solid var(--border-color);border-radius:10px;background:var(--bg-tertiary);color:var(--text-secondary);font-size:0.85em;cursor:pointer;font-family:inherit">确认且不再提示</button>
+        <button id="del-confirm-cancel" style="width:100%;padding:9px;border:none;border-radius:10px;background:transparent;color:var(--text-muted);font-size:0.85em;cursor:pointer;font-family:inherit">取消</button>
+      </div>
+    `;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    const close = () => document.body.removeChild(overlay);
+    box.querySelector('#del-confirm-ok').addEventListener('click', () => { close(); onConfirm(); });
+    box.querySelector('#del-confirm-skip').addEventListener('click', () => {
+      skipDeleteConfirm = true;
+      localStorage.setItem('cc-web-skip-delete-confirm', '1');
+      close();
+      onConfirm();
+    });
+    box.querySelector('#del-confirm-cancel').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
   }
 
   function appendSystemMessage(message) {
@@ -578,10 +658,73 @@
   function scrollToBottom() {
     requestAnimationFrame(() => {
       messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      updateScrollbar();
     });
   }
 
-  // --- Session List ---
+  // --- Custom Scrollbar ---
+  const scrollbarEl = document.getElementById('custom-scrollbar');
+  const thumbEl = document.getElementById('custom-scrollbar-thumb');
+
+  function updateScrollbar() {
+    if (!scrollbarEl || !thumbEl) return;
+    const { scrollTop, scrollHeight, clientHeight } = messagesDiv;
+    if (scrollHeight <= clientHeight) {
+      thumbEl.style.display = 'none';
+      return;
+    }
+    thumbEl.style.display = '';
+    const trackH = scrollbarEl.clientHeight;
+    const thumbH = Math.max(30, trackH * clientHeight / scrollHeight);
+    const thumbTop = (scrollTop / (scrollHeight - clientHeight)) * (trackH - thumbH);
+    thumbEl.style.height = thumbH + 'px';
+    thumbEl.style.top = thumbTop + 'px';
+  }
+
+  messagesDiv.addEventListener('scroll', () => updateScrollbar(), { passive: true });
+  new ResizeObserver(updateScrollbar).observe(messagesDiv);
+
+  // Drag logic
+  let dragStartY = 0, dragStartScrollTop = 0, isDragging = false;
+
+  function onDragStart(e) {
+    isDragging = true;
+    dragStartY = e.type === 'touchstart' ? e.touches[0].clientY : e.clientY;
+    dragStartScrollTop = messagesDiv.scrollTop;
+    thumbEl.classList.add('dragging');
+    scrollbarEl.classList.add('active');
+    e.preventDefault();
+  }
+
+  function onDragMove(e) {
+    if (!isDragging) return;
+    const clientY = e.type === 'touchmove' ? e.touches[0].clientY : e.clientY;
+    const dy = clientY - dragStartY;
+    const { scrollHeight, clientHeight } = messagesDiv;
+    const trackH = scrollbarEl.clientHeight;
+    const thumbH = Math.max(30, trackH * clientHeight / scrollHeight);
+    const ratio = (scrollHeight - clientHeight) / (trackH - thumbH);
+    messagesDiv.scrollTop = dragStartScrollTop + dy * ratio;
+    e.preventDefault();
+  }
+
+  function onDragEnd() {
+    if (!isDragging) return;
+    isDragging = false;
+    thumbEl.classList.remove('dragging');
+    scrollbarEl.classList.remove('active');
+  }
+
+  thumbEl.addEventListener('mousedown', onDragStart);
+  thumbEl.addEventListener('touchstart', onDragStart, { passive: false });
+  document.addEventListener('mousemove', onDragMove);
+  document.addEventListener('touchmove', onDragMove, { passive: false });
+  document.addEventListener('mouseup', onDragEnd);
+  document.addEventListener('touchend', onDragEnd);
+
+  updateScrollbar();
+
+
   function renderSessionList() {
     sessionList.innerHTML = '';
     for (const s of sessions) {
@@ -602,7 +745,7 @@
         const target = e.target;
         if (target.classList.contains('delete')) {
           e.stopPropagation();
-          if (confirm('删除此会话？')) {
+          const doDelete = () => {
             send({ type: 'delete_session', sessionId: s.id });
             if (s.id === currentSessionId) {
               currentSessionId = null;
@@ -610,6 +753,11 @@
               chatTitle.textContent = '新会话';
               costDisplay.textContent = '';
             }
+          };
+          if (skipDeleteConfirm) {
+            doDelete();
+          } else {
+            showDeleteConfirm(doDelete);
           }
           return;
         }

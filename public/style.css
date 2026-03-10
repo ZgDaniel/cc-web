@@ -334,17 +334,60 @@ body {
 }
 
 /* === Messages === */
-.messages {
+.messages-wrap {
   flex: 1;
-  overflow-y: auto;
+  position: relative;
+  overflow: hidden;
+  min-height: 0;
+}
+.messages {
+  height: 100%;
+  overflow-y: scroll;
   overflow-x: hidden;
   padding: 16px;
+  padding-right: 20px;
   display: flex;
   flex-direction: column;
   gap: 12px;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
+  scrollbar-width: none;
 }
+.messages::-webkit-scrollbar { display: none; }
+/* Custom scrollbar */
+.custom-scrollbar {
+  position: absolute;
+  right: 2px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.messages-wrap:hover .custom-scrollbar,
+.custom-scrollbar.active {
+  opacity: 1;
+}
+.custom-scrollbar-thumb {
+  position: absolute;
+  right: 0;
+  width: 6px;
+  min-height: 30px;
+  border-radius: 4px;
+  background: var(--scrollbar-thumb);
+  cursor: grab;
+  transition: width 0.15s, right 0.15s, background 0.15s;
+  pointer-events: all;
+}
+.custom-scrollbar-thumb:hover,
+.custom-scrollbar-thumb.dragging {
+  width: 12px;
+  right: -3px;
+  background: #b0a090;
+  cursor: grab;
+}
+.custom-scrollbar-thumb.dragging { cursor: grabbing; }
 .welcome-msg {
   text-align: center;
   margin: auto;
@@ -518,33 +561,6 @@ body {
   font-size: 13px;
   line-height: 1.5;
   white-space: pre;
-}
-/* HTML preview */
-.code-html-preview {
-  border-top: 1px solid var(--border-color);
-  background: var(--bg-secondary);
-}
-.code-html-preview summary {
-  padding: 6px 12px;
-  cursor: pointer;
-  font-size: 12px;
-  color: var(--text-secondary);
-  user-select: none;
-  list-style: none;
-}
-.code-html-preview summary::-webkit-details-marker { display: none; }
-.code-html-preview summary::before {
-  content: '▸';
-  font-size: 11px;
-  transition: transform 0.2s;
-  margin-right: 6px;
-}
-.code-html-preview[open] summary::before { transform: rotate(90deg); }
-.code-html-preview iframe {
-  width: 100%;
-  min-height: 180px;
-  border: 0;
-  background: #fff;
 }
 
 /* Tool calls */

@@ -309,6 +309,27 @@ function loadClaudeJsonModelMap() {
 }
 
 // Apply model config to runtime MODEL_MAP only (env vars are injected per-spawn, not here)
+const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'settings.json');
+const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL'];
+
+function applyCustomTemplateToSettings(tpl) {
+  let settings = {};
+  try { settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')); } catch {}
+  const cleanedEnv = {};
+  for (const [k, v] of Object.entries(settings.env || {})) {
+    if (!SETTINGS_API_KEYS.includes(k)) cleanedEnv[k] = v;
+  }
+  if (tpl.apiKey)       { cleanedEnv.ANTHROPIC_AUTH_TOKEN = tpl.apiKey; cleanedEnv.ANTHROPIC_API_KEY = tpl.apiKey; }
+  if (tpl.apiBase)      cleanedEnv.ANTHROPIC_BASE_URL = tpl.apiBase;
+  if (tpl.defaultModel) cleanedEnv.ANTHROPIC_MODEL = tpl.defaultModel;
+  if (tpl.opusModel)    cleanedEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = tpl.opusModel;
+  if (tpl.sonnetModel)  cleanedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = tpl.sonnetModel;
+  if (tpl.haikuModel)   cleanedEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = tpl.haikuModel;
+  settings.env = cleanedEnv;
+  try { fs.writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2)); } catch {}
+}
+
 function applyModelConfig() {
   const config = loadModelConfig();
   if (config.mode === 'custom' && config.activeTemplate) {
@@ -934,6 +955,11 @@ function handleSaveModelConfig(ws, newConfig) {
   // Re-apply at runtime
   MODEL_MAP = { opus: 'claude-opus-4-6', sonnet: 'claude-sonnet-4-6', haiku: 'claude-haiku-4-5-20251001' };
   applyModelConfig();
+  // custom mode: write to ~/.claude/settings.json immediately on save
+  if (merged.mode === 'custom' && merged.activeTemplate) {
+    const tpl = merged.templates.find(t => t.name === merged.activeTemplate);
+    if (tpl) applyCustomTemplateToSettings(tpl);
+  }
   plog('INFO', 'model_config_saved', { mode: merged.mode, activeTemplate: merged.activeTemplate });
   wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
   wsSend(ws, { type: 'system_message', message: '模型配置已保存' });
@@ -1138,7 +1164,23 @@ function handleDeleteSession(ws, sessionId) {
   cleanRunDir(sessionId);
   try {
     const p = sessionPath(sessionId);
+    // Read claudeSessionId before deleting the file
+    let claudeSessionId = null;
+    try {
+      const session = loadSession(sessionId);
+      claudeSessionId = session?.claudeSessionId || null;
+    } catch {}
     if (fs.existsSync(p)) fs.unlinkSync(p);
+    // Sync-delete the corresponding Claude native session .jsonl
+    if (claudeSessionId) {
+      const projectsDir = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
+      try {
+        for (const proj of fs.readdirSync(projectsDir)) {
+          const target = path.join(projectsDir, proj, `${claudeSessionId}.jsonl`);
+          if (fs.existsSync(target)) fs.unlinkSync(target);
+        }
+      } catch {}
+    }
     sendSessionList(ws);
   } catch {
     wsSend(ws, { type: 'error', message: 'Failed to delete session' });
@@ -1295,28 +1337,7 @@ function handleMessage(ws, msg, options = {}) {
     const modelCfg = loadModelConfig();
     if (modelCfg.mode === 'custom' && modelCfg.activeTemplate) {
       const tpl = (modelCfg.templates || []).find(t => t.name === modelCfg.activeTemplate);
-      if (tpl) {
-        const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'settings.json');
-        let settings = {};
-        try { settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')); } catch {}
-        const API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
-          'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL'];
-        const existingEnv = settings.env || {};
-        // Remove old API-related keys, keep non-API keys
-        const cleanedEnv = {};
-        for (const [k, v] of Object.entries(existingEnv)) {
-          if (!API_KEYS.includes(k)) cleanedEnv[k] = v;
-        }
-        // Inject template values
-        if (tpl.apiKey)       { cleanedEnv.ANTHROPIC_AUTH_TOKEN = tpl.apiKey; cleanedEnv.ANTHROPIC_API_KEY = tpl.apiKey; }
-        if (tpl.apiBase)      cleanedEnv.ANTHROPIC_BASE_URL = tpl.apiBase;
-        if (tpl.defaultModel) cleanedEnv.ANTHROPIC_MODEL = tpl.defaultModel;
-        if (tpl.opusModel)    cleanedEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = tpl.opusModel;
-        if (tpl.sonnetModel)  cleanedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = tpl.sonnetModel;
-        if (tpl.haikuModel)   cleanedEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = tpl.haikuModel;
-        settings.env = cleanedEnv;
-        try { fs.writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2)); } catch {}
-      }
+      if (tpl) applyCustomTemplateToSettings(tpl);
     }
   }
 
