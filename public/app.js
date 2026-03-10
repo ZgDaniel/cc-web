@@ -1150,7 +1150,7 @@
 
     function renderModelCustomArea() {
       if (modelModeSelect.value === 'local') {
-        modelCustomArea.innerHTML = `<div class="settings-field" style="color:var(--text-secondary);font-size:0.85em">读取 ~/.claude.json 中的 ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU_MODEL 字段覆盖模型名称。</div>`;
+        modelCustomArea.innerHTML = `<div class="settings-field" style="color:var(--text-warning, #e8a838);font-size:0.85em">⚠ 使用自定义模板会覆盖本地 API 配置，请提前做好备份。</div>`;
         modelActionsDiv.style.display = 'flex';
       } else {
         renderModelTemplateEditor();
@@ -1191,39 +1191,10 @@
               ${tplOptions}
               <option value="__new__">+ 新建模板</option>
             </select>
+            <button class="btn-test" id="model-tpl-edit" style="padding:4px 10px">编辑</button>
             <button class="btn-test" id="model-tpl-del" title="删除" style="padding:4px 8px">删除</button>
           </div>
         </div>
-        ${tpl ? `
-        <div class="settings-field">
-          <label>模板名称</label>
-          <input type="text" id="model-tpl-name" placeholder="模板名称" value="${escapeHtml(tpl.name)}">
-        </div>
-        <div class="settings-field">
-          <label>API Key</label>
-          <input type="text" id="model-tpl-apikey" placeholder="sk-ant-..." value="${escapeHtml(tpl.apiKey || '')}">
-        </div>
-        <div class="settings-field">
-          <label>API Base URL</label>
-          <input type="text" id="model-tpl-apibase" placeholder="https://api.anthropic.com" value="${escapeHtml(tpl.apiBase || '')}">
-        </div>
-        <div class="settings-field">
-          <label>默认模型 (ANTHROPIC_MODEL)</label>
-          <input type="text" id="model-tpl-default" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.defaultModel || '')}">
-        </div>
-        <div class="settings-field">
-          <label>Opus 模型名</label>
-          <input type="text" id="model-tpl-opus" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.opusModel || '')}">
-        </div>
-        <div class="settings-field">
-          <label>Sonnet 模型名</label>
-          <input type="text" id="model-tpl-sonnet" placeholder="claude-sonnet-4-6" value="${escapeHtml(tpl.sonnetModel || '')}">
-        </div>
-        <div class="settings-field">
-          <label>Haiku 模型名</label>
-          <input type="text" id="model-tpl-haiku" placeholder="claude-haiku-4-5-20251001" value="${escapeHtml(tpl.haikuModel || '')}">
-        </div>
-        ` : ''}
       `;
 
       panel.querySelector('#model-tpl-select').addEventListener('change', (e) => {
@@ -1234,11 +1205,16 @@
           if (modelEditingTemplates.find(t => t.name === n)) { alert('模板名称已存在'); e.target.value = modelActiveTemplate; return; }
           modelEditingTemplates.push({ name: n, apiKey: '', apiBase: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
           modelActiveTemplate = n;
+          renderModelTemplateEditor();
+          openTplEditModal();
         } else {
-          saveTplFields();
           modelActiveTemplate = e.target.value;
+          renderModelTemplateEditor();
         }
-        renderModelTemplateEditor();
+      });
+
+      panel.querySelector('#model-tpl-edit').addEventListener('click', () => {
+        openTplEditModal();
       });
 
       const delBtn = panel.querySelector('#model-tpl-del');
@@ -1253,24 +1229,80 @@
       }
     }
 
-    function saveTplFields() {
+    function openTplEditModal() {
       const tpl = modelEditingTemplates.find(t => t.name === modelActiveTemplate);
       if (!tpl) return;
-      const nameEl = panel.querySelector('#model-tpl-name');
-      const apikeyEl = panel.querySelector('#model-tpl-apikey');
-      const apibaseEl = panel.querySelector('#model-tpl-apibase');
-      const defaultEl = panel.querySelector('#model-tpl-default');
-      const opusEl = panel.querySelector('#model-tpl-opus');
-      const sonnetEl = panel.querySelector('#model-tpl-sonnet');
-      const haikuEl = panel.querySelector('#model-tpl-haiku');
-      if (nameEl && nameEl.value.trim()) tpl.name = nameEl.value.trim();
-      if (apikeyEl) tpl.apiKey = apikeyEl.value.trim();
-      if (apibaseEl) tpl.apiBase = apibaseEl.value.trim();
-      if (defaultEl) tpl.defaultModel = defaultEl.value.trim();
-      if (opusEl) tpl.opusModel = opusEl.value.trim();
-      if (sonnetEl) tpl.sonnetModel = sonnetEl.value.trim();
-      if (haikuEl) tpl.haikuModel = haikuEl.value.trim();
-      modelActiveTemplate = tpl.name;
+
+      const modalOverlay = document.createElement('div');
+      modalOverlay.className = 'settings-overlay';
+      modalOverlay.style.zIndex = '10001';
+      const modal = document.createElement('div');
+      modal.className = 'settings-panel';
+      modal.style.maxWidth = '460px';
+      modal.innerHTML = `
+        <div class="settings-header">
+          <h3>编辑模板: ${escapeHtml(tpl.name)}</h3>
+          <button class="settings-close" id="tpl-modal-close">&times;</button>
+        </div>
+        <div class="settings-field">
+          <label>模板名称</label>
+          <input type="text" id="tpl-ed-name" value="${escapeHtml(tpl.name)}">
+        </div>
+        <div class="settings-field">
+          <label>API Key</label>
+          <input type="text" id="tpl-ed-apikey" placeholder="sk-ant-..." value="${escapeHtml(tpl.apiKey || '')}">
+        </div>
+        <div class="settings-field">
+          <label>API Base URL</label>
+          <input type="text" id="tpl-ed-apibase" placeholder="https://api.anthropic.com" value="${escapeHtml(tpl.apiBase || '')}">
+        </div>
+        <div class="settings-field">
+          <label>默认模型 (ANTHROPIC_MODEL)</label>
+          <input type="text" id="tpl-ed-default" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.defaultModel || '')}">
+        </div>
+        <div class="settings-field">
+          <label>Opus 模型名</label>
+          <input type="text" id="tpl-ed-opus" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.opusModel || '')}">
+        </div>
+        <div class="settings-field">
+          <label>Sonnet 模型名</label>
+          <input type="text" id="tpl-ed-sonnet" placeholder="claude-sonnet-4-6" value="${escapeHtml(tpl.sonnetModel || '')}">
+        </div>
+        <div class="settings-field">
+          <label>Haiku 模型名</label>
+          <input type="text" id="tpl-ed-haiku" placeholder="claude-haiku-4-5-20251001" value="${escapeHtml(tpl.haikuModel || '')}">
+        </div>
+        <div class="settings-actions">
+          <button class="btn-save" id="tpl-ed-ok">确定</button>
+        </div>
+      `;
+      modalOverlay.appendChild(modal);
+      document.body.appendChild(modalOverlay);
+
+      const closeModal = () => { document.body.removeChild(modalOverlay); };
+      modal.querySelector('#tpl-modal-close').addEventListener('click', closeModal);
+      modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
+
+      modal.querySelector('#tpl-ed-ok').addEventListener('click', () => {
+        const newName = modal.querySelector('#tpl-ed-name').value.trim();
+        if (newName && newName !== tpl.name) {
+          if (modelEditingTemplates.find(t => t.name === newName && t !== tpl)) { alert('模板名称已存在'); return; }
+          tpl.name = newName;
+          modelActiveTemplate = newName;
+        }
+        tpl.apiKey = modal.querySelector('#tpl-ed-apikey').value.trim();
+        tpl.apiBase = modal.querySelector('#tpl-ed-apibase').value.trim();
+        tpl.defaultModel = modal.querySelector('#tpl-ed-default').value.trim();
+        tpl.opusModel = modal.querySelector('#tpl-ed-opus').value.trim();
+        tpl.sonnetModel = modal.querySelector('#tpl-ed-sonnet').value.trim();
+        tpl.haikuModel = modal.querySelector('#tpl-ed-haiku').value.trim();
+        closeModal();
+        renderModelTemplateEditor();
+      });
+    }
+
+    function saveTplFields() {
+      // Fields are now saved via modal, no inline fields to read
     }
 
     modelModeSelect.addEventListener('change', renderModelCustomArea);

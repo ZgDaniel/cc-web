@@ -244,6 +244,11 @@ node server.js
 
 ## 更新记录
 
+- **v1.2.3**
+  - 新增模型配置系统：支持 local（读取本地配置）和 custom（自定义 API 模板）两种模式切换。
+  - custom 模式通过写入 `~/.claude/settings.json` 实现 API 凭据注入，兼容 cc-switch-web 等配置管理工具。
+  - 模板配置改为弹窗编辑，界面更简洁；切换至 custom 模式时显示覆盖警告。
+  - spawn 时增加模型名称校验，防止无效模型参数导致进程静默失败。
 - **v1.2.2**
   - 对齐 Claude Code 原生上下文压缩策略：`/compact` 改为真实下发到 CLI 执行，不再使用本地会话伪重置。
   - 补齐超限自动恢复链路：当出现 `Request too large (max 20MB)` 时，自动执行 `/compact` 并在压缩后自动重放上一条失败请求继续运行。

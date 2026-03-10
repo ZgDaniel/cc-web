@@ -5,10 +5,10 @@ Claude Code Web Chat UI - 轻量级 Web 聊天界面，通过 WebSocket 与 Clau
 ## 目录与发布约定
 
 - 开发与运行目录固定为：`/home/cc-dan/cc/cc-web`
-- 当前提交 GitHub 的脱敏目录为：`/home/cc-dan/cc/cc-web_v1.2.2`
+- 当前提交 GitHub 的脱敏目录为：`/home/cc-dan/cc/cc-web_v1.2.3`
 - 脱敏目录命名规则：`/home/cc-dan/cc/cc-web_v<主版本>.<次版本>.<修订版本>`
 - 版本发布时，必须保持以下信息一致：
-  1. 脱敏目录实际名称（如 `cc-web_v1.2.2`）
+  1. 脱敏目录实际名称（如 `cc-web_v1.2.3`）
   2. 本文件中的“当前提交 GitHub 的脱敏目录”路径
   3. `/home/cc-dan/cc/项目清单.md` 中 CC-Web 的发布副本路径
   4. 脱敏目录 `README.md` 的“更新记录”版本号与说明
@@ -78,14 +78,18 @@ Claude Code Web Chat UI - 轻量级 Web 聊天界面，通过 WebSocket 与 Clau
 
 | 模式 | 说明 |
 |------|------|
-| `local` | 读取 `~/.claude.json` 中的 `env` 字段覆盖 MODEL_MAP（ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU_MODEL） |
-| `custom` | 使用命名模板，每个模板含 apiKey、apiBase、defaultModel、opusModel、sonnetModel、haikuModel |
+| `local` | 依赖 `~/.claude/settings.json` 已有配置（由 cc-switch-web 等工具管理），仅从中读取模型名称更新 MODEL_MAP |
+| `custom` | 使用命名模板，spawn 前将模板凭据写入 `~/.claude/settings.json` 的 `env` 字段 |
 
 关键实现：
-- `MODEL_MAP` 改为 `let`，启动时调用 `applyModelConfig()` 应用配置
-- `handleSaveModelConfig()` 保存后立即重新应用 MODEL_MAP
+- **配置优先级**：Claude CLI 读取 `~/.claude/settings.json` > 环境变量 > `~/.claude.json`
+- `applyModelConfig()` 仅更新 MODEL_MAP 模型名称映射（不写环境变量）
+- **spawn 环境隔离**：子进程 env 中删除所有 `ANTHROPIC_*` 变量，让 CLI 直接读取 `~/.claude/settings.json`
+- **custom 模式 spawn**：将模板的 apiKey/apiBase/model 写入 `~/.claude/settings.json` 的 `env` 字段，保留非 API 相关字段（如 `API_TIMEOUT_MS`）
+- **模型验证**：spawn 时检查 `session.model` 是否在当前 `MODEL_MAP` 值中，无效则不传 `--model` 参数
 - API Key 脱敏：前4后4，中间 `****`
 - 保存时若 API Key 含 `****` 则保留旧值（防止脱敏值覆盖真实密钥）
+- **前端**：模板配置字段通过弹窗编辑（点击"编辑"按钮），local 模式显示覆盖警告
 - WS 消息：`get_model_config` → `model_config`；`save_model_config` → `model_config` + `system_message`
 
 ## /compact 修复记录
