@@ -15,7 +15,7 @@ A lightweight web interface for [Claude Code](https://docs.anthropic.com/en/docs
 
 ## Features
 
-- **Lightweight runtime**: low backend overhead, browser-based control panel.
+- **Lightweight runtime（1.6MB）**: low backend overhead, browser-based control panel.
 - **Multi-session management**: create, switch, rename, and delete sessions; deleting a session also removes the local Claude history record.
 - **Session resume**: context continuity via `--resume`; you can also reattach via SSH + `tmux attach -t claude` when needed.
 - **Background task support**: Claude processes continue after browser disconnect and notify you on completion.
