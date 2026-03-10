@@ -16,12 +16,12 @@ A lightweight web interface for [Claude Code](https://docs.anthropic.com/en/docs
 ## Features
 
 - **Lightweight runtime**: low backend overhead, browser-based control panel.
-- **Multi-session management**: create, switch, rename, and delete sessions with automatic history persistence.
-- **Session resume**: context continuity via `--resume`; you can also reattach via SSH + tmux when needed.
+- **Multi-session management**: create, switch, rename, and delete sessions; deleting a session also removes the local Claude history record.
+- **Session resume**: context continuity via `--resume`; you can also reattach via SSH + `tmux attach -t claude` when needed.
 - **Background task support**: Claude processes continue after browser disconnect and notify you on completion.
 - **Multi-channel notifications**: PushPlus / Telegram / ServerChan / Feishu bot / QQ (Qmsg), configurable in Web UI.
 - **Process persistence**: detached subprocess + PID files; running tasks survive service restarts.
-- **Mobile friendly**: responsive layout with PWA notifications.
+- **Multi-API switching**: configure multiple API profiles and switch between them instantly from the UI.
 - **Password-based auth**: initial password generation, forced first-login reset, and password change in Web UI.
 
 ## Requirements
