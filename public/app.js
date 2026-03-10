@@ -1165,6 +1165,24 @@
         `<option value="${escapeHtml(t.name)}" ${t.name === activeName ? 'selected' : ''}>${escapeHtml(t.name)}</option>`
       ).join('');
 
+      if (modelEditingTemplates.length === 0) {
+        modelCustomArea.innerHTML = `
+          <div class="settings-field" style="color:var(--text-secondary);font-size:0.85em">尚无模板，点击下方按钮新建。</div>
+          <div class="settings-actions" style="margin-top:0">
+            <button class="btn-test" id="model-tpl-add-first">+ 新建模板</button>
+          </div>
+        `;
+        panel.querySelector('#model-tpl-add-first').addEventListener('click', () => {
+          const newName = prompt('输入新模板名称:');
+          if (!newName || !newName.trim()) return;
+          const n = newName.trim();
+          modelEditingTemplates.push({ name: n, apiKey: '', apiBase: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
+          modelActiveTemplate = n;
+          renderModelTemplateEditor();
+        });
+        return;
+      }
+
       modelCustomArea.innerHTML = `
         <div class="settings-field">
           <label>激活模板</label>
