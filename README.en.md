@@ -22,7 +22,6 @@ A lightweight web interface for [Claude Code](https://docs.anthropic.com/en/docs
 - **Multi-channel notifications**: PushPlus / Telegram / ServerChan / Feishu bot / QQ (Qmsg), configurable in Web UI.
 - **Process persistence**: detached subprocess + PID files; running tasks survive service restarts.
 - **Multi-API switching**: configure multiple API profiles and switch between them instantly from the UI.
-- **Password-based auth**: initial password generation, forced first-login reset, and password change in Web UI.
 
 ## Requirements
 
