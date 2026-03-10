@@ -4,3 +4,5 @@ logs/
 .env
 config/notify.json
 config/auth.json
+config/model.json
+CLAUDE.md
