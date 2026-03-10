@@ -21,6 +21,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const LOGS_DIR = path.join(__dirname, 'logs');
 const NOTIFY_CONFIG_PATH = path.join(__dirname, 'config', 'notify.json');
 const AUTH_CONFIG_PATH = path.join(__dirname, 'config', 'auth.json');
+const MODEL_CONFIG_PATH = path.join(__dirname, 'config', 'model.json');
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -230,7 +231,7 @@ const activeTokens = new Set();
 // Pending slash command metadata: sessionId -> { kind: string }
 const pendingSlashCommands = new Map();
 
-// Pending compact retry metadata: sessionId -> { text: string, mode: string }
+// Pending compact retry metadata: sessionId -> { text: string, mode: string, reason: string }
 const pendingCompactRetries = new Map();
 
 // Active processes: sessionId -> { pid, ws, fullText, toolCalls, lastCost, tailer }
@@ -239,11 +240,100 @@ const activeProcesses = new Map();
 // Track which session each ws is viewing: ws -> sessionId
 const wsSessionMap = new Map();
 
-const MODEL_MAP = {
+// Default fallback MODEL_MAP (overridden by model config at runtime)
+let MODEL_MAP = {
   opus: 'claude-opus-4-6',
   sonnet: 'claude-sonnet-4-6',
   haiku: 'claude-haiku-4-5-20251001',
 };
+
+// === Model Config ===
+const DEFAULT_MODEL_CONFIG = {
+  mode: 'local',      // 'local' | 'custom'
+  templates: [],      // array of { name, apiKey, apiBase, defaultModel, opusModel, sonnetModel, haikuModel }
+  activeTemplate: '', // name of active template (for 'custom' mode)
+};
+
+function loadModelConfig() {
+  try {
+    if (fs.existsSync(MODEL_CONFIG_PATH)) {
+      return JSON.parse(fs.readFileSync(MODEL_CONFIG_PATH, 'utf8'));
+    }
+  } catch {}
+  return JSON.parse(JSON.stringify(DEFAULT_MODEL_CONFIG));
+}
+
+function saveModelConfig(config) {
+  fs.writeFileSync(MODEL_CONFIG_PATH, JSON.stringify(config, null, 2));
+}
+
+function maskSecret(str) {
+  if (!str || str.length <= 8) return str ? '****' : '';
+  return str.slice(0, 4) + '****' + str.slice(-4);
+}
+
+function getModelConfigMasked() {
+  const config = loadModelConfig();
+  return {
+    mode: config.mode,
+    activeTemplate: config.activeTemplate,
+    templates: (config.templates || []).map(t => ({
+      name: t.name,
+      apiKey: maskSecret(t.apiKey),
+      apiBase: t.apiBase || '',
+      defaultModel: t.defaultModel || '',
+      opusModel: t.opusModel || '',
+      sonnetModel: t.sonnetModel || '',
+      haikuModel: t.haikuModel || '',
+    })),
+  };
+}
+
+// Read ~/.claude.json for model name overrides
+function loadClaudeJsonModelMap() {
+  try {
+    const p = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude.json');
+    if (!fs.existsSync(p)) return null;
+    const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const env = raw?.env || {};
+    const map = {};
+    if (env.ANTHROPIC_DEFAULT_OPUS_MODEL) map.opus = env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+    if (env.ANTHROPIC_DEFAULT_SONNET_MODEL) map.sonnet = env.ANTHROPIC_DEFAULT_SONNET_MODEL;
+    if (env.ANTHROPIC_DEFAULT_HAIKU_MODEL) map.haiku = env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+    // Fallback: ANTHROPIC_MODEL maps to opus slot
+    if (!map.opus && env.ANTHROPIC_MODEL) map.opus = env.ANTHROPIC_MODEL;
+    return Object.keys(map).length > 0 ? map : null;
+  } catch {
+    return null;
+  }
+}
+
+// Apply model config to runtime MODEL_MAP and env
+function applyModelConfig() {
+  const config = loadModelConfig();
+  if (config.mode === 'custom' && config.activeTemplate) {
+    const tpl = (config.templates || []).find(t => t.name === config.activeTemplate);
+    if (tpl) {
+      if (tpl.opusModel) MODEL_MAP.opus = tpl.opusModel;
+      if (tpl.sonnetModel) MODEL_MAP.sonnet = tpl.sonnetModel;
+      if (tpl.haikuModel) MODEL_MAP.haiku = tpl.haikuModel;
+      if (tpl.apiBase) process.env.ANTHROPIC_BASE_URL = tpl.apiBase;
+      if (tpl.apiKey) process.env.ANTHROPIC_API_KEY = tpl.apiKey;
+      if (tpl.defaultModel) process.env.ANTHROPIC_MODEL = tpl.defaultModel;
+      return;
+    }
+  }
+  // mode === 'local': read from ~/.claude.json
+  const localMap = loadClaudeJsonModelMap();
+  if (localMap) {
+    if (localMap.opus) MODEL_MAP.opus = localMap.opus;
+    if (localMap.sonnet) MODEL_MAP.sonnet = localMap.sonnet;
+    if (localMap.haiku) MODEL_MAP.haiku = localMap.haiku;
+  }
+}
+
+// Apply on startup
+applyModelConfig();
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -468,21 +558,26 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   // Notify client
   if (entry.ws) {
     if (pendingSlash?.kind === 'compact') {
-      wsSend(entry.ws, { type: 'system_message', message: '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。' });
       const retry = pendingCompactRetries.get(sessionId);
-      if (retry?.text) {
+      if (retry?.reason === 'auto') {
+        wsSend(entry.ws, { type: 'system_message', message: '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。' });
+        pendingCompactRetries.delete(sessionId);
+      } else if (retry?.text) {
         if (requestTooLarge) {
           pendingCompactRetries.delete(sessionId);
           wsSend(entry.ws, { type: 'system_message', message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
         } else {
           wsSend(entry.ws, { type: 'system_message', message: '检测到上一条请求因上下文过大失败，现已自动按压缩计划继续执行。' });
           shouldReturnForFollowup = true;
+          pendingCompactRetries.delete(sessionId);
         }
+      } else {
+        wsSend(entry.ws, { type: 'system_message', message: '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。' });
       }
     }
 
     if (requestTooLarge && !pendingSlash && session && session.claudeSessionId) {
-      pendingCompactRetries.set(sessionId, { text: pendingRetry?.text || '', mode: pendingRetry?.mode || session.permissionMode || 'yolo' });
+      pendingCompactRetries.set(sessionId, { text: pendingRetry?.text || '', mode: pendingRetry?.mode || session.permissionMode || 'yolo', reason: 'auto' });
       wsSend(entry.ws, { type: 'system_message', message: '检测到上下文达到上限，正在按 Claude Code 原版策略自动执行 /compact，然后继续当前任务…' });
       shouldReturnForFollowup = true;
     }
@@ -722,6 +817,12 @@ wss.on('connection', (ws) => {
       case 'change_password':
         handleChangePassword(ws, msg, authToken);
         break;
+      case 'get_model_config':
+        wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
+        break;
+      case 'save_model_config':
+        handleSaveModelConfig(ws, msg.config);
+        break;
       default:
         wsSend(ws, { type: 'error', message: `Unknown type: ${msg.type}` });
     }
@@ -800,6 +901,44 @@ function handleChangePassword(ws, msg, currentToken) {
   activeTokens.add(newToken);
 
   wsSend(ws, { type: 'password_changed', success: true, token: newToken, message: '密码修改成功' });
+}
+
+// === Model Config Handler ===
+function handleSaveModelConfig(ws, newConfig) {
+  if (!newConfig || !['local', 'custom'].includes(newConfig.mode)) {
+    return wsSend(ws, { type: 'error', message: '无效的模型配置' });
+  }
+  const current = loadModelConfig();
+  const merged = {
+    mode: newConfig.mode,
+    activeTemplate: newConfig.activeTemplate || '',
+    templates: [],
+  };
+
+  // Merge templates: keep existing secrets if masked
+  const newTemplates = Array.isArray(newConfig.templates) ? newConfig.templates : [];
+  const oldTemplates = Array.isArray(current.templates) ? current.templates : [];
+  for (const nt of newTemplates) {
+    if (!nt.name || !nt.name.trim()) continue;
+    const old = oldTemplates.find(t => t.name === nt.name);
+    merged.templates.push({
+      name: nt.name.trim(),
+      apiKey: (nt.apiKey && !nt.apiKey.includes('****')) ? nt.apiKey : (old?.apiKey || ''),
+      apiBase: nt.apiBase || '',
+      defaultModel: nt.defaultModel || '',
+      opusModel: nt.opusModel || '',
+      sonnetModel: nt.sonnetModel || '',
+      haikuModel: nt.haikuModel || '',
+    });
+  }
+
+  saveModelConfig(merged);
+  // Re-apply at runtime
+  MODEL_MAP = { opus: 'claude-opus-4-6', sonnet: 'claude-sonnet-4-6', haiku: 'claude-haiku-4-5-20251001' };
+  applyModelConfig();
+  plog('INFO', 'model_config_saved', { mode: merged.mode, activeTemplate: merged.activeTemplate });
+  wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
+  wsSend(ws, { type: 'system_message', message: '模型配置已保存' });
 }
 
 // === Slash Command Handler ===
@@ -1096,7 +1235,7 @@ function handleMessage(ws, msg, options = {}) {
   }
 
   if (!hideInHistory && normalizedText !== '/compact' && session.claudeSessionId) {
-    pendingCompactRetries.set(session.id, { text: normalizedText, mode: session.permissionMode || 'yolo' });
+    pendingCompactRetries.set(session.id, { text: normalizedText, mode: session.permissionMode || 'yolo', reason: 'normal' });
   }
 
   if (session.title === 'New Chat' || session.title === 'Untitled') {

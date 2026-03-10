@@ -519,6 +519,33 @@ body {
   line-height: 1.5;
   white-space: pre;
 }
+/* HTML preview */
+.code-html-preview {
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+.code-html-preview summary {
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary);
+  user-select: none;
+  list-style: none;
+}
+.code-html-preview summary::-webkit-details-marker { display: none; }
+.code-html-preview summary::before {
+  content: '▸';
+  font-size: 11px;
+  transition: transform 0.2s;
+  margin-right: 6px;
+}
+.code-html-preview[open] summary::before { transform: rotate(90deg); }
+.code-html-preview iframe {
+  width: 100%;
+  min-height: 180px;
+  border: 0;
+  background: #fff;
+}
 
 /* Tool calls */
 .tool-call {

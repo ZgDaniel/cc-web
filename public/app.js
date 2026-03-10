@@ -288,6 +288,10 @@
         if (typeof _onNotifyTestResult === 'function') _onNotifyTestResult(msg);
         break;
 
+      case 'model_config':
+        if (typeof _onModelConfig === 'function') _onModelConfig(msg.config);
+        break;
+
       case 'background_done':
         // A background task completed (browser was disconnected or viewing another session)
         showToast(`「${msg.title}」任务完成`, msg.sessionId);
@@ -1042,6 +1046,7 @@
   // --- Settings Panel ---
   let _onNotifyConfig = null;
   let _onNotifyTestResult = null;
+  let _onModelConfig = null;
 
   const settingsBtn = $('#settings-btn');
 
@@ -1055,8 +1060,9 @@
   ];
 
   function showSettingsPanel() {
-    // Request current config
+    // Request current configs
     send({ type: 'get_notify_config' });
+    send({ type: 'get_model_config' });
 
     const overlay = document.createElement('div');
     overlay.className = 'settings-overlay';
@@ -1070,6 +1076,23 @@
         ⚙ 设置
         <button class="settings-close" title="关闭">&times;</button>
       </h3>
+
+      <div class="settings-section-title">模型配置</div>
+      <div class="settings-field">
+        <label>配置模式</label>
+        <select class="settings-select" id="model-mode">
+          <option value="local">读取本地配置文件 (~/.claude.json)</option>
+          <option value="custom">自定义配置</option>
+        </select>
+      </div>
+      <div id="model-custom-area"></div>
+      <div class="settings-actions" id="model-actions" style="display:none">
+        <button class="btn-save" id="model-save-btn">保存模型配置</button>
+      </div>
+      <div class="settings-status" id="model-status"></div>
+
+      <div class="settings-divider"></div>
+
       <div class="settings-section-title">通知设置</div>
       <div class="settings-field">
         <label>通知方式</label>
@@ -1109,6 +1132,151 @@
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
 
+    // === Model Config UI ===
+    const modelModeSelect = panel.querySelector('#model-mode');
+    const modelCustomArea = panel.querySelector('#model-custom-area');
+    const modelActionsDiv = panel.querySelector('#model-actions');
+    const modelSaveBtn = panel.querySelector('#model-save-btn');
+    const modelStatusDiv = panel.querySelector('#model-status');
+
+    let modelCurrentConfig = null;
+    let modelEditingTemplates = [];
+    let modelActiveTemplate = '';
+
+    function showModelStatus(msg, type) {
+      modelStatusDiv.textContent = msg;
+      modelStatusDiv.className = 'settings-status ' + (type || '');
+    }
+
+    function renderModelCustomArea() {
+      if (modelModeSelect.value === 'local') {
+        modelCustomArea.innerHTML = `<div class="settings-field" style="color:var(--text-secondary);font-size:0.85em">读取 ~/.claude.json 中的 ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU_MODEL 字段覆盖模型名称。</div>`;
+        modelActionsDiv.style.display = 'flex';
+      } else {
+        renderModelTemplateEditor();
+        modelActionsDiv.style.display = 'flex';
+      }
+    }
+
+    function renderModelTemplateEditor() {
+      const activeName = modelActiveTemplate;
+      const tpl = modelEditingTemplates.find(t => t.name === activeName) || null;
+      const tplOptions = modelEditingTemplates.map(t =>
+        `<option value="${escapeHtml(t.name)}" ${t.name === activeName ? 'selected' : ''}>${escapeHtml(t.name)}</option>`
+      ).join('');
+
+      modelCustomArea.innerHTML = `
+        <div class="settings-field">
+          <label>激活模板</label>
+          <div style="display:flex;gap:6px;align-items:center">
+            <select class="settings-select" id="model-tpl-select" style="flex:1">
+              ${tplOptions}
+              <option value="__new__">+ 新建模板</option>
+            </select>
+            <button class="btn-test" id="model-tpl-del" title="删除" style="padding:4px 8px">删除</button>
+          </div>
+        </div>
+        ${tpl ? `
+        <div class="settings-field">
+          <label>模板名称</label>
+          <input type="text" id="model-tpl-name" placeholder="模板名称" value="${escapeHtml(tpl.name)}">
+        </div>
+        <div class="settings-field">
+          <label>API Key</label>
+          <input type="text" id="model-tpl-apikey" placeholder="sk-ant-..." value="${escapeHtml(tpl.apiKey || '')}">
+        </div>
+        <div class="settings-field">
+          <label>API Base URL</label>
+          <input type="text" id="model-tpl-apibase" placeholder="https://api.anthropic.com" value="${escapeHtml(tpl.apiBase || '')}">
+        </div>
+        <div class="settings-field">
+          <label>默认模型 (ANTHROPIC_MODEL)</label>
+          <input type="text" id="model-tpl-default" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.defaultModel || '')}">
+        </div>
+        <div class="settings-field">
+          <label>Opus 模型名</label>
+          <input type="text" id="model-tpl-opus" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.opusModel || '')}">
+        </div>
+        <div class="settings-field">
+          <label>Sonnet 模型名</label>
+          <input type="text" id="model-tpl-sonnet" placeholder="claude-sonnet-4-6" value="${escapeHtml(tpl.sonnetModel || '')}">
+        </div>
+        <div class="settings-field">
+          <label>Haiku 模型名</label>
+          <input type="text" id="model-tpl-haiku" placeholder="claude-haiku-4-5-20251001" value="${escapeHtml(tpl.haikuModel || '')}">
+        </div>
+        ` : ''}
+      `;
+
+      panel.querySelector('#model-tpl-select').addEventListener('change', (e) => {
+        if (e.target.value === '__new__') {
+          const newName = prompt('输入新模板名称:');
+          if (!newName || !newName.trim()) { e.target.value = modelActiveTemplate; return; }
+          const n = newName.trim();
+          if (modelEditingTemplates.find(t => t.name === n)) { alert('模板名称已存在'); e.target.value = modelActiveTemplate; return; }
+          modelEditingTemplates.push({ name: n, apiKey: '', apiBase: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
+          modelActiveTemplate = n;
+        } else {
+          saveTplFields();
+          modelActiveTemplate = e.target.value;
+        }
+        renderModelTemplateEditor();
+      });
+
+      const delBtn = panel.querySelector('#model-tpl-del');
+      if (delBtn) {
+        delBtn.addEventListener('click', () => {
+          if (!modelActiveTemplate) return;
+          if (!confirm(`确认删除模板「${modelActiveTemplate}」?`)) return;
+          modelEditingTemplates = modelEditingTemplates.filter(t => t.name !== modelActiveTemplate);
+          modelActiveTemplate = modelEditingTemplates[0]?.name || '';
+          renderModelTemplateEditor();
+        });
+      }
+    }
+
+    function saveTplFields() {
+      const tpl = modelEditingTemplates.find(t => t.name === modelActiveTemplate);
+      if (!tpl) return;
+      const nameEl = panel.querySelector('#model-tpl-name');
+      const apikeyEl = panel.querySelector('#model-tpl-apikey');
+      const apibaseEl = panel.querySelector('#model-tpl-apibase');
+      const defaultEl = panel.querySelector('#model-tpl-default');
+      const opusEl = panel.querySelector('#model-tpl-opus');
+      const sonnetEl = panel.querySelector('#model-tpl-sonnet');
+      const haikuEl = panel.querySelector('#model-tpl-haiku');
+      if (nameEl && nameEl.value.trim()) tpl.name = nameEl.value.trim();
+      if (apikeyEl) tpl.apiKey = apikeyEl.value.trim();
+      if (apibaseEl) tpl.apiBase = apibaseEl.value.trim();
+      if (defaultEl) tpl.defaultModel = defaultEl.value.trim();
+      if (opusEl) tpl.opusModel = opusEl.value.trim();
+      if (sonnetEl) tpl.sonnetModel = sonnetEl.value.trim();
+      if (haikuEl) tpl.haikuModel = haikuEl.value.trim();
+      modelActiveTemplate = tpl.name;
+    }
+
+    modelModeSelect.addEventListener('change', renderModelCustomArea);
+
+    modelSaveBtn.addEventListener('click', () => {
+      if (modelModeSelect.value === 'custom') saveTplFields();
+      const config = {
+        mode: modelModeSelect.value,
+        activeTemplate: modelActiveTemplate,
+        templates: modelEditingTemplates,
+      };
+      send({ type: 'save_model_config', config });
+      showModelStatus('已保存', 'success');
+    });
+
+    _onModelConfig = (config) => {
+      modelCurrentConfig = config;
+      modelEditingTemplates = (config.templates || []).map(t => Object.assign({}, t));
+      modelActiveTemplate = config.activeTemplate || (modelEditingTemplates[0]?.name || '');
+      modelModeSelect.value = config.mode || 'local';
+      renderModelCustomArea();
+    };
+
+    // === Notify Config UI ===
     const providerSelect = panel.querySelector('#notify-provider');
     const fieldsDiv = panel.querySelector('#notify-fields');
     const statusDiv = panel.querySelector('#notify-status');
@@ -1285,6 +1453,7 @@
     if (overlay) overlay.remove();
     _onNotifyConfig = null;
     _onNotifyTestResult = null;
+    _onModelConfig = null;
     document.removeEventListener('keydown', _settingsEscape);
   }
 
