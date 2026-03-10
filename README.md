@@ -31,7 +31,6 @@ https://github.com/ZgDaniel/cc-web 给我装！
 - **多渠道通知** — 支持 PushPlus / Telegram / Server酱 / 飞书机器人 / QQ（Qmsg），Web UI 内可视化配置
 - **进程持久化** — detached 进程 + PID 文件，服务重启不丢失运行中的任务
 - **多 API 切换** — 可配置多个 API 方案，UI 中一键切换，即时生效
-- **密码认证** — 自动生成初始密码、首次登录强制改密、Web UI 修改密码
 
 ## 前提条件
 
