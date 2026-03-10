@@ -5,7 +5,7 @@ Claude Code 轻量级 Web 远程工具 — 在浏览器中与 [Claude Code](http
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
-[English README](./README.en.md)
+[English README](./README.en.md) | [更新日志](./CHANGELOG.md)
 
 Vibe产物，readme比较絮叨，建议直接丢给CC，拷打一番就好。
 
@@ -244,33 +244,7 @@ node server.js
 
 ## 更新记录
 
-- **v1.2.5**
-  - 修复删除会话时同步删除 ~/.claude/projects/ 下对应的原生会话历史，遍历所有项目目录确保完整清除。
-  - 新增删除确认弹窗，支持「确认且不再提示」选项，风格与主界面一致。
-  - 用户消息支持多行换行显示。
-  - 修复 AskUserQuestion 选项卡渲染位置：从消息顶部移至底部。
-  - 修复流式输出与工具调用 UI 共存时的覆盖问题（bubble 拆分为 .msg-text 和 .msg-tools）。
-  - 新增聊天区自定义滚动条，支持鼠标/触屏拖动，悬停时滑块变宽。
-  - 会话历史分批异步渲染，切换会话体感延迟大幅降低。
-  - 修复快速切换会话时旧历史错误渲染到新会话的问题（epoch 校验）。
-  - 模型配置保存时立即同步写入 ~/.claude/settings.json，无需触发对话才生效。
-- **v1.2.3**
-  - 新增模型配置系统：支持 local（读取本地配置）和 custom（自定义 API 模板）两种模式切换。
-  - custom 模式通过写入 `~/.claude/settings.json` 实现 API 凭据注入，兼容 cc-switch-web 等配置管理工具。
-  - 模板配置改为弹窗编辑，界面更简洁；切换至 custom 模式时显示覆盖警告。
-  - spawn 时增加模型名称校验，防止无效模型参数导致进程静默失败。
-- **v1.2.2**
-  - 对齐 Claude Code 原生上下文压缩策略：`/compact` 改为真实下发到 CLI 执行，不再使用本地会话伪重置。
-  - 补齐超限自动恢复链路：当出现 `Request too large (max 20MB)` 时，自动执行 `/compact` 并在压缩后自动重放上一条失败请求继续运行。
-  - 增加自动续跑保护：若压缩后仍超限，停止自动重试并提示用户手动缩小输入范围，避免死循环。
-- **v1.2.1**
-  - 修复 `AskUserQuestion` 交互选项在 Web 端不显示的问题：后端保留完整结构化参数并前端按问题/选项渲染。
-  - 新增交互选项快捷填充：点击选项即可把对应答案插入输入框，便于快速确认并发送。
-- **v1.2**
-  - 修复消息中包含代码块时可能触发的页面横向溢出问题：窗口不再被长代码撑宽，代码块可在块内横向滚动。
-  - 优化移动端输入体验：手机浏览器回车键默认换行，不再直接发送消息；消息发送改为手动点击发送按钮。
-- **v1.1**
-  - 增加 Windows 环境下 Claude Code CLI 的兼容支持，完善本地部署与启动体验。
+查看 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 补充说明
 
