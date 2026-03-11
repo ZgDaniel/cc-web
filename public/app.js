@@ -528,29 +528,98 @@
       card.appendChild(body);
 
       if (Array.isArray(q.options) && q.options.length > 0) {
+        const hasDesc = q.options.some(o => o.description);
+
+        // 左右分栏容器
+        const layout = document.createElement('div');
+        layout.className = 'ask-options-layout' + (hasDesc ? ' has-preview' : '');
+
         const opts = document.createElement('div');
         opts.className = 'ask-question-options';
+
+        // 右侧预览区（仅在有 description 时创建）
+        const preview = hasDesc ? document.createElement('div') : null;
+        if (preview) {
+          preview.className = 'ask-option-preview';
+          // 默认显示第一项
+          preview.textContent = q.options[0].description || '';
+        }
+
+        // 当前选中项（移动端 tap-to-preview 状态）
+        let selectedOpt = null;
+        let selectedBtn = null;
+
         q.options.forEach((opt, i) => {
           const item = document.createElement('button');
           item.type = 'button';
           item.className = 'ask-option-item';
-          item.addEventListener('click', () => appendAskOptionToInput(q, opt));
 
           const title = document.createElement('div');
           title.className = 'ask-option-label';
           title.textContent = `${i + 1}. ${opt.label || ''}`;
           item.appendChild(title);
 
-          if (opt.description) {
-            const desc = document.createElement('div');
-            desc.className = 'ask-option-desc';
-            desc.textContent = opt.description;
-            item.appendChild(desc);
+          // 桌面：hover 切换预览
+          if (preview) {
+            item.addEventListener('mouseenter', () => {
+              preview.textContent = opt.description || '';
+            });
           }
+
+          item.addEventListener('click', (e) => {
+            const isTouch = item.dataset.touchActivated === '1';
+            item.dataset.touchActivated = '';
+
+            if (isTouch) {
+              // 移动端：第一次 tap = 选中预览，不发送
+              if (selectedBtn !== item) {
+                if (selectedBtn) selectedBtn.classList.remove('ask-option-selected');
+                selectedBtn = item;
+                selectedOpt = opt;
+                item.classList.add('ask-option-selected');
+                if (preview) preview.textContent = opt.description || '';
+                return;
+              }
+              // 第二次 tap 同一项 = 发送
+            }
+
+            // 桌面直接发送
+            appendAskOptionToInput(q, opt);
+          });
+
+          item.addEventListener('touchstart', () => {
+            item.dataset.touchActivated = '1';
+          }, { passive: true });
 
           opts.appendChild(item);
         });
-        card.appendChild(opts);
+
+        layout.appendChild(opts);
+        if (preview) {
+          layout.appendChild(preview);
+          // 预览区最小高度 = 左侧选项列表总高度（渲染后同步）
+          requestAnimationFrame(() => {
+            preview.style.minHeight = opts.offsetHeight + 'px';
+          });
+        }
+
+        // 移动端确认按钮
+        if (hasDesc) {
+          const confirmBtn = document.createElement('button');
+          confirmBtn.type = 'button';
+          confirmBtn.className = 'ask-confirm-btn';
+          confirmBtn.textContent = '确认选择';
+          confirmBtn.addEventListener('click', () => {
+            if (selectedOpt) {
+              appendAskOptionToInput(q, selectedOpt);
+            } else if (q.options.length > 0) {
+              appendAskOptionToInput(q, q.options[0]);
+            }
+          });
+          layout.appendChild(confirmBtn);
+        }
+
+        card.appendChild(layout);
       }
 
       wrapper.appendChild(card);
@@ -681,7 +750,15 @@
     thumbEl.style.top = thumbTop + 'px';
   }
 
-  messagesDiv.addEventListener('scroll', () => updateScrollbar(), { passive: true });
+  messagesDiv.addEventListener('scroll', () => {
+    updateScrollbar();
+    // 移动端：滚动时短暂显示滑块，停止后淡出
+    scrollbarEl.classList.add('scrolling');
+    clearTimeout(scrollbarEl._hideTimer);
+    scrollbarEl._hideTimer = setTimeout(() => {
+      if (!isDragging) scrollbarEl.classList.remove('scrolling');
+    }, 1200);
+  }, { passive: true });
   new ResizeObserver(updateScrollbar).observe(messagesDiv);
 
   // Drag logic

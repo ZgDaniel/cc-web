@@ -311,7 +311,8 @@ function loadClaudeJsonModelMap() {
 // Apply model config to runtime MODEL_MAP only (env vars are injected per-spawn, not here)
 const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'settings.json');
 const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL'];
+  'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_REASONING_MODEL'];
 
 function applyCustomTemplateToSettings(tpl) {
   let settings = {};
@@ -327,7 +328,14 @@ function applyCustomTemplateToSettings(tpl) {
   if (tpl.sonnetModel)  cleanedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = tpl.sonnetModel;
   if (tpl.haikuModel)   cleanedEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = tpl.haikuModel;
   settings.env = cleanedEnv;
-  try { fs.writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2)); } catch {}
+  // 原子写入：先写临时文件再 rename，避免 Claude 子进程读到写了一半的文件
+  const tmpPath = CLAUDE_SETTINGS_PATH + '.tmp';
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2));
+    fs.renameSync(tmpPath, CLAUDE_SETTINGS_PATH);
+  } catch {
+    try { fs.unlinkSync(tmpPath); } catch {}
+  }
 }
 
 function applyModelConfig() {
