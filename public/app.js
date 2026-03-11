@@ -80,9 +80,13 @@
   window.addEventListener('orientationchange', () => setTimeout(setVH, 100));
 
   // --- marked config ---
+  const PREVIEW_LANGS = new Set(['html', 'svg']);
+  const _previewCodeMap = new Map();
+  let _previewCodeId = 0;
+
   const renderer = new marked.Renderer();
   renderer.code = function (code, language) {
-    const lang = language || 'plaintext';
+    const lang = (language || 'plaintext').toLowerCase();
     let highlighted;
     try {
       if (hljs.getLanguage(lang)) {
@@ -93,22 +97,51 @@
     } catch {
       highlighted = escapeHtml(code);
     }
-    return `<div class="code-block-wrapper">
+    const canPreview = PREVIEW_LANGS.has(lang);
+    const previewBtn = canPreview
+      ? `<button class="code-preview-btn" onclick="ccTogglePreview(this)">Preview</button>`
+      : '';
+    const previewPane = canPreview
+      ? `<div class="code-preview-pane"><iframe class="code-preview-iframe" sandbox="allow-scripts" loading="lazy"></iframe></div>`
+      : '';
+    const cid = canPreview ? (++_previewCodeId) : 0;
+    if (canPreview) _previewCodeMap.set(cid, code);
+    return `<div class="code-block-wrapper${canPreview ? ' has-preview' : ''}"${canPreview ? ` data-cid="${cid}"` : ''}>
       <div class="code-block-header">
         <span>${escapeHtml(lang)}</span>
-        <button class="code-copy-btn" onclick="ccCopyCode(this)">Copy</button>
+        <div class="code-block-actions">${previewBtn}<button class="code-copy-btn" onclick="ccCopyCode(this)">Copy</button></div>
       </div>
-      <pre><code class="hljs language-${escapeHtml(lang)}">${highlighted}</code></pre>
+      ${previewPane}<pre><code class="hljs language-${escapeHtml(lang)}">${highlighted}</code></pre>
     </div>`;
   };
   marked.setOptions({ renderer, breaks: true, gfm: true });
 
   window.ccCopyCode = function (btn) {
-    const code = btn.closest('.code-block-wrapper').querySelector('code').textContent;
+    const wrapper = btn.closest('.code-block-wrapper');
+    const cid = wrapper.dataset.cid ? Number(wrapper.dataset.cid) : 0;
+    const code = (cid && _previewCodeMap.has(cid)) ? _previewCodeMap.get(cid) : wrapper.querySelector('code').textContent;
     navigator.clipboard.writeText(code).then(() => {
       btn.textContent = 'Copied!';
       setTimeout(() => btn.textContent = 'Copy', 1500);
     });
+  };
+
+  window.ccTogglePreview = function (btn) {
+    const wrapper = btn.closest('.code-block-wrapper');
+    const inPreview = wrapper.classList.contains('preview-mode');
+    if (inPreview) {
+      wrapper.classList.remove('preview-mode');
+      btn.textContent = 'Preview';
+    } else {
+      const iframe = wrapper.querySelector('.code-preview-iframe');
+      if (iframe && !iframe.dataset.loaded) {
+        const cid = wrapper.dataset.cid ? Number(wrapper.dataset.cid) : 0;
+        iframe.srcdoc = (cid && _previewCodeMap.has(cid)) ? _previewCodeMap.get(cid) : '';
+        iframe.dataset.loaded = '1';
+      }
+      wrapper.classList.add('preview-mode');
+      btn.textContent = 'Source';
+    }
   };
 
   // --- WebSocket ---
@@ -466,15 +499,20 @@
     scrollToBottom();
 
     // Render remaining batches asynchronously, prepending each
+    // Use scrollHeight delta to keep current view position stable after prepend
     let delay = 0;
     for (let b = 1; b < batches.length; b++) {
       const [start, end] = batches[b];
       delay += 16;
       setTimeout(() => {
         if (renderEpoch !== epoch) return; // session switched, abort stale render
+        const prevHeight = messagesDiv.scrollHeight;
+        const prevScrollTop = messagesDiv.scrollTop;
         const frag = document.createDocumentFragment();
         for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i]));
         messagesDiv.insertBefore(frag, messagesDiv.firstChild);
+        // Compensate scrollTop so visible area stays unchanged
+        messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
         updateScrollbar();
       }, delay);
     }
