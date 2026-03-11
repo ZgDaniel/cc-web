@@ -43,6 +43,8 @@
   let pendingText = '';
   let renderTimer = null;
   let activeToolCalls = new Map();
+  let toolGroupCount = 0;   // 当前 .msg-tools 直接子节点数（含已有父目录）
+  let hasGrouped = false;  // 本次输出是否已触发过折叠
   let cmdMenuIndex = -1;
   let currentMode = localStorage.getItem('cc-web-mode') || 'yolo';
   let currentModel = 'opus';
@@ -353,6 +355,8 @@
     isGenerating = true;
     pendingText = '';
     activeToolCalls.clear();
+    toolGroupCount = 0;
+    hasGrouped = false;
     sendBtn.hidden = true;
     abortBtn.hidden = false;
     // 不禁用输入框，允许用户继续输入（但无法发送）
@@ -388,11 +392,39 @@
     if (typing) typing.remove();
 
     const streamEl = document.getElementById('streaming-msg');
-    if (streamEl) streamEl.removeAttribute('id');
+    if (streamEl) {
+      // 若本轮出现过父目录，把末尾散落的 .tool-call 也一并收入同一父节点
+      if (hasGrouped) {
+        const toolsDiv = streamEl.querySelector('.msg-tools');
+        if (toolsDiv) {
+          const loose = Array.from(toolsDiv.children).filter(c => c.classList.contains('tool-call'));
+          if (loose.length > 0) {
+            let group = toolsDiv.querySelector(':scope > .tool-group');
+            if (!group) {
+              group = document.createElement('details');
+              group.className = 'tool-group';
+              const gs = document.createElement('summary');
+              gs.className = 'tool-group-summary';
+              group.appendChild(gs);
+              const inner = document.createElement('div');
+              inner.className = 'tool-group-inner';
+              group.appendChild(inner);
+              toolsDiv.insertBefore(group, toolsDiv.firstChild);
+            }
+            const inner = group.querySelector('.tool-group-inner');
+            loose.forEach(c => inner.appendChild(c));
+            _refreshGroupSummary(group);
+          }
+        }
+      }
+      streamEl.removeAttribute('id');
+    }
 
     if (sessionId) currentSessionId = sessionId;
     pendingText = '';
     activeToolCalls.clear();
+    toolGroupCount = 0;
+    hasGrouped = false;
   }
 
   // --- Rendering ---
@@ -458,6 +490,8 @@
     const el = createMsgElement(m.role, m.content);
     if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
       const bubble = el.querySelector('.msg-bubble');
+      const FOLD_AT = 5;
+      let grouped = false;
       for (const tc of m.toolCalls) {
         const details = document.createElement('details');
         details.className = 'tool-call';
@@ -468,7 +502,40 @@
         details.appendChild(summary);
         const displayInput = tc.name === 'AskUserQuestion' ? tc.input : (tc.result || tc.input);
         details.appendChild(buildToolContentElement(tc.name, displayInput));
+
+        // 散落的 .tool-call 达到 FOLD_AT 个时，移入唯一 .tool-group
+        const loose = Array.from(bubble.children).filter(c => c.classList.contains('tool-call'));
+        if (loose.length >= FOLD_AT) {
+          let group = bubble.querySelector(':scope > .tool-group');
+          if (!group) {
+            group = document.createElement('details');
+            group.className = 'tool-group';
+            const gs = document.createElement('summary');
+            gs.className = 'tool-group-summary';
+            group.appendChild(gs);
+            const inner = document.createElement('div');
+            inner.className = 'tool-group-inner';
+            group.appendChild(inner);
+            bubble.insertBefore(group, bubble.firstChild);
+            grouped = true;
+          }
+          const inner = group.querySelector('.tool-group-inner');
+          loose.forEach(c => inner.appendChild(c));
+          _refreshGroupSummary(group);
+        }
         bubble.appendChild(details);
+      }
+      // 结束时若出现过父目录，收尾散落项
+      if (grouped) {
+        const loose = Array.from(bubble.children).filter(c => c.classList.contains('tool-call'));
+        if (loose.length > 0) {
+          const group = bubble.querySelector(':scope > .tool-group');
+          if (group) {
+            const inner = group.querySelector('.tool-group-inner');
+            loose.forEach(c => inner.appendChild(c));
+            _refreshGroupSummary(group);
+          }
+        }
       }
     }
     return el;
@@ -703,8 +770,38 @@
     details.appendChild(summary);
     details.appendChild(buildToolContentElement(name, input));
 
+    // 折叠策略：只维护唯一一个 .tool-group 父节点
+    // 散落的 .tool-call 直接子节点达到5个时，将它们全部移入父节点；之后继续散落，再达5个再移入
+    const FOLD_AT = 5;
+    const looseBefore = Array.from(toolsDiv.children).filter(c => c.classList.contains('tool-call'));
+    if (looseBefore.length >= FOLD_AT) {
+      // 确保存在唯一的 .tool-group
+      let group = toolsDiv.querySelector(':scope > .tool-group');
+      if (!group) {
+        group = document.createElement('details');
+        group.className = 'tool-group';
+        const gs = document.createElement('summary');
+        gs.className = 'tool-group-summary';
+        group.appendChild(gs);
+        const inner = document.createElement('div');
+        inner.className = 'tool-group-inner';
+        group.appendChild(inner);
+        toolsDiv.insertBefore(group, toolsDiv.firstChild);
+        hasGrouped = true;
+      }
+      const inner = group.querySelector('.tool-group-inner');
+      looseBefore.forEach(c => inner.appendChild(c));
+      _refreshGroupSummary(group);
+    }
     toolsDiv.appendChild(details);
     scrollToBottom();
+  }
+
+  function _refreshGroupSummary(group) {
+    const inner = group.querySelector('.tool-group-inner');
+    const count = inner ? inner.childElementCount : 0;
+    const summary = group.querySelector('.tool-group-summary');
+    if (summary) summary.textContent = `展开 ${count} 个工具调用`;
   }
 
   function updateToolCall(toolUseId, result) {

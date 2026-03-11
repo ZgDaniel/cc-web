@@ -665,6 +665,39 @@ body {
   font-family: 'SF Mono', monospace;
 }
 
+/* Tool group (auto-fold) */
+.tool-group {
+  margin: 8px 0;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.tool-group-summary {
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
+  list-style: none;
+  user-select: none;
+}
+.tool-group-summary::-webkit-details-marker { display: none; }
+.tool-group-summary::before {
+  content: '▸ ';
+  font-size: 11px;
+  transition: transform 0.2s;
+  display: inline-block;
+}
+.tool-group[open] > .tool-group-summary::before { transform: rotate(90deg); }
+.tool-group-summary:hover { background: var(--bg-tertiary); }
+.tool-group-inner {
+  padding: 4px 8px;
+  background: var(--bg-primary);
+}
+.tool-group-inner .tool-call {
+  margin: 4px 0;
+}
+
 /* AskUserQuestion preview */
 .ask-user-question {
   padding: 10px 12px;
