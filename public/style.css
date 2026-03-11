@@ -49,11 +49,9 @@ body {
   -webkit-tap-highlight-color: transparent;
 }
 
-/* Scrollbar */
-::-webkit-scrollbar { width: 5px; }
-::-webkit-scrollbar-track { background: var(--scrollbar-track); }
-::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #b0a090; }
+/* 全局隐藏原生滚动条，聊天区由 custom-scrollbar 接管 */
+::-webkit-scrollbar { display: none; }
+* { scrollbar-width: none; }
 
 /* === Login === */
 .login-overlay {
@@ -369,6 +367,16 @@ body {
 .custom-scrollbar.active {
   opacity: 1;
 }
+/* 移动端触摸后 hover 会粘滞 — 完全禁用 hover 触发，只靠 .active（拖动时）显示 */
+@media (pointer: coarse) {
+  .messages-wrap:hover .custom-scrollbar {
+    opacity: 0;
+  }
+  /* 移动端滚动时用独立的类显示滑块，不走 .active */
+  .custom-scrollbar.scrolling {
+    opacity: 1;
+  }
+}
 .custom-scrollbar-thumb {
   position: absolute;
   right: 0;
@@ -388,6 +396,28 @@ body {
   cursor: grab;
 }
 .custom-scrollbar-thumb.dragging { cursor: grabbing; }
+/* 移动端触摸设备：加宽滑块与轨道，便于手指操作；默认隐藏，拖动时显示 */
+@media (pointer: coarse) {
+  .custom-scrollbar {
+    width: 18px;
+    right: 0;
+    opacity: 0;
+  }
+  .custom-scrollbar.active {
+    opacity: 1;
+  }
+  .custom-scrollbar-thumb {
+    width: 8px;
+    right: 5px;
+    min-height: 40px;
+    border-radius: 4px;
+  }
+  .custom-scrollbar-thumb:hover,
+  .custom-scrollbar-thumb.dragging {
+    width: 14px;
+    right: 2px;
+  }
+}
 .welcome-msg {
   text-align: center;
   margin: auto;
@@ -640,10 +670,64 @@ body {
   color: var(--text-primary);
   margin-bottom: 8px;
 }
+/* 左右分栏布局 */
+.ask-options-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ask-options-layout.has-preview {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto auto;
+  gap: 8px;
+  align-items: start;
+}
 .ask-question-options {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  grid-row: 1;
+  grid-column: 1;
+}
+/* 右侧预览区 */
+.ask-option-preview {
+  grid-row: 1;
+  grid-column: 2;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  min-height: 60px;
+  transition: background 0.15s;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* 确认按钮 — 仅移动端 */
+.ask-confirm-btn {
+  display: none;
+  grid-row: 2;
+  grid-column: 1 / -1;
+  width: 100%;
+  padding: 9px 0;
+  border: 1.5px solid var(--accent);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.ask-confirm-btn:active {
+  background: var(--accent);
+  color: #fff;
+}
+@media (pointer: coarse) {
+  .ask-confirm-btn { display: block; }
 }
 .ask-option-item {
   border: 1px solid var(--border-color);
@@ -656,6 +740,10 @@ body {
   transition: background 0.12s, border-color 0.12s;
 }
 .ask-option-item:hover {
+  background: var(--accent-light);
+  border-color: var(--accent);
+}
+.ask-option-item.ask-option-selected {
   background: var(--accent-light);
   border-color: var(--accent);
 }
