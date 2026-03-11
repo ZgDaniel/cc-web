@@ -849,6 +849,9 @@ wss.on('connection', (ws) => {
       case 'save_model_config':
         handleSaveModelConfig(ws, msg.config);
         break;
+      case 'fetch_models':
+        handleFetchModels(ws, msg);
+        break;
       default:
         wsSend(ws, { type: 'error', message: `Unknown type: ${msg.type}` });
     }
@@ -971,6 +974,69 @@ function handleSaveModelConfig(ws, newConfig) {
   plog('INFO', 'model_config_saved', { mode: merged.mode, activeTemplate: merged.activeTemplate });
   wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
   wsSend(ws, { type: 'system_message', message: '模型配置已保存' });
+}
+
+// === Fetch Upstream Models ===
+function handleFetchModels(ws, msg) {
+  const { apiBase, apiKey, modelsEndpoint } = msg;
+  if (!apiBase || !apiKey) {
+    return wsSend(ws, { type: 'fetch_models_result', success: false, message: '需要填写 API Base 和 API Key' });
+  }
+  // Build URL: apiBase + modelsEndpoint (default /v1/models)
+  let base = apiBase.replace(/\/+$/, '');
+  const endpoint = modelsEndpoint || '/v1/models';
+  const fullUrl = base + endpoint;
+
+  let parsed;
+  try { parsed = new URL(fullUrl); } catch {
+    return wsSend(ws, { type: 'fetch_models_result', success: false, message: '无效的 URL: ' + fullUrl });
+  }
+
+  // Resolve real apiKey (if masked, look up saved config by template name or apiBase)
+  let realKey = apiKey;
+  if (apiKey.includes('****')) {
+    const config = loadModelConfig();
+    const saved = (config.templates || []);
+    // Match by template name first, then by apiBase
+    const tpl = (msg.templateName && saved.find(t => t.name === msg.templateName))
+      || saved.find(t => t.apiBase && t.apiBase.replace(/\/+$/, '') === base)
+      || null;
+    if (tpl && tpl.apiKey && !tpl.apiKey.includes('****')) realKey = tpl.apiKey;
+    else return wsSend(ws, { type: 'fetch_models_result', success: false, message: 'API Key 已脱敏，请重新输入完整 Key' });
+  }
+
+  const mod = parsed.protocol === 'https:' ? require('https') : require('http');
+  const reqOptions = {
+    method: 'GET',
+    headers: { 'Authorization': `Bearer ${realKey}` },
+    timeout: 15000,
+  };
+
+  const req = mod.request(parsed, reqOptions, (res) => {
+    let body = '';
+    res.on('data', (chunk) => { body += chunk; });
+    res.on('end', () => {
+      if (res.statusCode !== 200) {
+        return wsSend(ws, { type: 'fetch_models_result', success: false, message: `HTTP ${res.statusCode}: ${body.slice(0, 200)}` });
+      }
+      try {
+        const json = JSON.parse(body);
+        const models = (json.data || json.models || []).map(m => typeof m === 'string' ? m : m.id || m.name || '').filter(Boolean).sort();
+        wsSend(ws, { type: 'fetch_models_result', success: true, models });
+      } catch (e) {
+        wsSend(ws, { type: 'fetch_models_result', success: false, message: '解析响应失败: ' + e.message });
+      }
+    });
+  });
+
+  req.on('error', (e) => {
+    wsSend(ws, { type: 'fetch_models_result', success: false, message: '请求失败: ' + e.message });
+  });
+  req.on('timeout', () => {
+    req.destroy();
+    wsSend(ws, { type: 'fetch_models_result', success: false, message: '请求超时 (15s)' });
+  });
+  req.end();
 }
 
 // === Slash Command Handler ===

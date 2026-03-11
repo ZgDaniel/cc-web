@@ -1078,6 +1078,27 @@ body {
   border-radius: 6px;
 }
 .settings-panel h3 .settings-close:hover { color: var(--text-primary); background: var(--bg-tertiary); }
+.settings-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+.settings-header h3 {
+  margin-bottom: 0;
+  flex: 1;
+}
+.settings-header .settings-close {
+  margin-left: auto;
+  background: none;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+.settings-header .settings-close:hover { color: var(--text-primary); background: var(--bg-tertiary); }
 .settings-field {
   margin-bottom: 16px;
 }

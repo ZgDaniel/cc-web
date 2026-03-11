@@ -326,6 +326,10 @@
         if (typeof _onModelConfig === 'function') _onModelConfig(msg.config);
         break;
 
+      case 'fetch_models_result':
+        if (typeof _onFetchModelsResult === 'function') _onFetchModelsResult(msg);
+        break;
+
       case 'background_done':
         // A background task completed (browser was disconnected or viewing another session)
         showToast(`「${msg.title}」任务完成`, msg.sessionId);
@@ -1310,6 +1314,7 @@
   let _onNotifyConfig = null;
   let _onNotifyTestResult = null;
   let _onModelConfig = null;
+  let _onFetchModelsResult = null;
 
   const settingsBtn = $('#settings-btn');
 
@@ -1373,23 +1378,9 @@
       <div class="settings-divider"></div>
 
       <div class="settings-section-title">修改密码</div>
-      <div class="settings-field">
-        <label>当前密码</label>
-        <input type="password" id="settings-current-pw" placeholder="当前密码" autocomplete="current-password">
+      <div class="settings-actions" style="margin-top:0">
+        <button class="btn-test" id="pw-open-modal-btn" style="padding:6px 16px">修改密码</button>
       </div>
-      <div class="settings-field">
-        <label>新密码</label>
-        <input type="password" id="settings-new-pw" placeholder="新密码" autocomplete="new-password">
-        <div class="password-hint" id="settings-pw-hint">至少 8 位，包含大写/小写/数字/特殊字符中的 2 种</div>
-      </div>
-      <div class="settings-field">
-        <label>确认新密码</label>
-        <input type="password" id="settings-confirm-pw" placeholder="确认新密码" autocomplete="new-password">
-      </div>
-      <div class="settings-actions">
-        <button class="btn-save" id="pw-change-btn" disabled>修改密码</button>
-      </div>
-      <div class="settings-status" id="pw-status"></div>
     `;
 
     overlay.appendChild(panel);
@@ -1519,22 +1510,44 @@
           <label>API Base URL</label>
           <input type="text" id="tpl-ed-apibase" placeholder="https://api.anthropic.com" value="${escapeHtml(tpl.apiBase || '')}">
         </div>
+
+        <div class="settings-divider" style="margin:12px 0"></div>
+
+        <div class="settings-field">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:600">
+            获取上游模型列表
+          </label>
+          <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
+            <label style="font-size:0.85em;display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input type="checkbox" id="tpl-ed-custom-endpoint"> 端点
+            </label>
+            <input type="text" id="tpl-ed-models-endpoint" placeholder="/v1/models" style="flex:1;display:none" value="">
+          </div>
+          <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
+            <button class="btn-test" id="tpl-ed-fetch-models" style="padding:4px 12px;white-space:nowrap">获取模型</button>
+            <span id="tpl-ed-fetch-status" style="font-size:0.85em;color:var(--text-secondary)"></span>
+          </div>
+        </div>
+
+        <div class="settings-divider" style="margin:12px 0"></div>
+
         <div class="settings-field">
           <label>默认模型 (ANTHROPIC_MODEL)</label>
-          <input type="text" id="tpl-ed-default" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.defaultModel || '')}">
+          <input type="text" id="tpl-ed-default" list="tpl-dl-models" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.defaultModel || '')}" autocomplete="off">
         </div>
         <div class="settings-field">
           <label>Opus 模型名</label>
-          <input type="text" id="tpl-ed-opus" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.opusModel || '')}">
+          <input type="text" id="tpl-ed-opus" list="tpl-dl-models" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.opusModel || '')}" autocomplete="off">
         </div>
         <div class="settings-field">
           <label>Sonnet 模型名</label>
-          <input type="text" id="tpl-ed-sonnet" placeholder="claude-sonnet-4-6" value="${escapeHtml(tpl.sonnetModel || '')}">
+          <input type="text" id="tpl-ed-sonnet" list="tpl-dl-models" placeholder="claude-sonnet-4-6" value="${escapeHtml(tpl.sonnetModel || '')}" autocomplete="off">
         </div>
         <div class="settings-field">
           <label>Haiku 模型名</label>
-          <input type="text" id="tpl-ed-haiku" placeholder="claude-haiku-4-5-20251001" value="${escapeHtml(tpl.haikuModel || '')}">
+          <input type="text" id="tpl-ed-haiku" list="tpl-dl-models" placeholder="claude-haiku-4-5-20251001" value="${escapeHtml(tpl.haikuModel || '')}" autocomplete="off">
         </div>
+        <datalist id="tpl-dl-models"></datalist>
         <div class="settings-actions">
           <button class="btn-save" id="tpl-ed-ok">确定</button>
         </div>
@@ -1542,7 +1555,51 @@
       modalOverlay.appendChild(modal);
       document.body.appendChild(modalOverlay);
 
-      const closeModal = () => { document.body.removeChild(modalOverlay); };
+      // Custom endpoint checkbox toggle
+      const customEndpointCb = modal.querySelector('#tpl-ed-custom-endpoint');
+      const endpointInput = modal.querySelector('#tpl-ed-models-endpoint');
+      customEndpointCb.addEventListener('change', () => {
+        endpointInput.style.display = customEndpointCb.checked ? '' : 'none';
+      });
+
+      // Fetch models
+      const fetchBtn = modal.querySelector('#tpl-ed-fetch-models');
+      const fetchStatus = modal.querySelector('#tpl-ed-fetch-status');
+      const datalist = modal.querySelector('#tpl-dl-models');
+
+      fetchBtn.addEventListener('click', () => {
+        const apiBase = modal.querySelector('#tpl-ed-apibase').value.trim();
+        const apiKey = modal.querySelector('#tpl-ed-apikey').value.trim();
+        if (!apiBase || !apiKey) {
+          fetchStatus.textContent = '请先填写 API Base 和 API Key';
+          fetchStatus.style.color = 'var(--text-error, #e85d5d)';
+          return;
+        }
+        const modelsEndpoint = customEndpointCb.checked ? endpointInput.value.trim() : '';
+        fetchBtn.disabled = true;
+        fetchStatus.textContent = '正在获取...';
+        fetchStatus.style.color = 'var(--text-secondary)';
+
+        _onFetchModelsResult = (result) => {
+          _onFetchModelsResult = null;
+          fetchBtn.disabled = false;
+          if (result.success) {
+            datalist.innerHTML = result.models.map(m => `<option value="${escapeHtml(m)}">`).join('');
+            fetchStatus.textContent = `获取到 ${result.models.length} 个模型`;
+            fetchStatus.style.color = 'var(--text-success, #5dbe5d)';
+          } else {
+            fetchStatus.textContent = result.message || '获取失败';
+            fetchStatus.style.color = 'var(--text-error, #e85d5d)';
+          }
+        };
+
+        send({ type: 'fetch_models', apiBase, apiKey, modelsEndpoint: modelsEndpoint || undefined, templateName: tpl.name });
+      });
+
+      const closeModal = () => {
+        _onFetchModelsResult = null;
+        document.body.removeChild(modalOverlay);
+      };
       modal.querySelector('#tpl-modal-close').addEventListener('click', closeModal);
       modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
 
@@ -1694,69 +1751,108 @@
       showStatus('已保存', 'success');
     });
 
-    // Password change in settings
-    const settingsCurrentPw = panel.querySelector('#settings-current-pw');
-    const settingsNewPw = panel.querySelector('#settings-new-pw');
-    const settingsConfirmPw = panel.querySelector('#settings-confirm-pw');
-    const pwHint = panel.querySelector('#settings-pw-hint');
-    const pwChangeBtn = panel.querySelector('#pw-change-btn');
-    const pwStatus = panel.querySelector('#pw-status');
+    // Password change button -> opens modal
+    const pwOpenModalBtn = panel.querySelector('#pw-open-modal-btn');
+    pwOpenModalBtn.addEventListener('click', openPasswordModal);
 
-    function checkSettingsPw() {
-      const newPw = settingsNewPw.value;
-      const confirmPw = settingsConfirmPw.value;
-      const currentPw = settingsCurrentPw.value;
-      if (!newPw) {
-        pwHint.textContent = '至少 8 位，包含大写/小写/数字/特殊字符中的 2 种';
-        pwHint.className = 'password-hint';
-        pwChangeBtn.disabled = true;
-        return;
-      }
-      const result = clientValidatePassword(newPw);
-      if (!result.valid) {
-        pwHint.textContent = result.message;
-        pwHint.className = 'password-hint error';
-        pwChangeBtn.disabled = true;
-        return;
-      }
-      pwHint.textContent = '密码强度符合要求';
-      pwHint.className = 'password-hint success';
-      pwChangeBtn.disabled = !currentPw || !confirmPw || confirmPw !== newPw;
-    }
+    function openPasswordModal() {
+      const pwOverlay = document.createElement('div');
+      pwOverlay.className = 'settings-overlay';
+      pwOverlay.style.zIndex = '10001';
+      const pwModal = document.createElement('div');
+      pwModal.className = 'settings-panel';
+      pwModal.style.maxWidth = '400px';
+      pwModal.innerHTML = `
+        <div class="settings-header">
+          <h3>修改密码</h3>
+          <button class="settings-close" id="pw-modal-close">&times;</button>
+        </div>
+        <div class="settings-field">
+          <label>当前密码</label>
+          <input type="password" id="pw-modal-current" placeholder="当前密码" autocomplete="current-password">
+        </div>
+        <div class="settings-field">
+          <label>新密码</label>
+          <input type="password" id="pw-modal-new" placeholder="新密码" autocomplete="new-password">
+          <div class="password-hint" id="pw-modal-hint">至少 8 位，包含大写/小写/数字/特殊字符中的 2 种</div>
+        </div>
+        <div class="settings-field">
+          <label>确认新密码</label>
+          <input type="password" id="pw-modal-confirm" placeholder="确认新密码" autocomplete="new-password">
+        </div>
+        <div class="settings-actions">
+          <button class="btn-save" id="pw-modal-submit" disabled>修改密码</button>
+        </div>
+        <div class="settings-status" id="pw-modal-status"></div>
+      `;
+      pwOverlay.appendChild(pwModal);
+      document.body.appendChild(pwOverlay);
 
-    settingsCurrentPw.addEventListener('input', checkSettingsPw);
-    settingsNewPw.addEventListener('input', checkSettingsPw);
-    settingsConfirmPw.addEventListener('input', checkSettingsPw);
+      const currentPwIn = pwModal.querySelector('#pw-modal-current');
+      const newPwIn = pwModal.querySelector('#pw-modal-new');
+      const confirmPwIn = pwModal.querySelector('#pw-modal-confirm');
+      const hint = pwModal.querySelector('#pw-modal-hint');
+      const submitBtn = pwModal.querySelector('#pw-modal-submit');
+      const status = pwModal.querySelector('#pw-modal-status');
 
-    pwChangeBtn.addEventListener('click', () => {
-      const currentPw = settingsCurrentPw.value;
-      const newPw = settingsNewPw.value;
-      const confirmPw = settingsConfirmPw.value;
-      if (newPw !== confirmPw) {
-        pwStatus.textContent = '两次密码不一致';
-        pwStatus.className = 'settings-status error';
-        return;
-      }
-      pwChangeBtn.disabled = true;
-      pwStatus.textContent = '正在修改...';
-      pwStatus.className = 'settings-status';
-      _onPasswordChanged = (result) => {
-        if (result.success) {
-          pwStatus.textContent = result.message || '密码修改成功';
-          pwStatus.className = 'settings-status success';
-          settingsCurrentPw.value = '';
-          settingsNewPw.value = '';
-          settingsConfirmPw.value = '';
-          pwHint.textContent = '至少 8 位，包含大写/小写/数字/特殊字符中的 2 种';
-          pwHint.className = 'password-hint';
-        } else {
-          pwStatus.textContent = result.message || '修改失败';
-          pwStatus.className = 'settings-status error';
-          pwChangeBtn.disabled = false;
+      function checkPw() {
+        const newPw = newPwIn.value;
+        const confirmPw = confirmPwIn.value;
+        const currentPw = currentPwIn.value;
+        if (!newPw) {
+          hint.textContent = '至少 8 位，包含大写/小写/数字/特殊字符中的 2 种';
+          hint.className = 'password-hint';
+          submitBtn.disabled = true;
+          return;
         }
-      };
-      send({ type: 'change_password', currentPassword: currentPw, newPassword: newPw });
-    });
+        const result = clientValidatePassword(newPw);
+        if (!result.valid) {
+          hint.textContent = result.message;
+          hint.className = 'password-hint error';
+          submitBtn.disabled = true;
+          return;
+        }
+        hint.textContent = '密码强度符合要求';
+        hint.className = 'password-hint success';
+        submitBtn.disabled = !currentPw || !confirmPw || confirmPw !== newPw;
+      }
+
+      currentPwIn.addEventListener('input', checkPw);
+      newPwIn.addEventListener('input', checkPw);
+      confirmPwIn.addEventListener('input', checkPw);
+
+      const closePwModal = () => { document.body.removeChild(pwOverlay); };
+      pwModal.querySelector('#pw-modal-close').addEventListener('click', closePwModal);
+      pwOverlay.addEventListener('click', (e) => { if (e.target === pwOverlay) closePwModal(); });
+
+      submitBtn.addEventListener('click', () => {
+        const currentPw = currentPwIn.value;
+        const newPw = newPwIn.value;
+        const confirmPw = confirmPwIn.value;
+        if (newPw !== confirmPw) {
+          status.textContent = '两次密码不一致';
+          status.className = 'settings-status error';
+          return;
+        }
+        submitBtn.disabled = true;
+        status.textContent = '正在修改...';
+        status.className = 'settings-status';
+        _onPasswordChanged = (result) => {
+          if (result.success) {
+            status.textContent = result.message || '密码修改成功';
+            status.className = 'settings-status success';
+            setTimeout(closePwModal, 1200);
+          } else {
+            status.textContent = result.message || '修改失败';
+            status.className = 'settings-status error';
+            submitBtn.disabled = false;
+          }
+        };
+        send({ type: 'change_password', currentPassword: currentPw, newPassword: newPw });
+      });
+
+      currentPwIn.focus();
+    }
 
     document.addEventListener('keydown', _settingsEscape);
   }
@@ -1767,6 +1863,7 @@
     _onNotifyConfig = null;
     _onNotifyTestResult = null;
     _onModelConfig = null;
+    _onFetchModelsResult = null;
     document.removeEventListener('keydown', _settingsEscape);
   }
 
