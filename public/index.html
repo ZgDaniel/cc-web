@@ -32,7 +32,13 @@
     <!-- Sidebar -->
     <aside id="sidebar" class="sidebar">
       <div class="sidebar-header">
-        <button id="new-chat-btn" class="new-chat-btn">+ 新会话</button>
+        <div class="new-chat-split">
+          <button id="new-chat-btn" class="new-chat-btn">+ 新会话</button>
+          <button id="new-chat-arrow" class="new-chat-arrow" title="更多">▾</button>
+        </div>
+        <div id="new-chat-dropdown" class="new-chat-dropdown" hidden>
+          <button id="import-session-btn">导入本地 CLI 会话</button>
+        </div>
       </div>
       <div id="session-list" class="session-list"></div>
       <div class="sidebar-footer">
@@ -48,6 +54,7 @@
       <header class="chat-header">
         <button id="menu-btn" class="menu-btn" title="菜单">☰</button>
         <span id="chat-title" class="chat-title">新会话</span>
+        <span id="chat-cwd" class="chat-cwd" hidden></span>
         <select id="mode-select" class="mode-select" title="权限模式">
           <option value="yolo">YOLO</option>
           <option value="default">默认</option>

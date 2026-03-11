@@ -49,6 +49,7 @@
   let currentMode = localStorage.getItem('cc-web-mode') || 'yolo';
   let currentModel = 'opus';
   let loginPasswordValue = ''; // store login password for force-change flow
+  let currentCwd = null;
   let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
 
   // --- DOM ---
@@ -63,8 +64,12 @@
   const sidebarOverlay = $('#sidebar-overlay');
   const menuBtn = $('#menu-btn');
   const newChatBtn = $('#new-chat-btn');
+  const newChatArrow = $('#new-chat-arrow');
+  const newChatDropdown = $('#new-chat-dropdown');
+  const importSessionBtn = $('#import-session-btn');
   const sessionList = $('#session-list');
   const chatTitle = $('#chat-title');
+  const chatCwd = $('#chat-cwd');
   const costDisplay = $('#cost-display');
   const messagesDiv = $('#messages');
   const msgInput = $('#msg-input');
@@ -225,6 +230,18 @@
         currentSessionId = msg.sessionId;
         localStorage.setItem('cc-web-session', currentSessionId);
         chatTitle.textContent = msg.title || '新会话';
+        // 显示 cwd
+        currentCwd = msg.cwd || null;
+        if (currentCwd) {
+          const parts = currentCwd.replace(/\/+$/, '').split('/');
+          const short = parts.slice(-2).join('/') || currentCwd;
+          chatCwd.textContent = '~/' + short;
+          chatCwd.title = currentCwd;
+          chatCwd.hidden = false;
+        } else {
+          chatCwd.hidden = true;
+          chatCwd.textContent = '';
+        }
         // 同步 session 的 mode（如有）
         if (msg.mode && MODE_LABELS[msg.mode]) {
           currentMode = msg.mode;
@@ -346,6 +363,18 @@
 
       case 'password_changed':
         handlePasswordChanged(msg);
+        break;
+
+      case 'native_sessions':
+        if (typeof _onNativeSessions === 'function') _onNativeSessions(msg.groups || []);
+        break;
+
+      case 'cwd_suggestions':
+        if (typeof _onCwdSuggestions === 'function') _onCwdSuggestions(msg.paths || []);
+        break;
+
+      case 'update_info':
+        if (typeof window._ccOnUpdateInfo === 'function') window._ccOnUpdateInfo(msg);
         break;
     }
   }
@@ -476,7 +505,7 @@
       bubble.style.whiteSpace = 'pre-wrap';
       bubble.textContent = content;
     } else {
-      bubble.innerHTML = content ? renderMarkdown(content) : '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+      bubble.innerHTML = content ? renderMarkdown(content) : '';
     }
 
     div.appendChild(avatar);
@@ -1308,7 +1337,24 @@
   });
 
   sidebarOverlay.addEventListener('click', closeSidebar);
-  newChatBtn.addEventListener('click', () => send({ type: 'new_session' }));
+
+  // Split new-chat button
+  newChatBtn.addEventListener('click', () => showNewSessionModal());
+  newChatArrow.addEventListener('click', (e) => {
+    e.stopPropagation();
+    newChatDropdown.hidden = !newChatDropdown.hidden;
+  });
+  importSessionBtn.addEventListener('click', () => {
+    newChatDropdown.hidden = true;
+    showImportSessionModal();
+  });
+  document.addEventListener('click', (e) => {
+    if (!newChatDropdown.hidden &&
+        !newChatDropdown.contains(e.target) &&
+        e.target !== newChatArrow) {
+      newChatDropdown.hidden = true;
+    }
+  });
   sendBtn.addEventListener('click', sendMessage);
   abortBtn.addEventListener('click', () => send({ type: 'abort' }));
 
@@ -1474,10 +1520,11 @@
 
       <div class="settings-divider"></div>
 
-      <div class="settings-section-title">修改密码</div>
-      <div class="settings-actions" style="margin-top:0">
+      <div class="settings-actions" style="margin-top:0;flex-wrap:wrap;gap:10px">
         <button class="btn-test" id="pw-open-modal-btn" style="padding:6px 16px">修改密码</button>
+        <button class="btn-test" id="check-update-btn" style="padding:6px 16px">检查更新</button>
       </div>
+      <div class="settings-status" id="update-status" style="margin-top:8px"></div>
     `;
 
     overlay.appendChild(panel);
@@ -1852,6 +1899,35 @@
     const pwOpenModalBtn = panel.querySelector('#pw-open-modal-btn');
     pwOpenModalBtn.addEventListener('click', openPasswordModal);
 
+    // Check update button
+    const checkUpdateBtn = panel.querySelector('#check-update-btn');
+    const updateStatusEl = panel.querySelector('#update-status');
+    let _onUpdateInfo = null;
+    checkUpdateBtn.addEventListener('click', () => {
+      updateStatusEl.textContent = '正在检查...';
+      updateStatusEl.className = 'settings-status';
+      _onUpdateInfo = (info) => {
+        _onUpdateInfo = null;
+        if (info.error) {
+          updateStatusEl.textContent = '检查失败: ' + info.error;
+          updateStatusEl.className = 'settings-status error';
+          return;
+        }
+        if (info.hasUpdate) {
+          updateStatusEl.innerHTML = `有新版本 <strong>v${escapeHtml(info.latestVersion)}</strong>（当前 v${escapeHtml(info.localVersion)}）&nbsp;<a href="${escapeHtml(info.releaseUrl)}" target="_blank" style="color:var(--accent)">查看更新</a>`;
+          updateStatusEl.className = 'settings-status success';
+        } else {
+          updateStatusEl.textContent = `已是最新版本 v${info.localVersion}`;
+          updateStatusEl.className = 'settings-status success';
+        }
+      };
+      send({ type: 'check_update' });
+    });
+
+    // Wire _onUpdateInfo into WS handler via closure
+    const _origOnUpdateInfo = window._ccOnUpdateInfo;
+    window._ccOnUpdateInfo = (info) => { if (_onUpdateInfo) _onUpdateInfo(info); };
+
     function openPasswordModal() {
       const pwOverlay = document.createElement('div');
       pwOverlay.className = 'settings-overlay';
@@ -1961,6 +2037,7 @@
     _onNotifyTestResult = null;
     _onModelConfig = null;
     _onFetchModelsResult = null;
+    window._ccOnUpdateInfo = null;
     document.removeEventListener('keydown', _settingsEscape);
   }
 
@@ -2110,6 +2187,152 @@
         _onPasswordChanged = null;
       }
     }
+  }
+
+  // --- New Session Modal ---
+  let _onCwdSuggestions = null;
+
+  function showNewSessionModal() {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'new-session-overlay';
+
+    overlay.innerHTML = `
+      <div class="modal-panel">
+        <div class="modal-header">
+          <span class="modal-title">新建会话</span>
+          <button class="modal-close-btn" id="ns-close-btn">✕</button>
+        </div>
+        <div class="modal-body">
+          <label class="modal-field-label">工作目录</label>
+          <div class="modal-field-row">
+            <input type="text" id="ns-cwd-input" class="modal-text-input" placeholder="例如 /home/user/project" list="ns-cwd-list" autocomplete="off">
+            <datalist id="ns-cwd-list"></datalist>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn-secondary" id="ns-cancel-btn">取消</button>
+          <button class="modal-btn-primary" id="ns-create-btn">创建</button>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    const cwdInput = overlay.querySelector('#ns-cwd-input');
+    const cwdList = overlay.querySelector('#ns-cwd-list');
+
+    // Fetch suggestions on focus
+    cwdInput.addEventListener('focus', () => {
+      _onCwdSuggestions = (paths) => {
+        cwdList.innerHTML = paths.map(p => `<option value="${escapeHtml(p)}"></option>`).join('');
+      };
+      send({ type: 'list_cwd_suggestions' });
+    });
+
+    function close() {
+      overlay.remove();
+      _onCwdSuggestions = null;
+    }
+
+    overlay.querySelector('#ns-close-btn').addEventListener('click', close);
+    overlay.querySelector('#ns-cancel-btn').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+    overlay.querySelector('#ns-create-btn').addEventListener('click', () => {
+      const cwd = cwdInput.value.trim() || null;
+      close();
+      send({ type: 'new_session', cwd });
+    });
+
+    cwdInput.focus();
+  }
+
+  // --- Import Native Session Modal ---
+  let _onNativeSessions = null;
+
+  function showImportSessionModal() {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'import-session-overlay';
+
+    overlay.innerHTML = `
+      <div class="modal-panel modal-panel-wide">
+        <div class="modal-header">
+          <span class="modal-title">导入本地 CLI 会话</span>
+          <button class="modal-close-btn" id="is-close-btn">✕</button>
+        </div>
+        <div class="modal-body" id="is-body">
+          <div class="modal-loading">正在加载…</div>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    function close() {
+      overlay.remove();
+      _onNativeSessions = null;
+    }
+
+    overlay.querySelector('#is-close-btn').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+    _onNativeSessions = (groups) => {
+      const body = overlay.querySelector('#is-body');
+      if (!body) return;
+      if (!groups || groups.length === 0) {
+        body.innerHTML = '<div class="modal-empty">未找到本地 CLI 会话</div>';
+        return;
+      }
+      body.innerHTML = '';
+      for (const group of groups) {
+        const groupEl = document.createElement('div');
+        groupEl.className = 'import-group';
+        // Convert slug dir to readable path
+        let readablePath = group.dir.replace(/-/g, '/');
+        if (!readablePath.startsWith('/')) readablePath = '/' + readablePath;
+        readablePath = readablePath.replace(/\/+/g, '/');
+        const groupTitle = document.createElement('div');
+        groupTitle.className = 'import-group-title';
+        groupTitle.textContent = readablePath;
+        groupEl.appendChild(groupTitle);
+        for (const sess of group.sessions) {
+          const item = document.createElement('div');
+          item.className = 'import-item';
+          const info = document.createElement('div');
+          info.className = 'import-item-info';
+          const titleEl = document.createElement('div');
+          titleEl.className = 'import-item-title';
+          titleEl.textContent = sess.title;
+          const meta = document.createElement('div');
+          meta.className = 'import-item-meta';
+          const cwdText = sess.cwd ? sess.cwd : '';
+          const timeText = sess.updatedAt ? timeAgo(sess.updatedAt) : '';
+          meta.textContent = [cwdText, timeText].filter(Boolean).join(' · ');
+          info.appendChild(titleEl);
+          info.appendChild(meta);
+          const btn = document.createElement('button');
+          btn.className = 'import-item-btn';
+          btn.textContent = sess.alreadyImported ? '重新导入' : '导入';
+          btn.addEventListener('click', () => {
+            if (sess.alreadyImported) {
+              if (!confirm('已导入过此会话，重新导入将覆盖已有内容。确认继续？')) return;
+            } else {
+              if (!confirm('由于 cc-web 与本地 CLI 的逻辑不同，导入会话需要解析后方可展示，导入后将覆盖已有内容。确认继续？')) return;
+            }
+            close();
+            send({ type: 'import_native_session', sessionId: sess.sessionId, projectDir: group.dir });
+          });
+          item.appendChild(info);
+          item.appendChild(btn);
+          groupEl.appendChild(item);
+        }
+        body.appendChild(groupEl);
+      }
+    };
+
+    send({ type: 'list_native_sessions' });
   }
 
   // --- Helpers ---

@@ -814,7 +814,7 @@ wss.on('connection', (ws) => {
         handleAbort(ws);
         break;
       case 'new_session':
-        handleNewSession(ws);
+        handleNewSession(ws, msg);
         break;
       case 'load_session':
         handleLoadSession(ws, msg.sessionId);
@@ -851,6 +851,18 @@ wss.on('connection', (ws) => {
         break;
       case 'fetch_models':
         handleFetchModels(ws, msg);
+        break;
+      case 'check_update':
+        handleCheckUpdate(ws);
+        break;
+      case 'list_native_sessions':
+        handleListNativeSessions(ws);
+        break;
+      case 'import_native_session':
+        handleImportNativeSession(ws, msg);
+        break;
+      case 'list_cwd_suggestions':
+        handleListCwdSuggestions(ws);
         break;
       default:
         wsSend(ws, { type: 'error', message: `Unknown type: ${msg.type}` });
@@ -1157,7 +1169,8 @@ function handleSlashCommand(ws, text, sessionId) {
 }
 
 // === Session Handlers ===
-function handleNewSession(ws) {
+function handleNewSession(ws, msg) {
+  const cwd = (msg && msg.cwd) ? String(msg.cwd) : null;
   const id = crypto.randomUUID();
   const session = {
     id,
@@ -1169,10 +1182,11 @@ function handleNewSession(ws) {
     permissionMode: 'yolo',
     totalCost: 0,
     messages: [],
+    cwd: cwd,
   };
   saveSession(session);
   wsSessionMap.set(ws, id);
-  wsSend(ws, { type: 'session_info', sessionId: id, messages: [], title: session.title, mode: session.permissionMode, model: null });
+  wsSend(ws, { type: 'session_info', sessionId: id, messages: [], title: session.title, mode: session.permissionMode, model: null, cwd: session.cwd });
   sendSessionList(ws);
 }
 
@@ -1204,6 +1218,7 @@ function handleLoadSession(ws, sessionId) {
     mode: session.permissionMode || 'yolo',
     model: modelShortName(session.model),
     hasUnread: hadUnread,
+    cwd: session.cwd || null,
   });
 
   // Resume streaming if process is still active
@@ -1433,7 +1448,7 @@ function handleMessage(ws, msg, options = {}) {
   try {
     proc = spawn(CLAUDE_PATH, args, {
       env,
-      cwd: process.env.HOME || process.env.USERPROFILE || process.cwd(),
+      cwd: session.cwd || process.env.HOME || process.env.USERPROFILE || process.cwd(),
       stdio: [inputFd, outputFd, errorFd],
       detached: !IS_WIN,
       windowsHide: true,
@@ -1581,6 +1596,250 @@ function sanitizeToolInput(toolName, input) {
     return parsed;
   }
   return truncateObj(parsed, 500);
+}
+
+// === Check Update ===
+function handleCheckUpdate(ws) {
+  const localVersion = (() => {
+    try {
+      const cl = fs.readFileSync(path.join(__dirname, 'CHANGELOG.md'), 'utf8');
+      const m = cl.match(/\*\*v([\d.]+)\*\*/);
+      if (m) return m[1];
+    } catch {}
+    try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || 'unknown'; } catch {}
+    return 'unknown';
+  })();
+
+  const https = require('https');
+  const options = {
+    hostname: 'raw.githubusercontent.com',
+    path: '/ZgDaniel/cc-web/main/CHANGELOG.md',
+    headers: { 'User-Agent': 'cc-web-update-check' },
+    timeout: 10000,
+  };
+
+  const req = https.request(options, (res) => {
+    let body = '';
+    res.on('data', c => body += c);
+    res.on('end', () => {
+      if (res.statusCode !== 200) {
+        return wsSend(ws, { type: 'update_info', localVersion, error: `HTTP ${res.statusCode}` });
+      }
+      const m = body.match(/\*\*v([\d.]+)\*\*/);
+      const latest = m ? m[1] : null;
+      if (!latest) {
+        return wsSend(ws, { type: 'update_info', localVersion, error: '无法解析远端版本号' });
+      }
+      const hasUpdate = latest !== localVersion;
+      wsSend(ws, {
+        type: 'update_info',
+        localVersion,
+        latestVersion: latest,
+        hasUpdate,
+        releaseUrl: 'https://github.com/ZgDaniel/cc-web',
+      });
+    });
+  });
+  req.on('error', (e) => {
+    wsSend(ws, { type: 'update_info', localVersion, error: '网络请求失败: ' + e.message });
+  });
+  req.on('timeout', () => {
+    req.destroy();
+    wsSend(ws, { type: 'update_info', localVersion, error: '请求超时' });
+  });
+  req.end();
+}
+
+// === Native Session Import ===
+
+const CLAUDE_PROJECTS_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
+
+function parseJsonlToMessages(lines) {
+  const messages = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry;
+    try { entry = JSON.parse(trimmed); } catch { continue; }
+    if (entry.type === 'user') {
+      const raw = entry.message?.content;
+      let content = '';
+      if (typeof raw === 'string') {
+        content = raw;
+      } else if (Array.isArray(raw)) {
+        // skip tool_result blocks, only take text blocks
+        content = raw
+          .filter(b => b.type === 'text')
+          .map(b => b.text || '')
+          .join('');
+      }
+      if (content.trim()) {
+        messages.push({ role: 'user', content, timestamp: entry.timestamp || null });
+      }
+    } else if (entry.type === 'assistant') {
+      const blocks = entry.message?.content;
+      if (!Array.isArray(blocks)) continue;
+      let content = '';
+      const toolCalls = [];
+      for (const b of blocks) {
+        if (b.type === 'text' && b.text) {
+          content += b.text;
+        } else if (b.type === 'tool_use') {
+          toolCalls.push({ name: b.name, id: b.id, input: b.input, done: true });
+        }
+        // skip thinking blocks
+      }
+      if (content.trim() || toolCalls.length > 0) {
+        messages.push({ role: 'assistant', content, toolCalls, timestamp: entry.timestamp || null });
+      }
+    }
+    // skip other types
+  }
+  return messages;
+}
+
+function getImportedSessionIds() {
+  const imported = new Set();
+  try {
+    for (const f of fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'))) {
+      try {
+        const s = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8'));
+        if (s.claudeSessionId) imported.add(s.claudeSessionId);
+      } catch {}
+    }
+  } catch {}
+  return imported;
+}
+
+function handleListNativeSessions(ws) {
+  const groups = [];
+  try {
+    const imported = getImportedSessionIds();
+    const dirs = fs.readdirSync(CLAUDE_PROJECTS_DIR).filter(d => {
+      try { return fs.statSync(path.join(CLAUDE_PROJECTS_DIR, d)).isDirectory(); } catch { return false; }
+    });
+    for (const dir of dirs) {
+      const dirPath = path.join(CLAUDE_PROJECTS_DIR, dir);
+      const sessionItems = [];
+      try {
+        const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.jsonl'));
+        for (const f of files) {
+          const sessionId = f.replace('.jsonl', '');
+          const filePath = path.join(dirPath, f);
+          try {
+            const content = fs.readFileSync(filePath, 'utf8');
+            const lines = content.split('\n');
+            // Find first user message for title
+            let title = sessionId.slice(0, 20);
+            let cwd = null;
+            let updatedAt = null;
+            let lastTs = null;
+            for (const line of lines) {
+              const t = line.trim();
+              if (!t) continue;
+              try {
+                const e = JSON.parse(t);
+                if (e.timestamp) lastTs = e.timestamp;
+                if (e.type === 'user' && !cwd) {
+                  cwd = e.cwd || null;
+                  const raw = e.message?.content;
+                  let text = '';
+                  if (typeof raw === 'string') text = raw;
+                  else if (Array.isArray(raw)) text = raw.filter(b => b.type === 'text').map(b => b.text || '').join('');
+                  if (text.trim()) title = text.trim().slice(0, 80).replace(/\n/g, ' ');
+                }
+              } catch {}
+            }
+            updatedAt = lastTs;
+            sessionItems.push({ sessionId, title, cwd, updatedAt, alreadyImported: imported.has(sessionId) });
+          } catch {}
+        }
+      } catch {}
+      if (sessionItems.length > 0) {
+        sessionItems.sort((a, b) => {
+          if (!a.updatedAt) return 1;
+          if (!b.updatedAt) return -1;
+          return new Date(b.updatedAt) - new Date(a.updatedAt);
+        });
+        groups.push({ dir, sessions: sessionItems });
+      }
+    }
+  } catch {}
+  wsSend(ws, { type: 'native_sessions', groups });
+}
+
+function handleImportNativeSession(ws, msg) {
+  const { sessionId, projectDir } = msg;
+  if (!sessionId || !projectDir) {
+    return wsSend(ws, { type: 'error', message: '缺少 sessionId 或 projectDir' });
+  }
+  const filePath = path.join(CLAUDE_PROJECTS_DIR, String(projectDir), `${sanitizeId(sessionId)}.jsonl`);
+  if (!filePath.startsWith(CLAUDE_PROJECTS_DIR)) {
+    return wsSend(ws, { type: 'error', message: '非法路径' });
+  }
+  let content;
+  try { content = fs.readFileSync(filePath, 'utf8'); } catch {
+    return wsSend(ws, { type: 'error', message: '无法读取会话文件' });
+  }
+  const lines = content.split('\n');
+  const messages = parseJsonlToMessages(lines);
+
+  // Find or create cc-web session with this claudeSessionId
+  let existingSession = null;
+  try {
+    for (const f of fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'))) {
+      try {
+        const s = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8'));
+        if (s.claudeSessionId === sessionId) { existingSession = s; break; }
+      } catch {}
+    }
+  } catch {}
+
+  // Determine title and cwd from messages/raw
+  let title = sessionId.slice(0, 20);
+  let cwd = null;
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const e = JSON.parse(t);
+      if (e.type === 'user') {
+        if (!cwd) cwd = e.cwd || null;
+        const raw = e.message?.content;
+        let text = '';
+        if (typeof raw === 'string') text = raw;
+        else if (Array.isArray(raw)) text = raw.filter(b => b.type === 'text').map(b => b.text || '').join('');
+        if (text.trim()) { title = text.trim().slice(0, 60).replace(/\n/g, ' '); break; }
+      }
+    } catch {}
+  }
+
+  const id = existingSession ? existingSession.id : crypto.randomUUID();
+  const session = {
+    id,
+    title,
+    created: existingSession?.created || new Date().toISOString(),
+    updated: new Date().toISOString(),
+    claudeSessionId: sessionId,
+    importedFrom: projectDir,
+    model: existingSession?.model || null,
+    permissionMode: existingSession?.permissionMode || 'yolo',
+    totalCost: existingSession?.totalCost || 0,
+    messages,
+    cwd: cwd || existingSession?.cwd || null,
+  };
+  saveSession(session);
+  wsSessionMap.set(ws, id);
+  wsSend(ws, { type: 'session_info', sessionId: id, messages: session.messages, title: session.title, mode: session.permissionMode, model: modelShortName(session.model), cwd: session.cwd });
+  sendSessionList(ws);
+}
+
+function handleListCwdSuggestions(ws) {
+  const paths = new Set();
+  // Always include HOME
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  if (home) paths.add(home);
+  wsSend(ws, { type: 'cwd_suggestions', paths: Array.from(paths).sort() });
 }
 
 // === Startup ===
