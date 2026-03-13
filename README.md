@@ -1,6 +1,6 @@
 # CC-Web
 
-Claude Code 轻量级 Web 远程工具 — 在浏览器中与 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 交互。
+Claude Code / Codex 轻量级 Web 远程工具 — 在浏览器中与本机 CLI Agent 交互。
 
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
@@ -24,20 +24,27 @@ https://github.com/ZgDaniel/cc-web 给我装！
 
 ## 功能特性
 
-- **超轻量（1.6MB）** — 后端性能占用少，前端通过 web 访问
+- **超轻量** — 后端性能占用少，前端通过 web 访问
+- **双 Agent 会话** — 新建会话时可选择 Claude 或 Codex，沿用相同的 Web 会话与后台任务模型
+- **Agent 视图隔离** — 侧边栏切换 Claude / Codex 后，仅展示当前 Agent 的会话与最近记录，互不干扰
+- **独立 Agent 设置** — Claude 与 Codex 拥有各自的设置入口与默认行为，保持贴近各自原生 CLI 的使用方式
 - **多会话管理** — 创建、切换、重命名、删除会话，删除时同步清除本地 Claude 历史记录
 - **会话续接** — 基于 `--resume` 实现跨消息上下文保持，也可通过 SSH 使用 `tmux attach -t claude` 命令加入会话
+- **本地历史导入** — Claude 可导入 `~/.claude/projects/` 会话；Codex 可导入 `~/.codex/sessions/` rollout 历史
 - **后台任务** — 关闭浏览器后 Claude 进程继续运行，完成后推送通知
 - **多渠道通知** — 支持 PushPlus / Telegram / Server酱 / 飞书机器人 / QQ（Qmsg），Web UI 内可视化配置
 - **进程持久化** — detached 进程 + PID 文件，服务重启不丢失运行中的任务
 - **多 API 切换** — 可配置多个 API 方案，UI 中一键切换，即时生效
+- **密码认证** — 自动生成初始密码、首次登录强制改密、Web UI 修改密码
+- **隔离式回归脚本** — `npm run regression` 在临时目录中使用 mock Claude / Codex CLI 校验主路径，不污染真实数据
 
 ## 前提条件
 
 - **Node.js** >= 18
-- **Claude Code CLI** 已安装并配置（`claude` 命令可用）
+- **Claude Code CLI** 或 **Codex CLI** 已安装并配置
   ```bash
   npm install -g @anthropic-ai/claude-code
+  npm install -g @openai/codex
   ```
 
 ## 快速开始
@@ -75,6 +82,10 @@ copy .env.example .env  & REM 可选
 | `CC_WEB_PASSWORD` | 否 | 自动生成 | Web 登录密码（首次启动自动迁移到 `config/auth.json`） |
 | `PORT` | 否 | `8002` | 服务监听端口 |
 | `CLAUDE_PATH` | 否 | `claude` | Claude CLI 可执行文件路径 |
+| `CODEX_PATH` | 否 | `codex` | Codex CLI 可执行文件路径 |
+| `CC_WEB_CONFIG_DIR` | 否 | `./config` | 配置目录覆写（主要供隔离测试使用） |
+| `CC_WEB_SESSIONS_DIR` | 否 | `./sessions` | 会话目录覆写（主要供隔离测试使用） |
+| `CC_WEB_LOGS_DIR` | 否 | `./logs` | 日志目录覆写（主要供隔离测试使用） |
 | `PUSHPLUS_TOKEN` | 否 | - | PushPlus Token（首次启动自动迁移到通知配置） |
 
 ### 通知配置
@@ -106,16 +117,24 @@ copy .env.example .env  & REM 可选
 ```
 cc-web/
 ├── server.js              # Node.js 后端（HTTP + WebSocket + 进程管理 + 通知）
+├── lib/
+│   ├── agent-runtime.js    # Claude / Codex 运行时适配层
+│   └── codex-rollouts.js   # Codex rollout 历史解析
 ├── public/
 │   ├── index.html          # 页面结构
 │   ├── app.js              # 前端逻辑（WebSocket 通信、UI 交互）
 │   ├── style.css           # 样式（和风暖色调主题）
 │   └── sw.js               # Service Worker（移动端推送通知）
 ├── config/
+│   ├── codex.json          # Codex 独立配置（运行时生成）
 │   ├── notify.json         # 通知渠道配置（运行时生成）
 │   └── auth.json           # 密码配置（运行时生成）
 ├── sessions/               # 对话历史 JSON 文件（运行时生成）
 ├── logs/                   # 进程生命周期日志（运行时生成）
+├── scripts/
+│   ├── regression.js       # 隔离式回归脚本
+│   ├── mock-claude.js      # 回归用 mock Claude CLI
+│   └── mock-codex.js       # 回归用 mock Codex CLI
 ├── .env.example            # 环境变量模板
 ├── start.bat               # Windows 一键启动脚本
 ├── .gitignore
@@ -128,14 +147,15 @@ cc-web/
 ### 进程模型
 
 ```
-浏览器 ←WebSocket→ Node.js (server.js) ←文件I/O→ Claude CLI (detached)
+浏览器 ←WebSocket→ Node.js (server.js) ←文件I/O→ Claude / Codex CLI (detached)
 ```
 
-- 每条用户消息 spawn 一个 `claude -p --output-format stream-json` 子进程
+- 每条用户消息会根据当前会话 Agent，spawn Claude 或 Codex 子进程
 - 进程使用 `detached: true` + `proc.unref()`，独立于 Node.js 生命周期
 - stdin/stdout/stderr 通过文件传递（`sessions/{id}-run/`），不使用 pipe
 - PID 持久化到文件，服务重启后自动恢复（`recoverProcesses()`）
 - 使用 `FileTailer` 实时监听输出文件变化，流式推送给前端
+- Claude / Codex 的 spawn spec 与事件解析分别由 `lib/agent-runtime.js` 管理
 
 ### 后台任务流程
 
@@ -247,4 +267,5 @@ node server.js
 
 ## 补充说明
 
-- 暂时只支持 Claude Code，后续再 vibe codex
+- 当前已支持 Claude Code 与 Codex；Claude 侧能力更完整，Codex 侧以会话续接、后台执行和命令流展示为主
+- 每次大改动后建议先执行 `npm run regression`

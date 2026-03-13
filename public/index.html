@@ -6,6 +6,12 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <title>CC-Web</title>
+  <script>
+    (function () {
+      var theme = localStorage.getItem('cc-web-theme') || 'washi';
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
 </head>
@@ -15,7 +21,7 @@
     <div class="login-box">
       <div class="login-logo">CC</div>
       <h2>CC-Web</h2>
-      <p>Claude Code Web Chat</p>
+      <p>Claude / Codex Web Chat</p>
       <form id="login-form">
         <input type="password" id="login-password" placeholder="输入密码" autocomplete="current-password" autofocus>
         <label class="remember-label">
@@ -54,13 +60,19 @@
       <header class="chat-header">
         <button id="menu-btn" class="menu-btn" title="菜单">☰</button>
         <span id="chat-title" class="chat-title">新会话</span>
+        <button id="chat-agent-btn" class="chat-agent-btn" type="button" aria-haspopup="menu" aria-expanded="false">Claude</button>
+        <div id="chat-agent-menu" class="chat-agent-menu" hidden>
+          <button type="button" class="chat-agent-option active" data-agent="claude">Claude</button>
+          <button type="button" class="chat-agent-option" data-agent="codex">Codex</button>
+        </div>
+        <span id="chat-runtime-state" class="chat-runtime-state" hidden>运行中</span>
         <span id="chat-cwd" class="chat-cwd" hidden></span>
         <select id="mode-select" class="mode-select" title="权限模式">
           <option value="yolo">YOLO</option>
           <option value="default">默认</option>
           <option value="plan">Plan</option>
         </select>
-        <span id="cost-display" class="cost-display"></span>
+        <span id="cost-display" class="cost-display" hidden></span>
       </header>
 
       <div class="messages-wrap">
@@ -68,7 +80,7 @@
           <div class="welcome-msg">
             <div class="welcome-icon">✿</div>
             <h3>欢迎使用 CC-Web</h3>
-            <p>开始与 Claude Code 对话</p>
+            <p>开始与 Claude 对话</p>
           </div>
         </div>
         <div class="custom-scrollbar" id="custom-scrollbar">
@@ -80,7 +92,14 @@
       <div id="cmd-menu" class="cmd-menu" hidden></div>
 
       <div class="input-area">
+        <div id="attachment-tray" class="attachment-tray" hidden></div>
         <div class="input-wrapper">
+          <input id="image-upload-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+          <button id="attach-btn" class="attach-btn" title="上传图片" type="button">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.44 11.05l-8.49 8.49a6 6 0 1 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+            </svg>
+          </button>
           <textarea id="msg-input" rows="1" placeholder="输入消息… 输入 / 查看指令" autocomplete="off"></textarea>
           <button id="send-btn" class="send-btn" title="发送">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -95,6 +114,17 @@
         </div>
       </div>
     </main>
+  </div>
+
+  <div id="session-loading-overlay" class="session-loading-overlay" hidden aria-live="polite" aria-hidden="true">
+    <div class="session-loading-card" role="status" aria-busy="true">
+      <div class="session-loading-badge">Session</div>
+      <div class="session-loading-title">会话加载中</div>
+      <div id="session-loading-label" class="session-loading-label">正在整理消息与上下文…</div>
+      <div class="session-loading-bar">
+        <span class="session-loading-bar-fill"></span>
+      </div>
+    </div>
   </div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>

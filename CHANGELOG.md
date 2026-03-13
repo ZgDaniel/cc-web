@@ -1,5 +1,41 @@
 # 更新记录
 
+- **v1.2.8**
+  - **Codex 双 Agent 接入**
+    - 新建会话时可选择 Claude 或 Codex，复用 cc-web 现有的多会话、后台进程、断线续挂和文件 I/O 核心逻辑
+    - 侧边栏按 Agent 隔离会话列表、最近会话记忆与默认新建行为
+    - Agent 切换入口收进顶部栏标签下拉
+    - Claude / Codex 各有独立设置入口，Codex 设置简化为 `local/custom + API Profile`
+    - Codex 会话通过 `codex exec --json` / `codex exec resume --json` 对接，stdin 文件喂入 prompt，持久化 thread id 用于续接
+    - `/model`、`/cost`、`/help` 对 Codex 会话做了适配
+  - **Codex 本地历史导入**
+    - 扫描 `~/.codex/sessions/` 下的 rollout `.jsonl`，解析用户消息、助手输出、函数调用与 token 使用量后导入到 cc-web
+    - 删除 Codex 会话时同步清理对应 rollout 文件与本地线程元数据
+  - **图片上传**
+    - Claude 和 Codex 会话均支持图片消息：拖拽、粘贴或点击附件按钮上传
+    - 客户端自动压缩（WebP），服务端附件缓存（7 天 TTL）
+    - Claude 通过 `--input-format stream-json` 传入 base64 图片，Codex 通过 `--image` 参数传入
+    - 历史消息仅保留图片文字标签，不渲染原图
+    - 单条消息最多 4 张图片
+  - **会话加载体验优化**
+    - 回退并收敛长会话加载策略：最近消息先到，更老消息分批补充
+    - 新增会话加载遮罩与加载期不可操作状态
+    - 热会话缓存（最近 4 个，strong/weak 两级命中策略）
+    - 修复切后台再切回时运行中内容短暂消失的问题（`preserveStreaming` 机制）
+  - **主题系统**
+    - 引入完整的主题系统与 CoolVibe Light 视觉方案
+    - 主题入口从设置页顶部改为「外观 → 界面主题」二级页
+    - 加载遮罩适配 washi / coolvibe / editorial 三套主题变量
+  - **移动端交互增强**
+    - 对话区任意位置右滑唤起侧栏、侧栏打开后左滑关闭
+    - 运行中状态覆盖移动端 cwd 标签显示
+    - 修复附件按钮、新会话分裂按钮的移动端比例失调
+  - **其他改进**
+    - 后端重构：spawn spec 与事件解析抽离到 `lib/agent-runtime.js`，Codex rollout 解析在 `lib/codex-rollouts.js`
+    - 新增隔离式回归脚本 `npm run regression`，使用 mock CLI 在临时目录中校验主路径
+    - 设置页说明卡移除，Codex Web Search 解释文案移除
+    - 删除确认弹窗按 Agent 动态提示 Claude / Codex 的本地删除影响
+
 - **v1.2.7**
   - 新增导入本地 CLI 会话：扫描 `~/.claude/projects/` 下的 `.jsonl`，解析后导入到 cc-web，可续接历史对话。
   - 新增新建会话指定工作目录：创建会话时弹窗设置 cwd，spawn 子进程时使用该目录，header 显示当前工作路径。

@@ -1,6 +1,6 @@
 # CC-Web
 
-A lightweight web interface for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI, so you can run and monitor workflows directly from a browser.
+A lightweight browser interface for Claude Code and Codex, designed to keep each agent close to its native CLI workflow while sharing the same web shell.
 
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
@@ -15,21 +15,27 @@ A lightweight web interface for [Claude Code](https://docs.anthropic.com/en/docs
 
 ## Features
 
-- **Lightweight runtime（1.6MB）**: low backend overhead, browser-based control panel.
+- **Lightweight runtime**: low backend overhead, browser-based control panel.
+- **Dual-agent sessions**: create Claude or Codex sessions on the same backend core.
+- **Agent-isolated views**: switching Claude / Codex only shows that agent's sessions, recent state, settings, and import entry points.
+- **Agent-specific settings**: Claude keeps template-based model config; Codex has its own path, default model, mode, and search settings.
 - **Multi-session management**: create, switch, rename, and delete sessions; deleting a session also removes the local Claude history record.
+- **Local history import**: import Claude history from `~/.claude/projects/` and Codex rollout history from `~/.codex/sessions/`.
 - **Session resume**: context continuity via `--resume`; you can also reattach via SSH + `tmux attach -t claude` when needed.
 - **Background task support**: Claude processes continue after browser disconnect and notify you on completion.
 - **Multi-channel notifications**: PushPlus / Telegram / ServerChan / Feishu bot / QQ (Qmsg), configurable in Web UI.
 - **Process persistence**: detached subprocess + PID files; running tasks survive service restarts.
 - **Multi-API switching**: configure multiple API profiles and switch between them instantly from the UI.
+- **Password-based auth**: initial password generation, forced first-login reset, and password change in Web UI.
 
 ## Requirements
 
 - **Node.js** >= 18
-- **Claude Code CLI** installed and configured (`claude` command available)
+- **Claude Code CLI** and/or **Codex CLI** installed and configured
 
 ```bash
 npm install -g @anthropic-ai/claude-code
+npm install -g @openai/codex
 ```
 
 ## Quick Start
@@ -66,6 +72,7 @@ After startup, open `http://localhost:8002` and sign in with your password.
 | `CC_WEB_PASSWORD` | No | Auto-generated | Web login password (migrated into `config/auth.json` on first start) |
 | `PORT` | No | `8002` | Service port |
 | `CLAUDE_PATH` | No | `claude` | Executable path to Claude CLI |
+| `CODEX_PATH` | No | `codex` | Executable path to Codex CLI |
 | `PUSHPLUS_TOKEN` | No | - | PushPlus token (migrated into notification config on first start) |
 
 ### Notification Configuration
@@ -107,6 +114,8 @@ cc-web/
 │   └── auth.json           # Auth config (generated at runtime)
 ├── sessions/               # Chat history JSON files (generated at runtime)
 ├── logs/                   # Process lifecycle logs (generated at runtime)
+├── lib/                    # Agent runtime + Codex rollout parsing helpers
+├── scripts/                # Regression tooling + mock CLIs
 ├── .env.example            # Environment variable template
 ├── start.bat               # Windows startup script
 ├── .gitignore
@@ -119,10 +128,10 @@ cc-web/
 ### Process Model
 
 ```text
-Browser ←WebSocket→ Node.js (server.js) ←file I/O→ Claude CLI (detached)
+Browser ←WebSocket→ Node.js (server.js) ←file I/O→ Claude / Codex CLI (detached)
 ```
 
-- Each user message spawns a `claude -p --output-format stream-json` subprocess.
+- Each user message spawns either a Claude or Codex subprocess depending on the session agent.
 - Subprocesses use `detached: true` + `proc.unref()` and run independently from Node.js lifecycle.
 - stdin/stdout/stderr are bridged via files in `sessions/{id}-run/`.
 - PID is persisted to disk and recovered after service restart (`recoverProcesses()`).
@@ -216,7 +225,7 @@ server {
 
 ### Windows Deployment
 
-Use this mode when running CC-Web on a personal PC and controlling Claude Code from mobile.
+Use this mode when running CC-Web on a personal PC and controlling Claude / Codex from mobile.
 
 Start with `start.bat`, or run manually:
 
@@ -235,6 +244,14 @@ node server.js
 
 ## Release Notes
 
+- **v1.2.8**
+  - **Dual-agent (Codex)**: create Claude or Codex sessions on the same backend; agent-isolated sidebar, settings, and import
+  - **Image upload**: drag, paste, or attach images in both Claude and Codex sessions; client-side WebP compression, 7-day server cache, up to 4 images per message
+  - **Session loading**: loading overlay, hot session cache (4 slots, strong/weak hit), fix for streaming content disappearing on tab switch
+  - **Theme system**: full theme engine with CoolVibe Light, washi, and editorial variants; theme picker moved to sub-page
+  - **Mobile UX**: swipe-to-open/close sidebar, running-state badge replaces cwd label, button sizing fixes
+  - **Backend refactor**: spawn spec + event parsing extracted to `lib/agent-runtime.js`; isolated regression script `npm run regression`
+
 - **v1.2.2**
   - Aligned context compression with Claude Code native behavior: `/compact` is now actually sent to CLI instead of doing a local pseudo-reset.
   - Added automatic overflow recovery: when `Request too large (max 20MB)` occurs, CC-Web runs `/compact` and replays the failed prompt automatically.
@@ -250,4 +267,4 @@ node server.js
 
 ## Notes
 
-- This project currently targets Claude Code only.
+- Claude support is still the more mature path, while Codex now supports isolated sessions, resume, import, background execution, and local cleanup.
