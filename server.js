@@ -895,6 +895,39 @@ function formatRuntimeError(agent, raw, context = {}) {
   return `Claude 任务失败${exitInfo}：${condensed}`;
 }
 
+function compactStartMessage(agent) {
+  return agent === 'codex'
+    ? '正在执行 Codex /compact 压缩上下文，请稍候…'
+    : '正在执行 Claude 原生 /compact 压缩上下文，请稍候…';
+}
+
+function compactDoneMessage(agent) {
+  return agent === 'codex'
+    ? '上下文压缩完成。已执行 Codex /compact，下次继续在同一会话发送即可。'
+    : '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。';
+}
+
+function compactAutoStartMessage(agent) {
+  return agent === 'codex'
+    ? '检测到上下文达到上限，正在按 Codex /compact 自动压缩，然后继续当前任务…'
+    : '检测到上下文达到上限，正在按 Claude Code 原版策略自动执行 /compact，然后继续当前任务…';
+}
+
+function compactAutoResumeMessage(agent) {
+  return agent === 'codex'
+    ? '检测到上一条请求因上下文过大失败，现已按 Codex 压缩计划继续执行。'
+    : '检测到上一条请求因上下文过大失败，现已自动按压缩计划继续执行。';
+}
+
+function isContextLimitError(agent, raw) {
+  const text = String(raw || '');
+  if (!text) return false;
+  if (agent === 'claude') {
+    return /Request too large \(max 20MB\)/i.test(text);
+  }
+  return /context\s+(window|length)|maximum context length|context limit|token limit|too many tokens|input.*too long|prompt.*too long|request too large|please use\s*\/compact|use\s*\/compact|reduce (the )?(input|prompt|message)|exceed(?:ed|s).*(token|context)/i.test(text);
+}
+
 function handleProcessComplete(sessionId, exitCode, signal) {
   const entry = activeProcesses.get(sessionId);
   if (!entry) return;
@@ -906,7 +939,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     : null;
 
   const pendingRetry = pendingCompactRetries.get(sessionId) || null;
-  let requestTooLarge = false;
+  let contextLimitExceeded = false;
 
   // Read stderr for error clues
   let stderrSnippet = '';
@@ -918,13 +951,12 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     }
   } catch {}
 
-  requestTooLarge = entry.agent === 'claude'
-    && (/Request too large \(max 20MB\)/i.test(entry.fullText || '') || /Request too large \(max 20MB\)/i.test(stderrSnippet || ''));
   const rawCompletionError = entry.lastError || (
     ((typeof exitCode === 'number' && exitCode !== 0) || (!!signal && signal !== 'SIGTERM'))
       ? (stderrSnippet || null)
       : null
   );
+  contextLimitExceeded = isContextLimitError(entry.agent || 'claude', `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}`);
   const completionError = rawCompletionError ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal }) : null;
   if (!entry.lastError && rawCompletionError) entry.lastError = rawCompletionError;
 
@@ -943,7 +975,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     usage: entry.lastUsage || null,
     error: rawCompletionError,
     stderr: stderrSnippet || null,
-    requestTooLarge,
+    requestTooLarge: contextLimitExceeded,
   });
 
   // Final read
@@ -978,6 +1010,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   }
 
   let shouldReturnForFollowup = false;
+  let shouldAutoCompact = false;
 
   activeProcesses.delete(sessionId);
   cleanRunDir(sessionId);
@@ -987,30 +1020,28 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   if (entry.ws) {
     if (pendingSlash?.kind === 'compact') {
       const retry = pendingCompactRetries.get(sessionId);
-      if (retry?.reason === 'auto') {
-        wsSend(entry.ws, { type: 'system_message', message: '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。' });
-        pendingCompactRetries.delete(sessionId);
-      } else if (retry?.text) {
-        if (requestTooLarge) {
+      const autoRetryRequested = !!(retry?.text && retry?.reason === 'auto');
+      if (autoRetryRequested) {
+        if (contextLimitExceeded) {
           pendingCompactRetries.delete(sessionId);
           wsSend(entry.ws, { type: 'system_message', message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
         } else {
-          wsSend(entry.ws, { type: 'system_message', message: '检测到上一条请求因上下文过大失败，现已自动按压缩计划继续执行。' });
+          wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
+          wsSend(entry.ws, { type: 'system_message', message: compactAutoResumeMessage(entry.agent || 'claude') });
           shouldReturnForFollowup = true;
-          pendingCompactRetries.delete(sessionId);
         }
       } else {
-        wsSend(entry.ws, { type: 'system_message', message: '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。' });
+        wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
       }
     }
 
-    if (requestTooLarge && !pendingSlash && session && session.claudeSessionId) {
+    if (contextLimitExceeded && !pendingSlash && session && getRuntimeSessionId(session)) {
       pendingCompactRetries.set(sessionId, { text: pendingRetry?.text || '', mode: pendingRetry?.mode || session.permissionMode || 'yolo', reason: 'auto' });
-      wsSend(entry.ws, { type: 'system_message', message: '检测到上下文达到上限，正在按 Claude Code 原版策略自动执行 /compact，然后继续当前任务…' });
-      shouldReturnForFollowup = true;
+      wsSend(entry.ws, { type: 'system_message', message: compactAutoStartMessage(entry.agent || 'claude') });
+      shouldAutoCompact = true;
     }
 
-    if (completionError && !entry.errorSent) {
+    if (completionError && !entry.errorSent && !shouldAutoCompact) {
       entry.errorSent = true;
       wsSend(entry.ws, { type: 'error', message: completionError });
     }
@@ -1041,7 +1072,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     );
   }
 
-  if (!shouldReturnForFollowup && !requestTooLarge && pendingRetry && pendingRetry.text === (entry.fullText || '').trim()) {
+  if (!shouldReturnForFollowup && !shouldAutoCompact && !contextLimitExceeded && pendingRetry && pendingRetry.text === (entry.fullText || '').trim()) {
     pendingCompactRetries.delete(sessionId);
   }
 
@@ -1054,12 +1085,12 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       }
       return;
     }
+  }
 
-    if (requestTooLarge && !pendingSlash && session.claudeSessionId) {
-      pendingSlashCommands.set(sessionId, { kind: 'compact' });
-      handleMessage(entry.ws, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
-      return;
-    }
+  if (shouldAutoCompact && entry.ws && entry.ws.readyState === 1 && session) {
+    pendingSlashCommands.set(sessionId, { kind: 'compact' });
+    handleMessage(entry.ws, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
+    return;
   }
 }
 
@@ -1698,10 +1729,6 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
     }
 
     case '/compact': {
-      if (agent !== 'claude') {
-        wsSend(ws, { type: 'system_message', message: 'Codex 会话暂不支持 /compact。' });
-        break;
-      }
       if (!sessionId || !session) {
         wsSend(ws, { type: 'system_message', message: '当前没有可压缩的会话。请先进入一个已进行过对话的会话后再执行 /compact。' });
         break;
@@ -1710,12 +1737,18 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止，再执行 /compact。' });
         break;
       }
-      if (!session.claudeSessionId) {
-        wsSend(ws, { type: 'system_message', message: '当前会话尚未建立 Claude 上下文，暂时无需压缩。' });
+      const runtimeId = getRuntimeSessionId(session);
+      if (!runtimeId) {
+        wsSend(ws, {
+          type: 'system_message',
+          message: agent === 'codex'
+            ? '当前会话尚未建立 Codex 上下文，暂时无需压缩。'
+            : '当前会话尚未建立 Claude 上下文，暂时无需压缩。',
+        });
         break;
       }
 
-      wsSend(ws, { type: 'system_message', message: '正在执行 Claude 原生 /compact 压缩上下文，请稍候…' });
+      wsSend(ws, { type: 'system_message', message: compactStartMessage(agent) });
       pendingSlashCommands.set(session.id, { kind: 'compact' });
       handleMessage(ws, { text: '/compact', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
       break;
@@ -1753,7 +1786,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       wsSend(ws, {
         type: 'system_message',
         message: agent === 'codex'
-          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）'
+          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/compact — 执行 Codex /compact 压缩上下文'
           : base + '\n/model [名称] — 查看/切换模型（opus, sonnet, haiku）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）',
       });
       break;
@@ -2111,7 +2144,7 @@ function handleMessage(ws, msg, options = {}) {
     session.permissionMode = mode;
   }
 
-  if (!hideInHistory && normalizedText !== '/compact' && session.claudeSessionId) {
+  if (!hideInHistory && normalizedText !== '/compact' && getRuntimeSessionId(session)) {
     pendingCompactRetries.set(session.id, { text: normalizedText, mode: session.permissionMode || 'yolo', reason: 'normal' });
   }
 
