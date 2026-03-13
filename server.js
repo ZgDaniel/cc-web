@@ -2334,7 +2334,7 @@ function handleCheckUpdate(ws) {
   const localVersion = (() => {
     try {
       const cl = fs.readFileSync(path.join(__dirname, 'CHANGELOG.md'), 'utf8');
-      const m = cl.match(/\*\*v([\d.]+)\*\*/);
+      const m = cl.match(/##\s*v([\d.]+)/) || cl.match(/\*\*v([\d.]+)\*\*/);
       if (m) return m[1];
     } catch {}
     try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || 'unknown'; } catch {}
@@ -2356,7 +2356,7 @@ function handleCheckUpdate(ws) {
       if (res.statusCode !== 200) {
         return wsSend(ws, { type: 'update_info', localVersion, error: `HTTP ${res.statusCode}` });
       }
-      const m = body.match(/\*\*v([\d.]+)\*\*/);
+      const m = body.match(/##\s*v([\d.]+)/) || body.match(/\*\*v([\d.]+)\*\*/);
       const latest = m ? m[1] : null;
       if (!latest) {
         return wsSend(ws, { type: 'update_info', localVersion, error: '无法解析远端版本号' });
