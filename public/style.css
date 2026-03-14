@@ -1016,10 +1016,11 @@ body.session-loading-active {
 .msg.user .msg-avatar { background: var(--bg-bubble-user); color: #fff; }
 .msg.assistant .msg-avatar { background: var(--success); color: #fff; }
 .msg-avatar svg { display: block; flex-shrink: 0; }
-/* Claude avatar: pixel crab emoji on accent bg */
+/* Claude avatar: transparent bg, pixel crab uses theme accent color */
 .msg.assistant.agent-claude .msg-avatar {
-  background: var(--accent);
-  color: #fff;
+  background: transparent;
+  color: var(--accent);
+  border: 1.5px solid var(--accent);
   font-size: 18px;
 }
 /* Codex avatar: GPT logo on green bg */
