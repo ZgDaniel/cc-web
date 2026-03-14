@@ -238,8 +238,6 @@ async function buildNotifyContent(entry, session, completionError, contextLimitE
   const agent = entry.agent || 'claude';
   const agentLabel = agent === 'codex' ? 'Codex' : 'Claude';
   const hasTools = (entry.toolCalls || []).length > 0;
-  const cost = entry.lastCost ? `$${entry.lastCost.toFixed(4)}` : '';
-  const costLine = cost ? `费用: ${cost}` : '';
 
   // Determine notify title
   let notifyTitle;
@@ -255,7 +253,7 @@ async function buildNotifyContent(entry, session, completionError, contextLimitE
 
   // Context limit: fixed message, no AI
   if (contextLimitExceeded) {
-    return { title: notifyTitle, content: `${agentLabel} 会话上下文已达上限，已自动触发压缩。\n会话: ${title}${costLine ? '\n' + costLine : ''}` };
+    return { title: notifyTitle, content: `${agentLabel} 会话上下文已达上限，已自动触发压缩。\n会话: ${title}` };
   }
 
   // Check if summary is enabled and applicable
@@ -265,9 +263,7 @@ async function buildNotifyContent(entry, session, completionError, contextLimitE
 
   if (!summaryEnabled) {
     // Fallback: simple content
-    const respLen = (entry.fullText || '').length;
-    const lines = [`会话: ${title}`, `字数: ${respLen}`];
-    if (costLine) lines.push(costLine);
+    const lines = [`会话: ${title}`];
     if (completionError) lines.push(`错误: ${completionError.slice(0, 200)}`);
     return { title: notifyTitle, content: lines.join('\n') };
   }
@@ -275,9 +271,7 @@ async function buildNotifyContent(entry, session, completionError, contextLimitE
   const creds = getSummaryApiCredentials(summaryCfg);
   if (!creds) {
     // No credentials — fallback
-    const respLen = (entry.fullText || '').length;
-    const lines = [`会话: ${title}`, `字数: ${respLen}`];
-    if (costLine) lines.push(costLine);
+    const lines = [`会话: ${title}`];
     if (completionError) lines.push(`错误: ${completionError.slice(0, 200)}`);
     return { title: notifyTitle, content: lines.join('\n') };
   }
@@ -293,12 +287,9 @@ async function buildNotifyContent(entry, session, completionError, contextLimitE
   let bodyText;
   if (result.ok && result.text) {
     bodyText = result.text;
-    if (costLine) bodyText += '\n\n' + costLine;
   } else {
     // Fallback on API failure
-    const respLen = (entry.fullText || '').length;
-    const lines = [`会话: ${title}`, `字数: ${respLen}`];
-    if (costLine) lines.push(costLine);
+    const lines = [`会话: ${title}`];
     if (completionError) lines.push(`错误: ${completionError.slice(0, 200)}`);
     if (!result.ok) lines.push('（摘要生成失败，以上为原始信息）');
     bodyText = lines.join('\n');
