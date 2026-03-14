@@ -65,10 +65,22 @@ function plog(level, event, data = {}) {
 }
 
 // === Notification System ===
+const DEFAULT_SUMMARY_CONFIG = {
+  enabled: false,
+  trigger: 'background', // 'background' | 'always'
+  apiSource: 'claude',   // 'claude' | 'codex' | 'custom'
+  apiBase: '',
+  apiKey: '',
+  model: '',
+};
+
 function loadNotifyConfig() {
   try {
     if (fs.existsSync(NOTIFY_CONFIG_PATH)) {
-      return JSON.parse(fs.readFileSync(NOTIFY_CONFIG_PATH, 'utf8'));
+      const raw = JSON.parse(fs.readFileSync(NOTIFY_CONFIG_PATH, 'utf8'));
+      // Ensure summary field exists for older configs
+      if (!raw.summary) raw.summary = { ...DEFAULT_SUMMARY_CONFIG };
+      return raw;
     }
   } catch {}
   // First run: migrate from .env PUSHPLUS_TOKEN
@@ -80,6 +92,7 @@ function loadNotifyConfig() {
     serverchan: { sendKey: '' },
     feishu: { webhook: '' },
     qqbot: { qmsgKey: '' },
+    summary: { ...DEFAULT_SUMMARY_CONFIG },
   };
   saveNotifyConfig(config);
   return config;
@@ -96,6 +109,7 @@ function maskToken(str) {
 
 function getNotifyConfigMasked() {
   const config = loadNotifyConfig();
+  const s = config.summary || {};
   return {
     provider: config.provider,
     pushplus: { token: maskToken(config.pushplus?.token) },
@@ -103,13 +117,206 @@ function getNotifyConfigMasked() {
     serverchan: { sendKey: maskToken(config.serverchan?.sendKey) },
     feishu: { webhook: maskToken(config.feishu?.webhook) },
     qqbot: { qmsgKey: maskToken(config.qqbot?.qmsgKey) },
+    summary: {
+      enabled: !!s.enabled,
+      trigger: s.trigger || 'background',
+      apiSource: s.apiSource || 'claude',
+      apiBase: s.apiBase || '',
+      apiKey: maskToken(s.apiKey),
+      model: s.model || '',
+    },
   };
+}
+
+// === Notification Summary ===
+
+// Per-channel content length limits (chars)
+const NOTIFY_CONTENT_LIMITS = {
+  telegram: 3800,
+  qqbot: 3800,
+  serverchan: 30000,
+  pushplus: 18000,
+  feishu: 18000,
+};
+
+function truncateForChannel(text, provider) {
+  const limit = NOTIFY_CONTENT_LIMITS[provider] || 18000;
+  if (text.length <= limit) return text;
+  return text.slice(0, limit - 20) + '\n\n[内容已截断]';
+}
+
+function getSummaryApiCredentials(summaryConfig) {
+  // Returns { apiBase, apiKey, model } or null
+  const src = summaryConfig.apiSource || 'claude';
+  if (src === 'claude') {
+    const modelCfg = loadModelConfig();
+    if (modelCfg.mode === 'custom' && modelCfg.activeTemplate) {
+      const tpl = (modelCfg.templates || []).find(t => t.name === modelCfg.activeTemplate);
+      if (tpl && tpl.apiKey && tpl.apiBase) {
+        return { apiBase: tpl.apiBase, apiKey: tpl.apiKey, model: tpl.defaultModel || tpl.opusModel || '' };
+      }
+    }
+    return null; // local mode — no API credentials available
+  }
+  if (src === 'codex') {
+    const codexCfg = loadCodexConfig();
+    if (codexCfg.mode === 'custom' && codexCfg.activeProfile) {
+      const profile = (codexCfg.profiles || []).find(p => p.name === codexCfg.activeProfile);
+      if (profile && profile.apiKey && profile.apiBase) {
+        return { apiBase: profile.apiBase, apiKey: profile.apiKey, model: summaryConfig.model || '' };
+      }
+    }
+    return null;
+  }
+  if (src === 'custom') {
+    if (summaryConfig.apiBase && summaryConfig.apiKey) {
+      return { apiBase: summaryConfig.apiBase, apiKey: summaryConfig.apiKey, model: summaryConfig.model || '' };
+    }
+    return null;
+  }
+  return null;
+}
+
+function callSummaryApi(creds, prompt) {
+  return new Promise((resolve) => {
+    try {
+      const base = creds.apiBase.replace(/\/+$/, '');
+      const url = new URL(base + '/v1/chat/completions');
+      const mod = url.protocol === 'https:' ? require('https') : require('http');
+      const model = creds.model || 'claude-opus-4-6';
+      const body = JSON.stringify({
+        model,
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: prompt }],
+      });
+      const req = mod.request(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${creds.apiKey}`,
+          'Content-Length': Buffer.byteLength(body),
+        },
+        timeout: 20000,
+      }, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(data);
+            const text = json.choices?.[0]?.message?.content || json.content?.[0]?.text || '';
+            resolve({ ok: !!text, text: text.trim() });
+          } catch {
+            resolve({ ok: false, text: '' });
+          }
+        });
+      });
+      req.on('error', () => resolve({ ok: false, text: '' }));
+      req.on('timeout', () => { req.destroy(); resolve({ ok: false, text: '' }); });
+      req.write(body);
+      req.end();
+    } catch {
+      resolve({ ok: false, text: '' });
+    }
+  });
+}
+
+function buildSummaryPrompt(sessionTitle, lastUserMsg, fullText, isError, errorDesc) {
+  const userSnip = (lastUserMsg || '').slice(0, 500);
+  const outputSnip = (fullText || '').slice(0, 20000);
+  if (isError) {
+    return `以下是一个 AI 编程助手的任务记录，该任务异常退出。\n` +
+      `会话名称：${sessionTitle}\n` +
+      `用户提问：${userSnip}\n` +
+      `助手输出：${outputSnip}\n` +
+      `错误信息：${(errorDesc || '').slice(0, 500)}\n\n` +
+      `请用纯文本说明异常现象和可能原因，不超过 400 字，不使用任何 markdown 格式，不使用星号、井号、横线等符号。`;
+  }
+  return `以下是一个 AI 编程助手的任务记录。\n` +
+    `会话名称：${sessionTitle}\n` +
+    `用户提问：${userSnip}\n` +
+    `助手输出：${outputSnip}\n\n` +
+    `请用纯文本提炼关键信息，不超过 600 字，不使用任何 markdown 格式，不使用星号、井号、横线等符号。说明完成了什么、主要步骤、结果是否成功。`;
+}
+
+async function buildNotifyContent(entry, session, completionError, contextLimitExceeded) {
+  const title = session?.title || 'Untitled';
+  const agent = entry.agent || 'claude';
+  const agentLabel = agent === 'codex' ? 'Codex' : 'Claude';
+  const hasTools = (entry.toolCalls || []).length > 0;
+  const cost = entry.lastCost ? `$${entry.lastCost.toFixed(4)}` : '';
+  const costLine = cost ? `费用: ${cost}` : '';
+
+  // Determine notify title
+  let notifyTitle;
+  if (contextLimitExceeded) {
+    notifyTitle = `⚠ ${title} 上下文已压缩`;
+  } else if (completionError) {
+    notifyTitle = `✗ ${title} 任务异常`;
+  } else if (hasTools) {
+    notifyTitle = `✓ ${title} 任务完成`;
+  } else {
+    notifyTitle = `✓ ${title} 回复就绪`;
+  }
+
+  // Context limit: fixed message, no AI
+  if (contextLimitExceeded) {
+    return { title: notifyTitle, content: `${agentLabel} 会话上下文已达上限，已自动触发压缩。\n会话: ${title}${costLine ? '\n' + costLine : ''}` };
+  }
+
+  // Check if summary is enabled and applicable
+  const notifyCfg = loadNotifyConfig();
+  const summaryCfg = notifyCfg.summary || {};
+  const summaryEnabled = !!summaryCfg.enabled;
+
+  if (!summaryEnabled) {
+    // Fallback: simple content
+    const respLen = (entry.fullText || '').length;
+    const lines = [`会话: ${title}`, `字数: ${respLen}`];
+    if (costLine) lines.push(costLine);
+    if (completionError) lines.push(`错误: ${completionError.slice(0, 200)}`);
+    return { title: notifyTitle, content: lines.join('\n') };
+  }
+
+  const creds = getSummaryApiCredentials(summaryCfg);
+  if (!creds) {
+    // No credentials — fallback
+    const respLen = (entry.fullText || '').length;
+    const lines = [`会话: ${title}`, `字数: ${respLen}`];
+    if (costLine) lines.push(costLine);
+    if (completionError) lines.push(`错误: ${completionError.slice(0, 200)}`);
+    return { title: notifyTitle, content: lines.join('\n') };
+  }
+
+  // Get last user message from session
+  const messages = session?.messages || [];
+  const lastUser = [...messages].reverse().find(m => m.role === 'user');
+  const lastUserMsg = typeof lastUser?.content === 'string' ? lastUser.content : '';
+
+  const prompt = buildSummaryPrompt(title, lastUserMsg, entry.fullText || '', !!completionError, completionError || '');
+  const result = await callSummaryApi(creds, prompt);
+
+  let bodyText;
+  if (result.ok && result.text) {
+    bodyText = result.text;
+    if (costLine) bodyText += '\n\n' + costLine;
+  } else {
+    // Fallback on API failure
+    const respLen = (entry.fullText || '').length;
+    const lines = [`会话: ${title}`, `字数: ${respLen}`];
+    if (costLine) lines.push(costLine);
+    if (completionError) lines.push(`错误: ${completionError.slice(0, 200)}`);
+    if (!result.ok) lines.push('（摘要生成失败，以上为原始信息）');
+    bodyText = lines.join('\n');
+  }
+
+  return { title: notifyTitle, content: bodyText };
 }
 
 function sendNotification(title, content) {
   const config = loadNotifyConfig();
   if (!config.provider || config.provider === 'off') return Promise.resolve({ ok: true, skipped: true });
   const https = require('https');
+  const truncated = truncateForChannel(content, config.provider);
 
   return new Promise((resolve) => {
     let url, data;
@@ -118,31 +325,31 @@ function sendNotification(title, content) {
       case 'pushplus': {
         if (!config.pushplus?.token) return resolve({ ok: false, error: 'PushPlus token 未配置' });
         url = 'https://www.pushplus.plus/send';
-        data = JSON.stringify({ token: config.pushplus.token, title, content, template: 'txt' });
+        data = JSON.stringify({ token: config.pushplus.token, title, content: truncated, template: 'txt' });
         break;
       }
       case 'telegram': {
         if (!config.telegram?.botToken || !config.telegram?.chatId) return resolve({ ok: false, error: 'Telegram botToken 或 chatId 未配置' });
         url = `https://api.telegram.org/bot${config.telegram.botToken}/sendMessage`;
-        data = JSON.stringify({ chat_id: config.telegram.chatId, text: `${title}\n\n${content}` });
+        data = JSON.stringify({ chat_id: config.telegram.chatId, text: `${title}\n\n${truncated}` });
         break;
       }
       case 'serverchan': {
         if (!config.serverchan?.sendKey) return resolve({ ok: false, error: 'Server酱 sendKey 未配置' });
         url = `https://sctapi.ftqq.com/${config.serverchan.sendKey}.send`;
-        data = JSON.stringify({ title, desp: content });
+        data = JSON.stringify({ title, desp: truncated });
         break;
       }
       case 'feishu': {
         if (!config.feishu?.webhook) return resolve({ ok: false, error: '飞书 Webhook 未配置' });
         url = config.feishu.webhook;
-        data = JSON.stringify({ msg_type: 'text', content: { text: `${title}\n\n${content}` } });
+        data = JSON.stringify({ msg_type: 'text', content: { text: `${title}\n\n${truncated}` } });
         break;
       }
       case 'qqbot': {
         if (!config.qqbot?.qmsgKey) return resolve({ ok: false, error: 'Qmsg Key 未配置' });
         url = `https://qmsg.zendee.cn/send/${config.qqbot.qmsgKey}`;
-        data = `msg=${encodeURIComponent(`${title}\n\n${content}`)}`;
+        data = `msg=${encodeURIComponent(`${title}\n\n${truncated}`)}`;
         isFormData = true;
         break;
       }
@@ -1048,10 +1255,20 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 
     wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost || null });
     sendSessionList(entry.ws);
+    // Push notification when trigger='always' (user online but still wants notification)
+    (() => {
+      const notifyCfg = loadNotifyConfig();
+      if (!notifyCfg.provider || notifyCfg.provider === 'off') return;
+      if ((notifyCfg.summary?.trigger || 'background') !== 'always') return;
+      const sess = loadSession(sessionId);
+      buildNotifyContent(entry, sess, completionError, contextLimitExceeded).then(({ title: ntitle, content }) => {
+        sendNotification(ntitle, content);
+      });
+    })();
   } else {
     // Process completed while browser was disconnected — notify all connected clients
-    const session = loadSession(sessionId);
-    const title = session?.title || 'Untitled';
+    const sess = loadSession(sessionId);
+    const title = sess?.title || 'Untitled';
     for (const client of wss.clients) {
       if (client.readyState === 1) {
         wsSend(client, {
@@ -1063,13 +1280,10 @@ function handleProcessComplete(sessionId, exitCode, signal) {
         });
       }
     }
-    // Push notification
-    const cost = entry.lastCost ? `$${entry.lastCost.toFixed(4)}` : '';
-    const respLen = (entry.fullText || '').length;
-    sendNotification(
-      `CC-Web 任务完成`,
-      `会话: ${title}\n字数: ${respLen}\n费用: ${cost}`
-    );
+    // Push notification (background task)
+    buildNotifyContent(entry, sess, completionError, contextLimitExceeded).then(({ title: ntitle, content }) => {
+      sendNotification(ntitle, content);
+    });
   }
 
   if (!shouldReturnForFollowup && !shouldAutoCompact && !contextLimitExceeded && pendingRetry && pendingRetry.text === (entry.fullText || '').trim()) {
@@ -1438,6 +1652,17 @@ function handleSaveNotifyConfig(ws, newConfig) {
   merged.feishu = { webhook: (newConfig.feishu?.webhook && !newConfig.feishu.webhook.includes('****')) ? newConfig.feishu.webhook : current.feishu?.webhook || '' };
   // qqbot
   merged.qqbot = { qmsgKey: (newConfig.qqbot?.qmsgKey && !newConfig.qqbot.qmsgKey.includes('****')) ? newConfig.qqbot.qmsgKey : current.qqbot?.qmsgKey || '' };
+  // summary
+  const ns = newConfig.summary || {};
+  const cs = current.summary || {};
+  merged.summary = {
+    enabled: !!ns.enabled,
+    trigger: ['background', 'always'].includes(ns.trigger) ? ns.trigger : (cs.trigger || 'background'),
+    apiSource: ['claude', 'codex', 'custom'].includes(ns.apiSource) ? ns.apiSource : (cs.apiSource || 'claude'),
+    apiBase: ns.apiBase !== undefined ? ns.apiBase : (cs.apiBase || ''),
+    apiKey: (ns.apiKey && !ns.apiKey.includes('****')) ? ns.apiKey : (cs.apiKey || ''),
+    model: ns.model !== undefined ? ns.model : (cs.model || ''),
+  };
 
   saveNotifyConfig(merged);
   plog('INFO', 'notify_config_saved', { provider: merged.provider });

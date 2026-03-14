@@ -2835,6 +2835,14 @@
     const sc = panel.querySelector('#notify-sc-sendkey');
     const feishuWh = panel.querySelector('#notify-feishu-webhook');
     const qmsgKey = panel.querySelector('#notify-qmsg-key');
+    // Summary config
+    const summaryEnabled = panel.querySelector('#notify-summary-enabled');
+    const summaryTrigger = panel.querySelector('#notify-summary-trigger');
+    const summarySource = panel.querySelector('#notify-summary-source');
+    const summaryApiBase = panel.querySelector('#notify-summary-apibase');
+    const summaryApiKey = panel.querySelector('#notify-summary-apikey');
+    const summaryModel = panel.querySelector('#notify-summary-model');
+    const cs = currentConfig?.summary || {};
     return {
       provider,
       pushplus: { token: pp ? pp.value.trim() : (currentConfig?.pushplus?.token || '') },
@@ -2845,7 +2853,76 @@
       serverchan: { sendKey: sc ? sc.value.trim() : (currentConfig?.serverchan?.sendKey || '') },
       feishu: { webhook: feishuWh ? feishuWh.value.trim() : (currentConfig?.feishu?.webhook || '') },
       qqbot: { qmsgKey: qmsgKey ? qmsgKey.value.trim() : (currentConfig?.qqbot?.qmsgKey || '') },
+      summary: {
+        enabled: summaryEnabled ? summaryEnabled.checked : !!cs.enabled,
+        trigger: summaryTrigger ? summaryTrigger.value : (cs.trigger || 'background'),
+        apiSource: summarySource ? summarySource.value : (cs.apiSource || 'claude'),
+        apiBase: summaryApiBase ? summaryApiBase.value.trim() : (cs.apiBase || ''),
+        apiKey: summaryApiKey ? summaryApiKey.value.trim() : (cs.apiKey || ''),
+        model: summaryModel ? summaryModel.value.trim() : (cs.model || ''),
+      },
     };
+  }
+
+  function buildSummarySettingsHtml(config) {
+    const s = config?.summary || {};
+    const enabled = !!s.enabled;
+    const trigger = s.trigger || 'background';
+    const src = s.apiSource || 'claude';
+    const customVisible = src === 'custom' ? '' : 'display:none';
+    return `
+      <div class="settings-divider"></div>
+      <div class="settings-section-title">通知摘要</div>
+      <div class="settings-field" style="flex-direction:row;align-items:center;gap:10px">
+        <label style="margin:0;flex:1">启用 AI 摘要</label>
+        <input type="checkbox" id="notify-summary-enabled" ${enabled ? 'checked' : ''} style="width:auto;margin:0">
+      </div>
+      <div id="notify-summary-options" style="${enabled ? '' : 'display:none'}">
+        <div class="settings-field">
+          <label>推送时机</label>
+          <select class="settings-select" id="notify-summary-trigger">
+            <option value="background" ${trigger === 'background' ? 'selected' : ''}>仅后台任务</option>
+            <option value="always" ${trigger === 'always' ? 'selected' : ''}>所有任务</option>
+          </select>
+        </div>
+        <div class="settings-field">
+          <label>摘要 API 来源</label>
+          <select class="settings-select" id="notify-summary-source">
+            <option value="claude" ${src === 'claude' ? 'selected' : ''}>Claude 活跃模板</option>
+            <option value="codex" ${src === 'codex' ? 'selected' : ''}>Codex 活跃 Profile</option>
+            <option value="custom" ${src === 'custom' ? 'selected' : ''}>独立配置</option>
+          </select>
+        </div>
+        <div id="notify-summary-custom" style="${customVisible}">
+          <div class="settings-field">
+            <label>API Base URL</label>
+            <input type="text" id="notify-summary-apibase" placeholder="https://api.example.com" value="${escapeHtml(s.apiBase || '')}">
+          </div>
+          <div class="settings-field">
+            <label>API Key</label>
+            <input type="text" id="notify-summary-apikey" placeholder="sk-..." value="${escapeHtml(s.apiKey || '')}">
+          </div>
+          <div class="settings-field">
+            <label>模型</label>
+            <input type="text" id="notify-summary-model" placeholder="claude-opus-4-6" value="${escapeHtml(s.model || '')}">
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function bindSummarySettingsEvents(panel) {
+    const enabledCb = panel.querySelector('#notify-summary-enabled');
+    const optionsDiv = panel.querySelector('#notify-summary-options');
+    const sourceSelect = panel.querySelector('#notify-summary-source');
+    const customDiv = panel.querySelector('#notify-summary-custom');
+    if (!enabledCb || !optionsDiv || !sourceSelect || !customDiv) return;
+    enabledCb.addEventListener('change', () => {
+      optionsDiv.style.display = enabledCb.checked ? '' : 'none';
+    });
+    sourceSelect.addEventListener('change', () => {
+      customDiv.style.display = sourceSelect.value === 'custom' ? '' : 'none';
+    });
   }
 
   function openPasswordModal() {
@@ -2991,6 +3068,7 @@
         </select>
       </div>
       <div id="notify-fields"></div>
+      <div id="notify-summary-area"></div>
       <div class="settings-actions">
         <button class="btn-test" id="notify-test-btn">测试</button>
         <button class="btn-save" id="notify-save-btn">保存</button>
@@ -3020,6 +3098,7 @@
 
     const providerSelect = panel.querySelector('#notify-provider');
     const fieldsDiv = panel.querySelector('#notify-fields');
+    const summaryArea = panel.querySelector('#notify-summary-area');
     const statusDiv = panel.querySelector('#notify-status');
     const testBtn = panel.querySelector('#notify-test-btn');
     const saveBtn = panel.querySelector('#notify-save-btn');
@@ -3040,6 +3119,10 @@
 
     function renderFields(provider) {
       renderNotifyFields(fieldsDiv, currentNotifyConfig, provider);
+      if (summaryArea) {
+        summaryArea.innerHTML = buildSummarySettingsHtml(currentNotifyConfig);
+        bindSummarySettingsEvents(panel);
+      }
     }
 
     function collectNotifyConfig() {
@@ -3331,6 +3414,7 @@
         </select>
       </div>
       <div id="notify-fields"></div>
+      <div id="notify-summary-area"></div>
       <div class="settings-actions">
         <button class="btn-test" id="notify-test-btn">测试</button>
         <button class="btn-save" id="notify-save-btn">保存</button>
@@ -3340,7 +3424,6 @@
       <div class="settings-divider"></div>
 
       <div class="settings-section-title">系统</div>
-
       <div class="settings-actions" style="margin-top:0;flex-wrap:wrap;gap:10px">
         <button class="btn-test" id="pw-open-modal-btn" style="padding:6px 16px">修改密码</button>
         <button class="btn-test" id="check-update-btn" style="padding:6px 16px">检查更新</button>
@@ -3616,6 +3699,7 @@
     // === Notify Config UI ===
     const providerSelect = panel.querySelector('#notify-provider');
     const fieldsDiv = panel.querySelector('#notify-fields');
+    const summaryArea = panel.querySelector('#notify-summary-area');
     const statusDiv = panel.querySelector('#notify-status');
     const closeBtn = panel.querySelector('.settings-close');
     const testBtn = panel.querySelector('#notify-test-btn');
@@ -3625,6 +3709,10 @@
 
     function renderFields(provider) {
       renderNotifyFields(fieldsDiv, currentConfig, provider);
+      if (summaryArea) {
+        summaryArea.innerHTML = buildSummarySettingsHtml(currentConfig);
+        bindSummarySettingsEvents(panel);
+      }
     }
 
     providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
