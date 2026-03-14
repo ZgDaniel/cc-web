@@ -222,6 +222,134 @@
     `;
   }
 
+  function buildNotifyEntryHtml(config) {
+    const provider = config?.provider || 'off';
+    const providerLabel = PROVIDER_OPTIONS.find(o => o.value === provider)?.label || '关闭';
+    const summaryOn = config?.summary?.enabled ? '摘要已启用' : '摘要关闭';
+    const meta = provider === 'off' ? '未启用' : `${providerLabel} · ${summaryOn}`;
+    return `
+      <div class="settings-section-title">通知</div>
+      <button class="settings-nav-card" type="button" data-open-notify-page>
+        <span class="settings-nav-card-main">
+          <span class="settings-nav-card-title">通知设置</span>
+          <span class="settings-nav-card-meta" data-notify-summary>${escapeHtml(meta)}</span>
+        </span>
+        <span class="settings-nav-card-arrow" aria-hidden="true">›</span>
+      </button>
+    `;
+  }
+
+  function openNotifySubpage() {
+    send({ type: 'get_notify_config' });
+
+    const overlay = document.createElement('div');
+    overlay.className = 'settings-overlay settings-subpage-overlay';
+    overlay.style.zIndex = '10001';
+
+    const panel = document.createElement('div');
+    panel.className = 'settings-panel settings-subpage-panel';
+    panel.innerHTML = `
+      <div class="settings-header settings-subpage-header">
+        <button class="settings-back" type="button" aria-label="返回">‹</button>
+        <div class="settings-subpage-copy">
+          <div class="settings-subpage-kicker">Notification</div>
+          <h3>通知设置</h3>
+        </div>
+        <button class="settings-close" type="button" title="关闭">&times;</button>
+      </div>
+      <div class="settings-field">
+        <label>通知方式</label>
+        <select class="settings-select" id="notify-provider">
+          ${PROVIDER_OPTIONS.map(o => `<option value="${o.value}">${escapeHtml(o.label)}</option>`).join('')}
+        </select>
+      </div>
+      <div id="notify-fields"></div>
+      <div id="notify-summary-area"></div>
+      <div class="settings-actions">
+        <button class="btn-test" id="notify-test-btn">测试</button>
+        <button class="btn-save" id="notify-save-btn">保存</button>
+      </div>
+      <div class="settings-status" id="notify-status"></div>
+    `;
+
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+
+    const providerSelect = panel.querySelector('#notify-provider');
+    const fieldsDiv = panel.querySelector('#notify-fields');
+    const summaryArea = panel.querySelector('#notify-summary-area');
+    const statusDiv = panel.querySelector('#notify-status');
+    const testBtn = panel.querySelector('#notify-test-btn');
+    const saveBtn = panel.querySelector('#notify-save-btn');
+
+    let currentNotifyConfig = null;
+
+    function renderFields(provider) {
+      renderNotifyFields(fieldsDiv, currentNotifyConfig, provider);
+      if (summaryArea) {
+        summaryArea.innerHTML = buildSummarySettingsHtml(currentNotifyConfig);
+        bindSummarySettingsEvents(panel);
+      }
+    }
+
+    function collectConfig() {
+      return collectNotifyConfigFromPanel(panel, currentNotifyConfig, providerSelect.value);
+    }
+
+    function showStatus(msg, type) {
+      statusDiv.textContent = msg;
+      statusDiv.className = 'settings-status ' + (type || '');
+    }
+
+    function refreshParentSummary(config) {
+      const provider = config?.provider || 'off';
+      const providerLabel = PROVIDER_OPTIONS.find(o => o.value === provider)?.label || '关闭';
+      const summaryOn = config?.summary?.enabled ? '摘要已启用' : '摘要关闭';
+      const meta = provider === 'off' ? '未启用' : `${providerLabel} · ${summaryOn}`;
+      document.querySelectorAll('[data-notify-summary]').forEach(el => { el.textContent = meta; });
+    }
+
+    const savedOnNotifyConfig = _onNotifyConfig;
+    _onNotifyConfig = (config) => {
+      currentNotifyConfig = config;
+      providerSelect.value = config.provider || 'off';
+      renderFields(config.provider || 'off');
+      if (savedOnNotifyConfig) savedOnNotifyConfig(config);
+    };
+
+    const savedOnNotifyTestResult = _onNotifyTestResult;
+    _onNotifyTestResult = (msg) => {
+      showStatus(msg.message, msg.success ? 'success' : 'error');
+      if (savedOnNotifyTestResult) savedOnNotifyTestResult(msg);
+    };
+
+    providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
+
+    testBtn.addEventListener('click', () => {
+      const config = collectConfig();
+      send({ type: 'save_notify_config', config });
+      showStatus('正在发送测试消息...', '');
+      send({ type: 'test_notify' });
+    });
+
+    saveBtn.addEventListener('click', () => {
+      const config = collectConfig();
+      send({ type: 'save_notify_config', config });
+      refreshParentSummary(config);
+      showStatus('已保存', 'success');
+    });
+
+    const closeSubpage = () => {
+      _onNotifyConfig = savedOnNotifyConfig;
+      _onNotifyTestResult = savedOnNotifyTestResult;
+      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+    };
+
+    panel.querySelector('.settings-back').addEventListener('click', closeSubpage);
+    panel.querySelector('.settings-close').addEventListener('click', closeSubpage);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeSubpage(); });
+  }
+
   function openThemeSubpage() {
     const overlay = document.createElement('div');
     overlay.className = 'settings-overlay settings-subpage-overlay';
@@ -3025,7 +3153,6 @@
   }
 
   function showCodexSettingsPanel() {
-    send({ type: 'get_notify_config' });
     send({ type: 'get_codex_config' });
 
     const overlay = document.createElement('div');
@@ -3060,20 +3187,7 @@
 
       <div class="settings-divider"></div>
 
-      <div class="settings-section-title">通知设置</div>
-      <div class="settings-field">
-        <label>通知方式</label>
-        <select class="settings-select" id="notify-provider">
-          ${PROVIDER_OPTIONS.map(o => `<option value="${o.value}">${escapeHtml(o.label)}</option>`).join('')}
-        </select>
-      </div>
-      <div id="notify-fields"></div>
-      <div id="notify-summary-area"></div>
-      <div class="settings-actions">
-        <button class="btn-test" id="notify-test-btn">测试</button>
-        <button class="btn-save" id="notify-save-btn">保存</button>
-      </div>
-      <div class="settings-status" id="notify-status"></div>
+      ${buildNotifyEntryHtml(null)}
 
       <div class="settings-divider"></div>
 
@@ -3089,6 +3203,8 @@
     document.body.appendChild(overlay);
     const themePageBtn = panel.querySelector('[data-open-theme-page]');
     if (themePageBtn) themePageBtn.addEventListener('click', openThemeSubpage);
+    const notifyPageBtn = panel.querySelector('[data-open-notify-page]');
+    if (notifyPageBtn) notifyPageBtn.addEventListener('click', openNotifySubpage);
 
     const closeBtn = panel.querySelector('.settings-close');
     const codexModeSelect = panel.querySelector('#codex-mode');
@@ -3096,17 +3212,10 @@
     const codexStatus = panel.querySelector('#codex-status');
     const codexSaveBtn = panel.querySelector('#codex-save-btn');
 
-    const providerSelect = panel.querySelector('#notify-provider');
-    const fieldsDiv = panel.querySelector('#notify-fields');
-    const summaryArea = panel.querySelector('#notify-summary-area');
-    const statusDiv = panel.querySelector('#notify-status');
-    const testBtn = panel.querySelector('#notify-test-btn');
-    const saveBtn = panel.querySelector('#notify-save-btn');
     const pwOpenModalBtn = panel.querySelector('#pw-open-modal-btn');
     const checkUpdateBtn = panel.querySelector('#check-update-btn');
     const updateStatusEl = panel.querySelector('#update-status');
 
-    let currentNotifyConfig = null;
     let currentCodexConfig = null;
     let codexEditingProfiles = [];
     let codexActiveProfile = '';
@@ -3115,23 +3224,6 @@
     function showCodexStatus(msg, type) {
       codexStatus.textContent = msg;
       codexStatus.className = 'settings-status ' + (type || '');
-    }
-
-    function renderFields(provider) {
-      renderNotifyFields(fieldsDiv, currentNotifyConfig, provider);
-      if (summaryArea) {
-        summaryArea.innerHTML = buildSummarySettingsHtml(currentNotifyConfig);
-        bindSummarySettingsEvents(panel);
-      }
-    }
-
-    function collectNotifyConfig() {
-      return collectNotifyConfigFromPanel(panel, currentNotifyConfig, providerSelect.value);
-    }
-
-    function showNotifyStatus(msg, type) {
-      statusDiv.textContent = msg;
-      statusDiv.className = 'settings-status ' + (type || '');
     }
 
     function renderCodexProfileArea() {
@@ -3293,17 +3385,6 @@
       renderCodexProfileArea();
     };
 
-    _onNotifyConfig = (config) => {
-      currentNotifyConfig = config;
-      providerSelect.value = config.provider || 'off';
-      renderFields(config.provider || 'off');
-    };
-
-    _onNotifyTestResult = (msg) => {
-      showNotifyStatus(msg.message, msg.success ? 'success' : 'error');
-    };
-
-    providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
     codexModeSelect.addEventListener('change', renderCodexProfileArea);
 
     codexSaveBtn.addEventListener('click', () => {
@@ -3319,19 +3400,6 @@
       };
       send({ type: 'save_codex_config', config });
       showCodexStatus('已保存', 'success');
-    });
-
-    testBtn.addEventListener('click', () => {
-      const config = collectNotifyConfig();
-      send({ type: 'save_notify_config', config });
-      showNotifyStatus('正在发送测试消息...', '');
-      send({ type: 'test_notify' });
-    });
-
-    saveBtn.addEventListener('click', () => {
-      const config = collectNotifyConfig();
-      send({ type: 'save_notify_config', config });
-      showNotifyStatus('已保存', 'success');
     });
 
     pwOpenModalBtn.addEventListener('click', openPasswordModal);
@@ -3369,8 +3437,7 @@
       showCodexSettingsPanel();
       return;
     }
-    // Request current configs
-    send({ type: 'get_notify_config' });
+    // Request current configs (notify config is loaded on demand inside subpage)
     send({ type: 'get_model_config' });
 
     const overlay = document.createElement('div');
@@ -3406,20 +3473,7 @@
 
       <div class="settings-divider"></div>
 
-      <div class="settings-section-title">通知设置</div>
-      <div class="settings-field">
-        <label>通知方式</label>
-        <select class="settings-select" id="notify-provider">
-          ${PROVIDER_OPTIONS.map(o => `<option value="${o.value}">${escapeHtml(o.label)}</option>`).join('')}
-        </select>
-      </div>
-      <div id="notify-fields"></div>
-      <div id="notify-summary-area"></div>
-      <div class="settings-actions">
-        <button class="btn-test" id="notify-test-btn">测试</button>
-        <button class="btn-save" id="notify-save-btn">保存</button>
-      </div>
-      <div class="settings-status" id="notify-status"></div>
+      ${buildNotifyEntryHtml(null)}
 
       <div class="settings-divider"></div>
 
@@ -3435,6 +3489,8 @@
     document.body.appendChild(overlay);
     const themePageBtn = panel.querySelector('[data-open-theme-page]');
     if (themePageBtn) themePageBtn.addEventListener('click', openThemeSubpage);
+    const notifyPageBtn2 = panel.querySelector('[data-open-notify-page]');
+    if (notifyPageBtn2) notifyPageBtn2.addEventListener('click', openNotifySubpage);
 
     // === Model Config UI ===
     const modelModeSelect = panel.querySelector('#model-mode');
@@ -3696,64 +3752,10 @@
       renderModelCustomArea();
     };
 
-    // === Notify Config UI ===
-    const providerSelect = panel.querySelector('#notify-provider');
-    const fieldsDiv = panel.querySelector('#notify-fields');
-    const summaryArea = panel.querySelector('#notify-summary-area');
-    const statusDiv = panel.querySelector('#notify-status');
+    // === Notify Config UI (moved to subpage) ===
+    // notify config is handled by openNotifySubpage()
+
     const closeBtn = panel.querySelector('.settings-close');
-    const testBtn = panel.querySelector('#notify-test-btn');
-    const saveBtn = panel.querySelector('#notify-save-btn');
-
-    let currentConfig = null;
-
-    function renderFields(provider) {
-      renderNotifyFields(fieldsDiv, currentConfig, provider);
-      if (summaryArea) {
-        summaryArea.innerHTML = buildSummarySettingsHtml(currentConfig);
-        bindSummarySettingsEvents(panel);
-      }
-    }
-
-    providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
-
-    function collectConfig() {
-      return collectNotifyConfigFromPanel(panel, currentConfig, providerSelect.value);
-    }
-
-    function showStatus(msg, type) {
-      statusDiv.textContent = msg;
-      statusDiv.className = 'settings-status ' + type;
-    }
-
-    _onNotifyConfig = (config) => {
-      currentConfig = config;
-      providerSelect.value = config.provider || 'off';
-      renderFields(config.provider || 'off');
-    };
-
-    _onNotifyTestResult = (msg) => {
-      showStatus(msg.message, msg.success ? 'success' : 'error');
-    };
-
-    closeBtn.addEventListener('click', hideSettingsPanel);
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) hideSettingsPanel(); });
-
-    testBtn.addEventListener('click', () => {
-      // Save first then test
-      const config = collectConfig();
-      send({ type: 'save_notify_config', config });
-      showStatus('正在发送测试消息...', '');
-      send({ type: 'test_notify' });
-    });
-
-    saveBtn.addEventListener('click', () => {
-      const config = collectConfig();
-      send({ type: 'save_notify_config', config });
-      showStatus('已保存', 'success');
-    });
-
-    // Password change button -> opens modal
     const pwOpenModalBtn = panel.querySelector('#pw-open-modal-btn');
     pwOpenModalBtn.addEventListener('click', openPasswordModal);
 
@@ -3785,6 +3787,9 @@
     // Wire _onUpdateInfo into WS handler via closure
     const _origOnUpdateInfo = window._ccOnUpdateInfo;
     window._ccOnUpdateInfo = (info) => { if (_onUpdateInfo) _onUpdateInfo(info); };
+
+    closeBtn.addEventListener('click', hideSettingsPanel);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) hideSettingsPanel(); });
 
     document.addEventListener('keydown', _settingsEscape);
   }
