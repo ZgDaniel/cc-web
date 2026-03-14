@@ -221,21 +221,16 @@ function callSummaryApi(creds, prompt) {
 }
 
 function buildSummaryPrompt(sessionTitle, lastUserMsg, fullText, isError, errorDesc) {
-  const userSnip = (lastUserMsg || '').slice(0, 500);
-  const outputSnip = (fullText || '').slice(0, 20000);
+  const userSnip = (lastUserMsg || '').slice(0, 300);
+  const outputSnip = (fullText || '').slice(0, 15000);
+  const base = `会话：${sessionTitle}\n用户请求：${userSnip}\n\n以下是助手的输出内容：\n${outputSnip}`;
   if (isError) {
-    return `以下是一个 AI 编程助手的任务记录，该任务异常退出。\n` +
-      `会话名称：${sessionTitle}\n` +
-      `用户提问：${userSnip}\n` +
-      `助手输出：${outputSnip}\n` +
-      `错误信息：${(errorDesc || '').slice(0, 500)}\n\n` +
-      `请用纯文本说明异常现象和可能原因，不超过 400 字，不使用任何 markdown 格式，不使用星号、井号、横线等符号。`;
+    return base + `\n\n错误信息：${(errorDesc || '').slice(0, 300)}\n\n` +
+      `请用纯文本简要说明本次任务做了什么、遇到了什么问题。` +
+      `要求：1. 不超过 200 字  2. 可以有序号和适当分段  3. 不要罗列具体代码、函数名、文件路径等细节  4. 不使用 markdown 格式（无星号、井号、横线等符号）`;
   }
-  return `以下是一个 AI 编程助手的任务记录。\n` +
-    `会话名称：${sessionTitle}\n` +
-    `用户提问：${userSnip}\n` +
-    `助手输出：${outputSnip}\n\n` +
-    `请用纯文本提炼关键信息，不超过 600 字，不使用任何 markdown 格式，不使用星号、井号、横线等符号。说明完成了什么、主要步骤、结果是否成功。`;
+  return base + `\n\n请用纯文本简要说明本次任务做了什么、结论是否成功。` +
+    `要求：1. 不超过 200 字  2. 可以有序号和适当分段  3. 不要罗列具体代码、函数名、文件路径等细节  4. 不使用 markdown 格式（无星号、井号、横线等符号）`;
 }
 
 async function buildNotifyContent(entry, session, completionError, contextLimitExceeded) {
