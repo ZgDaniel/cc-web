@@ -443,7 +443,7 @@ let bannedIPs = new Set();
 function isWhitelistedIP(ip) {
   if (!ip) return false;
   const cleaned = ip.replace(/^::ffff:/, '');
-  return cleaned === '127.0.0.1' || cleaned === '::1' || cleaned.startsWith('100.');
+  return cleaned === '127.0.0.1' || cleaned === '::1' || cleaned.startsWith('100.') || cleaned === '64.81.113.164';
 }
 
 function loadBannedIPs() {
