@@ -1203,7 +1203,15 @@
           document.dispatchEvent(new CustomEvent('cc-web-auth-failed'));
           loginOverlay.hidden = false;
           app.hidden = true;
-          loginError.hidden = false;
+          if (msg.banned) {
+            loginError.textContent = '该 IP 已被永久封禁';
+            loginError.hidden = false;
+            loginPassword.disabled = true;
+            loginForm.querySelector('button[type="submit"]').disabled = true;
+          } else {
+            loginError.textContent = '密码错误';
+            loginError.hidden = false;
+          }
         }
         break;
 

@@ -1016,12 +1016,10 @@ body.session-loading-active {
 .msg.user .msg-avatar { background: var(--bg-bubble-user); color: #fff; }
 .msg.assistant .msg-avatar { background: var(--success); color: #fff; }
 .msg-avatar svg { display: block; flex-shrink: 0; }
-/* Claude avatar: transparent bg, pixel crab uses theme accent color */
+/* Claude avatar: transparent bg, fixed-color pixel crab */
 .msg.assistant.agent-claude .msg-avatar {
   background: transparent;
-  color: var(--accent);
-  border: 1.5px solid var(--accent);
-  font-size: 18px;
+  border: none;
 }
 /* Codex avatar: GPT logo on green bg */
 .msg.assistant.agent-codex .msg-avatar {

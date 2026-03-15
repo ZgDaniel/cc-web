@@ -32,6 +32,7 @@ const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
 const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
+const BANNED_IPS_PATH = path.join(CONFIG_DIR, 'banned_ips.json');
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -431,6 +432,50 @@ let authConfig = loadAuthConfig();
 let PASSWORD = authConfig.password;
 
 const activeTokens = new Set();
+
+// === Anti-brute-force ===
+const AUTH_FAIL_WINDOW = 5 * 60 * 1000; // 5 minutes
+const AUTH_FAIL_MAX = 3;
+const authFailures = new Map(); // ip -> [timestamp, ...]
+let bannedIPs = new Set();
+
+function loadBannedIPs() {
+  try {
+    if (fs.existsSync(BANNED_IPS_PATH)) {
+      const list = JSON.parse(fs.readFileSync(BANNED_IPS_PATH, 'utf8'));
+      bannedIPs = new Set(Array.isArray(list) ? list : []);
+    }
+  } catch { bannedIPs = new Set(); }
+}
+function saveBannedIPs() {
+  fs.writeFileSync(BANNED_IPS_PATH, JSON.stringify([...bannedIPs], null, 2));
+}
+loadBannedIPs();
+
+function getClientIP(ws) {
+  const req = ws._req;
+  if (!req) return null;
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) return forwarded.split(',')[0].trim();
+  return req.socket?.remoteAddress || null;
+}
+
+function recordAuthFailure(ip) {
+  if (!ip) return false;
+  const now = Date.now();
+  let list = authFailures.get(ip) || [];
+  list.push(now);
+  list = list.filter(t => now - t < AUTH_FAIL_WINDOW);
+  authFailures.set(ip, list);
+  if (list.length >= AUTH_FAIL_MAX) {
+    bannedIPs.add(ip);
+    saveBannedIPs();
+    authFailures.delete(ip);
+    plog('WARN', 'ip_banned', { ip, reason: `${AUTH_FAIL_MAX} failed auth in ${AUTH_FAIL_WINDOW / 1000}s` });
+    return true;
+  }
+  return false;
+}
 
 // Pending slash command metadata: sessionId -> { kind: string }
 const pendingSlashCommands = new Map();
@@ -1496,7 +1541,18 @@ const server = http.createServer((req, res) => {
 // === WebSocket Server ===
 const wss = new WebSocketServer({ server });
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  ws._req = req;
+  const clientIP = getClientIP(ws);
+
+  // Check if IP is banned
+  if (clientIP && bannedIPs.has(clientIP)) {
+    plog('WARN', 'banned_ip_rejected', { ip: clientIP });
+    wsSend(ws, { type: 'auth_result', success: false, banned: true });
+    ws.close();
+    return;
+  }
+
   let authenticated = false;
   let authToken = null;
   const wsId = crypto.randomBytes(4).toString('hex'); // short id for log correlation
@@ -1512,6 +1568,12 @@ wss.on('connection', (ws) => {
     }
 
     if (msg.type === 'auth') {
+      // Check ban before processing auth
+      if (clientIP && bannedIPs.has(clientIP)) {
+        wsSend(ws, { type: 'auth_result', success: false, banned: true });
+        ws.close();
+        return;
+      }
       if (msg.password === PASSWORD || (msg.token && activeTokens.has(msg.token))) {
         authToken = msg.token && activeTokens.has(msg.token) ? msg.token : crypto.randomBytes(32).toString('hex');
         activeTokens.add(authToken);
@@ -1519,7 +1581,9 @@ wss.on('connection', (ws) => {
         wsSend(ws, { type: 'auth_result', success: true, token: authToken, mustChangePassword: !!authConfig.mustChange });
         sendSessionList(ws);
       } else {
-        wsSend(ws, { type: 'auth_result', success: false });
+        const justBanned = recordAuthFailure(clientIP);
+        wsSend(ws, { type: 'auth_result', success: false, banned: justBanned });
+        if (justBanned) ws.close();
       }
       return;
     }
