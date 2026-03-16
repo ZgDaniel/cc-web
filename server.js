@@ -437,14 +437,27 @@ const activeTokens = new Set();
 const AUTH_FAIL_WINDOW = 5 * 60 * 1000; // 5 minutes
 const AUTH_FAIL_MAX = 3;
 const authFailures = new Map(); // ip -> [timestamp, ...]
-let bannedIPs = new Set();
+	let bannedIPs = new Set();
 
-// Tailscale / loopback whitelist — never ban these IPs
-function isWhitelistedIP(ip) {
-  if (!ip) return false;
-  const cleaned = ip.replace(/^::ffff:/, '');
-  return cleaned === '127.0.0.1' || cleaned === '::1' || cleaned.startsWith('100.') || cleaned === '';
-}
+	// Tailscale / loopback whitelist — never ban these IPs.
+	// Extra whitelist can be provided via env var (comma/space separated):
+	//   CC_WEB_IP_WHITELIST="<ip1>,<ip2>"
+	const EXTRA_WHITELIST_IPS = new Set(
+	  String(process.env.CC_WEB_IP_WHITELIST || '')
+	    .split(/[\s,]+/)
+	    .map(s => s.trim())
+	    .filter(Boolean)
+	    .map(s => s.replace(/^::ffff:/, ''))
+	);
+
+	function isWhitelistedIP(ip) {
+	  if (!ip) return false;
+	  const cleaned = ip.replace(/^::ffff:/, '');
+	  return cleaned === '127.0.0.1'
+	    || cleaned === '::1'
+	    || cleaned.startsWith('100.')
+	    || EXTRA_WHITELIST_IPS.has(cleaned);
+	}
 
 function loadBannedIPs() {
   try {
