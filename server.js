@@ -2055,25 +2055,27 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       break;
     }
 
-    case '/mode': {
-      const modeInput = parts[1];
-      const VALID_MODES = ['default', 'plan', 'yolo'];
-      const MODE_DESC = { default: '默认（需权限审批，受限操作）', plan: 'Plan（需确认计划后执行）', yolo: 'YOLO（跳过所有权限检查）' };
-      if (!modeInput) {
-        const cur = session?.permissionMode || 'yolo';
-        wsSend(ws, { type: 'system_message', message: `当前模式: ${MODE_DESC[cur] || cur}\n可选: default, plan, yolo` });
-      } else if (VALID_MODES.includes(modeInput.toLowerCase())) {
-        const mode = modeInput.toLowerCase();
-        if (session) {
-          session.permissionMode = mode;
-          clearRuntimeSessionId(session);
-          session.updated = new Date().toISOString();
-          saveSession(session);
-        }
-        wsSend(ws, { type: 'system_message', message: `权限模式已切换为: ${MODE_DESC[mode]}` });
-        wsSend(ws, { type: 'mode_changed', mode });
-      } else {
-        wsSend(ws, { type: 'system_message', message: `无效模式: ${modeInput}\n可选: default, plan, yolo` });
+	    case '/mode': {
+	      const modeInput = parts[1];
+	      const VALID_MODES = ['default', 'plan', 'yolo'];
+	      const MODE_DESC = { default: '默认（需权限审批，受限操作）', plan: 'Plan（需确认计划后执行）', yolo: 'YOLO（跳过所有权限检查）' };
+	      if (!modeInput) {
+	        const cur = session?.permissionMode || 'yolo';
+	        wsSend(ws, { type: 'system_message', message: `当前模式: ${MODE_DESC[cur] || cur}\n可选: default, plan, yolo` });
+	      } else if (VALID_MODES.includes(modeInput.toLowerCase())) {
+	        const mode = modeInput.toLowerCase();
+	        if (session) {
+	          session.permissionMode = mode;
+	          // Claude CLI permission mode changes should reset runtime resume id.
+	          // For Codex, keep thread id so mode switching does not drop context.
+	          if (isClaudeSession(session)) clearRuntimeSessionId(session);
+	          session.updated = new Date().toISOString();
+	          saveSession(session);
+	        }
+	        wsSend(ws, { type: 'system_message', message: `权限模式已切换为: ${MODE_DESC[mode]}` });
+	        wsSend(ws, { type: 'mode_changed', mode });
+	      } else {
+	        wsSend(ws, { type: 'system_message', message: `无效模式: ${modeInput}\n可选: default, plan, yolo` });
       }
       break;
     }
@@ -2330,20 +2332,21 @@ function handleRenameSession(ws, sessionId, title) {
   }
 }
 
-function handleSetMode(ws, sessionId, mode) {
-  const VALID_MODES = ['default', 'plan', 'yolo'];
-  if (!mode || !VALID_MODES.includes(mode)) return;
-  if (sessionId) {
-    const session = loadSession(sessionId);
-    if (session) {
-      session.permissionMode = mode;
-      clearRuntimeSessionId(session);
-      session.updated = new Date().toISOString();
-      saveSession(session);
-    }
-  }
-  wsSend(ws, { type: 'mode_changed', mode });
-}
+	function handleSetMode(ws, sessionId, mode) {
+	  const VALID_MODES = ['default', 'plan', 'yolo'];
+	  if (!mode || !VALID_MODES.includes(mode)) return;
+	  if (sessionId) {
+	    const session = loadSession(sessionId);
+	    if (session) {
+	      session.permissionMode = mode;
+	      // Same rule as /mode: don't clear Codex thread id on mode changes.
+	      if (isClaudeSession(session)) clearRuntimeSessionId(session);
+	      session.updated = new Date().toISOString();
+	      saveSession(session);
+	    }
+	  }
+	  wsSend(ws, { type: 'mode_changed', mode });
+	}
 
 function handleDisconnect(ws, wsId) {
   const affectedSessions = [];

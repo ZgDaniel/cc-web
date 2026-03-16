@@ -41,6 +41,15 @@ async function waitForPort(port, timeoutMs = 10000) {
   throw new Error(`Timed out waiting for port ${port}`);
 }
 
+async function waitForFile(filePath, timeoutMs = 10000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (fs.existsSync(filePath)) return;
+    await sleep(50);
+  }
+  throw new Error(`Timed out waiting for file: ${filePath}`);
+}
+
 async function withServer(env, fn) {
   const child = spawn('/usr/bin/node', [SERVER_PATH], {
     cwd: REPO_DIR,
@@ -95,19 +104,26 @@ async function uploadAttachment(port, token, { filename, mime, data }) {
   return payload.attachment;
 }
 
-function nextMessage(messages, ws, predicate, timeoutMs = 5000) {
+function nextMessage(messages, ws, predicate, timeoutMs = 15000) {
+  const callSite = (() => {
+    const stack = String(new Error().stack || '').split('\n');
+    return (stack[3] || stack[2] || '').trim();
+  })();
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const timer = setInterval(() => {
-      const found = messages.find(predicate);
-      if (found) {
+      const idx = messages.findIndex(predicate);
+      if (idx !== -1) {
         clearInterval(timer);
+        const found = messages.splice(idx, 1)[0];
         resolve(found);
         return;
       }
       if (Date.now() - started > timeoutMs) {
         clearInterval(timer);
-        reject(new Error('Timed out waiting for expected WebSocket message'));
+        const recentTypes = messages.slice(-12).map((m) => m?.type).join(', ');
+        const pendingTypes = messages.slice(0, 12).map((m) => m?.type).join(', ');
+        reject(new Error(`Timed out waiting for expected WebSocket message (wsState=${ws.readyState}, callSite=${callSite}, pendingTypes=[${pendingTypes}], recentTypes=[${recentTypes}])`));
       }
     }, 50);
   });
@@ -340,18 +356,44 @@ async function main() {
     const runningSessionList = await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.some((s) => s.id === firstMessageSession.sessionId && s.isRunning));
     assert(runningSessionList.sessions.some((s) => s.id === firstMessageSession.sessionId && s.isRunning), 'Running Codex session should be marked as isRunning');
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
+
+    // Switching permission mode must not clear Codex thread id (otherwise resume loses context).
+    const codexSessionPath = path.join(sessionsDir, `${firstMessageSession.sessionId}.json`);
+    await waitForFile(codexSessionPath, 15000);
+    const storedAfterFirst = JSON.parse(fs.readFileSync(codexSessionPath, 'utf8'));
+    const threadIdBeforeMode = storedAfterFirst.codexThreadId;
+    assert(threadIdBeforeMode, 'Codex thread id should be persisted after first run');
+
+    ws.send(JSON.stringify({ type: 'set_mode', sessionId: firstMessageSession.sessionId, mode: 'plan' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'mode_changed' && msg.mode === 'plan');
+    await waitForFile(codexSessionPath, 15000);
+    const storedAfterMode = JSON.parse(fs.readFileSync(codexSessionPath, 'utf8'));
+    assert(storedAfterMode.codexThreadId === threadIdBeforeMode, 'Codex thread id should survive mode switch');
+
+    ws.send(JSON.stringify({ type: 'message', text: 'second codex prompt', sessionId: firstMessageSession.sessionId, mode: 'plan', agent: 'codex' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
+
     const processLog = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8');
     const spawnLine = processLog
       .trim()
       .split('\n')
       .find((line) => line.includes(`"event":"process_spawn"`) && line.includes(firstMessageSession.sessionId.slice(0, 8)));
     assert(spawnLine && !spawnLine.includes('--search') && spawnLine.includes('--image'), 'Codex exec should attach images and not append unsupported --search flag');
+
+    const allSpawnsForSession = processLog
+      .trim()
+      .split('\n')
+      .filter((line) => line.includes(`"event":"process_spawn"`) && line.includes(firstMessageSession.sessionId.slice(0, 8)));
+    const lastSpawn = allSpawnsForSession[allSpawnsForSession.length - 1] || '';
+    assert(lastSpawn.includes('exec resume') && lastSpawn.includes(threadIdBeforeMode), 'Codex mode switch should keep resume thread id');
+    assert(lastSpawn.includes('-s read-only'), 'Codex plan mode should set sandbox read-only');
+
     const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'config.toml'), 'utf8');
     assert(runtimeToml.includes('preferred_auth_method = "apikey"'), 'Codex custom profile should write isolated runtime auth mode');
     assert(runtimeToml.includes('base_url = "https://example.com/v1"'), 'Codex custom profile should write isolated runtime base_url');
 
     ws.send(JSON.stringify({ type: 'message', text: '/compact', sessionId: firstMessageSession.sessionId, mode: 'yolo', agent: 'codex' }));
-    await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /正在执行 Codex \/compact/.test(msg.message || ''));
+    await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /正在执行/.test(msg.message || '') && /Codex \/compact/.test(msg.message || ''));
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
     const compactDoneMsg = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /已执行 Codex \/compact/.test(msg.message || ''));
     assert(/已执行 Codex \/compact/.test(compactDoneMsg.message || ''), 'Codex /compact should complete with Codex-specific status message');
