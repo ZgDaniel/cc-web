@@ -3,6 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const net = require('net');
 const { spawn, spawnSync } = require('child_process');
 const WebSocket = require('ws');
 
@@ -17,6 +18,18 @@ function mkdirp(dir) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      const port = addr && typeof addr === 'object' ? addr.port : null;
+      server.close(() => resolve(port));
+    });
+  });
 }
 
 function assert(condition, message) {
@@ -303,7 +316,7 @@ async function main() {
   createFakeClaudeHistory(homeDir);
   const codexFixture = createFakeCodexHistory(homeDir);
 
-  const port = 9102;
+  const port = await getFreePort();
   const password = 'Regression!234';
 
   await withServer({
@@ -429,6 +442,24 @@ async function main() {
     assert(claudeSpawnLine && claudeSpawnLine.includes('--input-format stream-json'), 'Claude image message should switch stdin to stream-json');
     const storedClaudeSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
     assert(Array.isArray(storedClaudeSession.messages?.[0]?.attachments) && storedClaudeSession.messages[0].attachments.length === 1, 'Claude message should persist attachment metadata');
+    assert(storedClaudeSession.claudeSessionId, 'Claude session id should be persisted after first run');
+    const claudeSessionIdBeforeMode = storedClaudeSession.claudeSessionId;
+
+    // Mode switching must not clear Claude runtime session id (resume should keep context).
+    ws.send(JSON.stringify({ type: 'set_mode', sessionId: claudeImageSession.sessionId, mode: 'plan' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'mode_changed' && msg.mode === 'plan');
+    const storedClaudeAfterMode = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
+    assert(storedClaudeAfterMode.claudeSessionId === claudeSessionIdBeforeMode, 'Claude session id should survive mode switch');
+
+    ws.send(JSON.stringify({ type: 'message', text: 'second claude prompt', sessionId: claudeImageSession.sessionId, mode: 'plan', agent: 'claude' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === claudeImageSession.sessionId);
+    const claudeSpawns = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+      .trim()
+      .split('\n')
+      .filter((line) => line.includes(`"event":"process_spawn"`) && line.includes(claudeImageSession.sessionId.slice(0, 8)));
+    const lastClaudeSpawn = claudeSpawns[claudeSpawns.length - 1] || '';
+    assert(lastClaudeSpawn.includes(`--resume ${claudeSessionIdBeforeMode}`), 'Claude mode switch should keep --resume session id');
+    assert(lastClaudeSpawn.includes('--permission-mode plan'), 'Claude plan mode should set --permission-mode plan');
 
     ws.send(JSON.stringify({ type: 'list_native_sessions' }));
     const nativeSessions = await nextMessage(messages, ws, (msg) => msg.type === 'native_sessions');

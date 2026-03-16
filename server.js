@@ -2066,9 +2066,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 	        const mode = modeInput.toLowerCase();
 	        if (session) {
 	          session.permissionMode = mode;
-	          // Claude CLI permission mode changes should reset runtime resume id.
-	          // For Codex, keep thread id so mode switching does not drop context.
-	          if (isClaudeSession(session)) clearRuntimeSessionId(session);
+	          // Mode switching should not reset runtime context (Claude/Codex both resume).
 	          session.updated = new Date().toISOString();
 	          saveSession(session);
 	        }
@@ -2339,8 +2337,7 @@ function handleRenameSession(ws, sessionId, title) {
 	    const session = loadSession(sessionId);
 	    if (session) {
 	      session.permissionMode = mode;
-	      // Same rule as /mode: don't clear Codex thread id on mode changes.
-	      if (isClaudeSession(session)) clearRuntimeSessionId(session);
+	      // Same rule as /mode: don't clear runtime context on mode changes.
 	      session.updated = new Date().toISOString();
 	      saveSession(session);
 	    }
