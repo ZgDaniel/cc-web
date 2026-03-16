@@ -323,7 +323,7 @@ async function main() {
     ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: '/tmp/codex-space', mode: 'plan' }));
     const codexSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === '/tmp/codex-space');
     assert(codexSession.mode === 'plan', 'Codex new_session should follow requested mode');
-    assert(codexSession.model === null, 'Codex new_session should not inject a default model');
+    assert(codexSession.model === 'gpt-5.4', 'Codex new_session should inject default model gpt-5.4');
 
     ws.send(JSON.stringify({ type: 'message', text: '/model gpt-5.3-codex', sessionId: codexSession.sessionId, mode: 'plan', agent: 'codex' }));
     const codexModelChanged = await nextMessage(messages, ws, (msg) => msg.type === 'model_changed' && msg.model === 'gpt-5.3-codex');

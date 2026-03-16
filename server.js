@@ -443,7 +443,7 @@ let bannedIPs = new Set();
 function isWhitelistedIP(ip) {
   if (!ip) return false;
   const cleaned = ip.replace(/^::ffff:/, '');
-  return cleaned === '127.0.0.1' || cleaned === '::1' || cleaned.startsWith('100.');
+  return cleaned === '127.0.0.1' || cleaned === '::1' || cleaned.startsWith('100.') || cleaned === '';
 }
 
 function loadBannedIPs() {
@@ -504,6 +504,10 @@ let MODEL_MAP = {
 };
 
 const VALID_AGENTS = new Set(['claude', 'codex']);
+
+// Codex CLI has its own default model if --model is omitted. We override it for new Codex sessions
+// to keep cc-web behavior stable and predictable.
+const DEFAULT_CODEX_MODEL = 'gpt-5.4';
 
 // === Model Config ===
 const DEFAULT_MODEL_CONFIG = {
@@ -1798,8 +1802,10 @@ function handleSaveModelConfig(ws, newConfig) {
 
   saveModelConfig(merged);
 
-  // Re-apply at runtime
-  MODEL_MAP = { opus: 'claude-opus-4-6', sonnet: 'claude-sonnet-4-6', haiku: 'claude-haiku-4-5-20251001' };
+  // Re-apply at runtime (mutate in-place to preserve agent-runtime closure reference)
+  MODEL_MAP.opus = 'claude-opus-4-6';
+  MODEL_MAP.sonnet = 'claude-sonnet-4-6';
+  MODEL_MAP.haiku = 'claude-haiku-4-5-20251001';
   applyModelConfig();
   // custom mode: write to ~/.claude/settings.json immediately on save
   if (merged.mode === 'custom' && merged.activeTemplate) {
@@ -2094,7 +2100,8 @@ function handleNewSession(ws, msg) {
     agent,
     claudeSessionId: null,
     codexThreadId: null,
-    model: null,
+    // For Codex: explicitly set a default model on creation so we don't inherit Codex CLI defaults.
+    model: agent === 'codex' ? DEFAULT_CODEX_MODEL : null,
     permissionMode: requestedMode,
     totalCost: 0,
     totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
@@ -2400,22 +2407,22 @@ function handleMessage(ws, msg, options = {}) {
     const id = crypto.randomUUID();
     const agent = normalizeAgent(msg.agent);
     const resolvedCwd = agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null;
-    session = {
-      id,
-      title: derivedTitle,
-      created: new Date().toISOString(),
-      updated: new Date().toISOString(),
-      agent,
-      claudeSessionId: null,
-      codexThreadId: null,
-      model: null,
-      permissionMode: mode || 'yolo',
-      totalCost: 0,
-      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
-      messages: [],
-      cwd: resolvedCwd,
-    };
-  }
+	    session = {
+	      id,
+	      title: derivedTitle,
+	      created: new Date().toISOString(),
+	      updated: new Date().toISOString(),
+	      agent,
+	      claudeSessionId: null,
+	      codexThreadId: null,
+	      model: agent === 'codex' ? DEFAULT_CODEX_MODEL : null,
+	      permissionMode: mode || 'yolo',
+	      totalCost: 0,
+	      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+	      messages: [],
+	      cwd: resolvedCwd,
+	    };
+	  }
   normalizeSession(session);
 
   if (normalizedText.startsWith('/') && resolvedAttachments.length > 0) {

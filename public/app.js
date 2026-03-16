@@ -37,14 +37,12 @@
     { value: 'haiku', label: 'Haiku', desc: '最快速，适合简单任务' },
   ];
 
-  const DEFAULT_CODEX_MODEL_OPTIONS = [
-    { value: 'gpt-5.4', label: 'GPT-5.4', desc: '当前主力 Codex 模型' },
-    { value: 'gpt-5.3-codex', label: 'GPT-5.3 Codex', desc: '偏工程执行场景' },
-    { value: 'gpt-5.2-codex', label: 'GPT-5.2 Codex', desc: '兼容旧路由与旧配置' },
-    { value: 'gpt-5.2', label: 'GPT-5.2', desc: '通用 OpenAI 兼容模型' },
-    { value: 'o3', label: 'o3', desc: '偏强推理路径' },
-    { value: 'o4-mini', label: 'o4-mini', desc: '轻量快速响应' },
-  ];
+	  const DEFAULT_CODEX_MODEL_OPTIONS = [
+	    { value: 'gpt-5.4', label: 'GPT-5.4', desc: '当前主力 Codex 模型' },
+	    { value: 'gpt-5.3-codex', label: 'GPT-5.3 Codex', desc: '偏工程执行场景' },
+	    { value: 'gpt-5.2-codex', label: 'GPT-5.2 Codex', desc: '兼容旧路由与旧配置' },
+	    { value: 'gpt-5.2', label: 'GPT-5.2', desc: '通用 OpenAI 兼容模型' },
+	  ];
 
   const MODE_PICKER_OPTIONS = [
     { value: 'yolo', label: 'YOLO', desc: '跳过所有权限检查' },
@@ -1058,25 +1056,48 @@
     costDisplay.textContent = '';
   }
 
-  function getCodexModelOptions() {
-    const seen = new Set();
-    const options = [];
+	  function _splitCodexThinkingModel(model) {
+	    const raw = String(model || '').trim();
+	    if (!raw) return { base: '', level: '' };
+	    const m = raw.match(/^(.*)\(([^()]+)\)\s*$/);
+	    if (!m) return { base: raw, level: '' };
+	    return { base: (m[1] || '').trim(), level: (m[2] || '').trim().toLowerCase() };
+	  }
 
-    function addOption(value, label, desc) {
-      const v = (value || '').trim();
-      if (!v || seen.has(v)) return;
-      seen.add(v);
-      options.push({ value: v, label: label || v, desc: desc || 'Codex 模型' });
-    }
+	  function _isCodexModelAtLeast52(model) {
+	    const { base } = _splitCodexThinkingModel(model);
+	    // Accept only GPT-5.2+ (hide/remove older and other families from picker).
+	    const m = String(base || '').trim().match(/^gpt-5\.(\d+)(?:-.+)?$/i);
+	    if (!m) return false;
+	    const minor = Number(m[1] || 0);
+	    return Number.isFinite(minor) && minor >= 2;
+	  }
 
-    DEFAULT_CODEX_MODEL_OPTIONS.forEach((opt) => addOption(opt.value, opt.label, opt.desc));
-    addOption(currentModel, currentModel, '当前会话模型');
-    sessions
-      .filter((s) => normalizeAgent(s.agent) === 'codex' && s.id === currentSessionId)
-      .forEach((s) => addOption(s.model, s.model, '当前会话已保存模型'));
+	  function getCodexBaseModelOptions() {
+	    const seen = new Set();
+	    const options = [];
 
-    return options;
-  }
+	    function addOption(value, label, desc) {
+	      const v = (value || '').trim();
+	      if (!v || seen.has(v)) return;
+	      seen.add(v);
+	      options.push({ value: v, label: label || v, desc: desc || 'Codex 模型' });
+	    }
+
+	    function addBaseOption(value, label, desc) {
+	      if (!_isCodexModelAtLeast52(value)) return;
+	      const { base } = _splitCodexThinkingModel(value);
+	      addOption(base, label || base, desc);
+	    }
+
+	    DEFAULT_CODEX_MODEL_OPTIONS.forEach((opt) => addBaseOption(opt.value, opt.label, opt.desc));
+	    addBaseOption(currentModel, currentModel, '当前会话模型');
+	    sessions
+	      .filter((s) => normalizeAgent(s.agent) === 'codex' && s.id === currentSessionId)
+	      .forEach((s) => addBaseOption(s.model, s.model, '当前会话已保存模型'));
+
+	    return options;
+	  }
 
   // --- marked config ---
   const PREVIEW_LANGS = new Set(['html', 'svg']);
@@ -1570,58 +1591,9 @@
     if (role === 'user') {
       avatar.textContent = 'U';
     } else if (currentAgent === 'codex') {
-      avatar.innerHTML = `<svg viewBox="0 0 41 41" xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor"><path d="M37.532 16.87a9.963 9.963 0 0 0-.856-8.184 10.078 10.078 0 0 0-10.855-4.835A9.964 9.964 0 0 0 18.306.5a10.079 10.079 0 0 0-9.614 6.977 9.967 9.967 0 0 0-6.664 4.834 10.08 10.08 0 0 0 1.24 11.817 9.965 9.965 0 0 0 .856 8.185 10.079 10.079 0 0 0 10.855 4.835 9.965 9.965 0 0 0 7.516 3.35 10.078 10.078 0 0 0 9.617-6.981 9.967 9.967 0 0 0 6.663-4.834 10.079 10.079 0 0 0-1.243-11.813zM22.498 37.886a7.474 7.474 0 0 1-4.799-1.735c.061-.033.168-.091.237-.134l7.964-4.6a1.294 1.294 0 0 0 .655-1.134V19.054l3.366 1.944a.12.12 0 0 1 .066.092v9.299a7.505 7.505 0 0 1-7.49 7.496zM6.392 31.006a7.471 7.471 0 0 1-.894-5.023c.06.036.162.099.237.141l7.964 4.6a1.297 1.297 0 0 0 1.308 0l9.724-5.614v3.888a.12.12 0 0 1-.048.103l-8.051 4.649a7.504 7.504 0 0 1-10.24-2.744zM4.297 13.62A7.469 7.469 0 0 1 8.2 10.333c0 .068-.004.19-.004.274v9.201a1.294 1.294 0 0 0 .654 1.132l9.723 5.614-3.366 1.944a.12.12 0 0 1-.114.012L6.044 23.86a7.504 7.504 0 0 1-1.747-10.24zm27.658 6.437l-9.724-5.615 3.367-1.943a.121.121 0 0 1 .114-.012l9.048 5.228a7.498 7.498 0 0 1-1.158 13.528v-9.476a1.293 1.293 0 0 0-.647-1.71zm3.35-5.043c-.059-.037-.162-.099-.236-.141l-7.965-4.6a1.298 1.298 0 0 0-1.308 0l-9.723 5.614v-3.888a.12.12 0 0 1 .048-.103l8.05-4.645a7.497 7.497 0 0 1 11.135 7.763zm-21.063 6.929l-3.367-1.944a.12.12 0 0 1-.065-.092v-9.299a7.497 7.497 0 0 1 12.293-5.756 6.94 6.94 0 0 0-.236.134l-7.965 4.6a1.294 1.294 0 0 0-.654 1.132l-.006 11.225zm1.829-3.943l4.33-2.501 4.332 2.5v4.999l-4.331 2.5-4.331-2.5V18z"/></svg>`;
+      avatar.innerHTML = `<img src="/codex.png" width="24" height="24" style="display:block;" alt="Codex">`;
     } else {
-      // Pixel-style Claude crab mascot, transparent bg, fixed colors matching original
-      avatar.innerHTML = `<svg viewBox="0 0 49 32" xmlns="http://www.w3.org/2000/svg" width="28" height="20" shape-rendering="crispEdges">
-        <!-- body -->
-        <rect x="7" y="1" width="35" height="22" fill="#d47f5a"/>
-        <!-- body outline -->
-        <rect x="7" y="1" width="35" height="1" fill="#714333"/>
-        <rect x="7" y="22" width="35" height="1" fill="#714333"/>
-        <rect x="7" y="1" width="1" height="22" fill="#714333"/>
-        <rect x="41" y="1" width="1" height="22" fill="#714333"/>
-        <!-- left eye -->
-        <rect x="13" y="6" width="2" height="6" fill="#2c0700"/>
-        <rect x="13" y="6" width="2" height="1" fill="#000"/>
-        <!-- right eye -->
-        <rect x="34" y="6" width="2" height="6" fill="#2c0700"/>
-        <rect x="34" y="6" width="2" height="1" fill="#000"/>
-        <!-- left claw arm -->
-        <rect x="1" y="12" width="6" height="6" fill="#d47f5a"/>
-        <rect x="1" y="12" width="1" height="6" fill="#714333"/>
-        <rect x="1" y="12" width="6" height="1" fill="#714333"/>
-        <rect x="1" y="17" width="6" height="1" fill="#714333"/>
-        <!-- left claw tip -->
-        <rect x="0" y="11" width="3" height="4" fill="#714333"/>
-        <rect x="0" y="15" width="3" height="3" fill="#2c0700"/>
-        <!-- right claw arm -->
-        <rect x="42" y="12" width="6" height="6" fill="#d47f5a"/>
-        <rect x="47" y="12" width="1" height="6" fill="#714333"/>
-        <rect x="42" y="12" width="6" height="1" fill="#714333"/>
-        <rect x="42" y="17" width="6" height="1" fill="#714333"/>
-        <!-- right claw tip -->
-        <rect x="46" y="11" width="3" height="4" fill="#714333"/>
-        <rect x="46" y="15" width="3" height="3" fill="#2c0700"/>
-        <!-- legs left 1 -->
-        <rect x="9" y="23" width="3" height="6" fill="#d47f5a"/>
-        <rect x="9" y="28" width="3" height="2" fill="#9d6452"/>
-        <!-- legs left 2 -->
-        <rect x="15" y="23" width="3" height="7" fill="#d47f5a"/>
-        <rect x="15" y="29" width="3" height="2" fill="#9d6452"/>
-        <!-- legs left 3 -->
-        <rect x="21" y="23" width="3" height="6" fill="#d47f5a"/>
-        <rect x="21" y="28" width="3" height="2" fill="#9d6452"/>
-        <!-- legs right 1 -->
-        <rect x="37" y="23" width="3" height="6" fill="#d47f5a"/>
-        <rect x="37" y="28" width="3" height="2" fill="#9d6452"/>
-        <!-- legs right 2 -->
-        <rect x="31" y="23" width="3" height="7" fill="#d47f5a"/>
-        <rect x="31" y="29" width="3" height="2" fill="#9d6452"/>
-        <!-- legs right 3 -->
-        <rect x="25" y="23" width="3" height="6" fill="#d47f5a"/>
-        <rect x="25" y="28" width="3" height="2" fill="#9d6452"/>
-      </svg>`;
+      avatar.innerHTML = `<img src="/claude.png" width="24" height="24" style="display:block;" alt="Claude">`;
     }
 
     const bubble = document.createElement('div');
@@ -1738,16 +1710,16 @@
     return section;
   }
 
-  function buildMsgElement(m) {
-    const el = createMsgElement(m.role, m.content, m.attachments || []);
-    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
-      const bubble = el.querySelector('.msg-bubble');
-      const FOLD_AT = 5;
-      let grouped = false;
-      for (const tc of m.toolCalls) {
-        const details = createToolCallElement(tc.id || `saved-${Math.random().toString(36).slice(2)}`, tc, true);
+	  function buildMsgElement(m) {
+	    const el = createMsgElement(m.role, m.content, m.attachments || []);
+	    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
+	      const bubble = el.querySelector('.msg-bubble');
+	      const FOLD_AT = 3;
+	      let grouped = false;
+	      for (const tc of m.toolCalls) {
+	        const details = createToolCallElement(tc.id || `saved-${Math.random().toString(36).slice(2)}`, tc, true);
 
-        // 散落的 .tool-call 达到 FOLD_AT 个时，移入唯一 .tool-group
+	        // 散落的 .tool-call 达到 FOLD_AT 个时，移入唯一 .tool-group
         const loose = Array.from(bubble.children).filter(c => c.classList.contains('tool-call'));
         if (loose.length >= FOLD_AT) {
           let group = bubble.querySelector(':scope > .tool-group');
@@ -2080,7 +2052,17 @@
       details.dataset.toolKind = toolKind(tool);
       details.classList.add(`codex-${toolKind(tool).replace(/_/g, '-')}`);
     }
-    if (tool.name === 'AskUserQuestion' || (!done && toolKind(tool) === 'command_execution')) details.open = true;
+    // Default expansion policy:
+    // - Always open AskUserQuestion (it is an actionable UI).
+    // - For non-Codex sessions, auto-open in-flight command execution so users can watch output.
+    // - For Codex sessions, keep everything collapsed by default (less noise), including in-flight commands.
+    const agent = normalizeAgent(currentAgent);
+    const kind = toolKind(tool);
+    if (tool.name === 'AskUserQuestion') {
+      details.open = true;
+    } else if (agent !== 'codex' && !done && kind === 'command_execution') {
+      details.open = true;
+    }
 
     const summary = document.createElement('summary');
     applyToolSummary(summary, tool, done);
@@ -2102,8 +2084,8 @@
     const details = createToolCallElement(toolUseId, tool, done);
 
     // 折叠策略：只维护唯一一个 .tool-group 父节点
-    // 散落的 .tool-call 直接子节点达到5个时，将它们全部移入父节点；之后继续散落，再达5个再移入
-    const FOLD_AT = 5;
+    // 散落的 .tool-call 直接子节点达到3个时，将它们全部移入父节点；之后继续散落，再达3个再移入
+    const FOLD_AT = 3;
     const looseBefore = Array.from(toolsDiv.children).filter(c => c.classList.contains('tool-call'));
     if (looseBefore.length >= FOLD_AT) {
       // 确保存在唯一的 .tool-group
@@ -2626,12 +2608,14 @@
     const chatMain = document.querySelector('.chat-main');
     chatMain.appendChild(picker);
 
-    picker.querySelectorAll('.option-picker-item').forEach(el => {
-      el.addEventListener('click', () => {
-        onSelect(el.dataset.value);
-        hideOptionPicker();
-      });
-    });
+	    picker.querySelectorAll('.option-picker-item').forEach(el => {
+	      el.addEventListener('click', () => {
+	        // Close current picker first so onSelect can safely open a nested picker.
+	        const v = el.dataset.value;
+	        hideOptionPicker();
+	        onSelect(v);
+	      });
+	    });
 
     // Close on outside click (delayed to avoid immediate close)
     setTimeout(() => {
@@ -2660,16 +2644,28 @@
     }
   }
 
-  function showModelPicker() {
-    if (currentAgent === 'codex') {
-      const options = getCodexModelOptions();
-      showOptionPicker('选择 Codex 模型', options, currentModel || '', (value) => {
-        send({ type: 'message', text: `/model ${value}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
-      });
-      return;
-    }
-    showOptionPicker('选择模型', MODEL_OPTIONS, currentModel, (value) => {
-      send({ type: 'message', text: `/model ${value}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+	  function showModelPicker() {
+	    if (currentAgent === 'codex') {
+	      const current = _splitCodexThinkingModel(currentModel || '');
+	      const baseOptions = getCodexBaseModelOptions();
+	      showOptionPicker('选择 Codex 模型', baseOptions, current.base || '', (baseValue) => {
+	        const base = String(baseValue || '').trim();
+	        const thinkingOptions = [
+	          { value: '', label: '无 (默认)', desc: '不附加 (medium/high/xhigh) 后缀' },
+	          { value: 'medium', label: 'medium', desc: '中等 thinking' },
+	          { value: 'high', label: 'high', desc: '更强 thinking' },
+	          { value: 'xhigh', label: 'xhigh', desc: '最强 thinking' },
+	        ];
+	        showOptionPicker('选择 Thinking 强度', thinkingOptions, current.level || '', (lvl) => {
+	          const level = String(lvl || '').trim().toLowerCase();
+	          const full = level ? `${base}(${level})` : base;
+	          send({ type: 'message', text: `/model ${full}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+	        });
+	      });
+	      return;
+	    }
+	    showOptionPicker('选择模型', MODEL_OPTIONS, currentModel, (value) => {
+	      send({ type: 'message', text: `/model ${value}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
     });
   }
 
