@@ -439,6 +439,13 @@ const AUTH_FAIL_MAX = 3;
 const authFailures = new Map(); // ip -> [timestamp, ...]
 let bannedIPs = new Set();
 
+// Tailscale / loopback whitelist — never ban these IPs
+function isWhitelistedIP(ip) {
+  if (!ip) return false;
+  const cleaned = ip.replace(/^::ffff:/, '');
+  return cleaned === '127.0.0.1' || cleaned === '::1' || cleaned.startsWith('100.');
+}
+
 function loadBannedIPs() {
   try {
     if (fs.existsSync(BANNED_IPS_PATH)) {
@@ -461,7 +468,7 @@ function getClientIP(ws) {
 }
 
 function recordAuthFailure(ip) {
-  if (!ip) return false;
+  if (!ip || isWhitelistedIP(ip)) return false;
   const now = Date.now();
   let list = authFailures.get(ip) || [];
   list.push(now);
