@@ -16,7 +16,8 @@ function readStdin() {
 
 (async function main() {
   const args = process.argv.slice(2);
-  const isResume = args[0] === 'exec' && args[1] === 'resume';
+  // cc-web can place `resume` after other `codex exec` options (e.g. --json, -s).
+  const isResume = args[0] === 'exec' && args.includes('resume');
   const threadId = (() => {
     if (!isResume) return `mock-${crypto.randomUUID()}`;
     for (let i = args.length - 1; i >= 2; i--) {

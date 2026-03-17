@@ -398,8 +398,9 @@ async function main() {
       .split('\n')
       .filter((line) => line.includes(`"event":"process_spawn"`) && line.includes(firstMessageSession.sessionId.slice(0, 8)));
     const lastSpawn = allSpawnsForSession[allSpawnsForSession.length - 1] || '';
-    assert(lastSpawn.includes('exec resume') && lastSpawn.includes(threadIdBeforeMode), 'Codex mode switch should keep resume thread id');
+    assert(lastSpawn.includes('resume') && lastSpawn.includes(threadIdBeforeMode), 'Codex mode switch should keep resume thread id');
     assert(lastSpawn.includes('-s read-only'), 'Codex plan mode should set sandbox read-only');
+    assert(lastSpawn.includes('-s read-only resume'), 'Codex resume in plan mode must place -s before resume subcommand');
 
     const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'config.toml'), 'utf8');
     assert(runtimeToml.includes('preferred_auth_method = "apikey"'), 'Codex custom profile should write isolated runtime auth mode');
