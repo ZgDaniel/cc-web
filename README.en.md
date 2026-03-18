@@ -244,6 +244,9 @@ node server.js
 
 ## Release Notes
 
+- **v1.2.10**
+  - Implemented `/init` behavior aligned with native Claude Code and Codex CLI
+
 - **v1.2.8**
   - **Dual-agent (Codex)**: create Claude or Codex sessions on the same backend; agent-isolated sidebar, settings, and import
   - **Image upload**: drag, paste, or attach images in both Claude and Codex sessions; client-side WebP compression, 7-day server cache, up to 4 images per message
