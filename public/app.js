@@ -11,6 +11,7 @@
     { cmd: '/mode', desc: '查看/切换权限模式' },
     { cmd: '/cost', desc: '查看会话费用' },
     { cmd: '/compact', desc: '压缩上下文' },
+    { cmd: '/init', desc: '生成/更新 CLAUDE.md' },
     { cmd: '/help', desc: '显示帮助' },
   ];
 
@@ -3260,13 +3261,13 @@
 
       <div class="settings-divider"></div>
 
-      <div class="settings-section-title">系统</div>
-      <div class="settings-actions" style="margin-top:0;flex-wrap:wrap;gap:10px">
-        <button class="btn-test" id="pw-open-modal-btn" style="padding:6px 16px">修改密码</button>
-        <button class="btn-test" id="check-update-btn" style="padding:6px 16px">检查更新</button>
-      </div>
-      <div class="settings-status" id="update-status" style="margin-top:8px"></div>
-    `;
+	      <div class="settings-section-title">系统</div>
+	      <div class="settings-actions" style="margin-top:0;flex-wrap:wrap;gap:10px">
+	        <button class="btn-test" id="pw-open-modal-btn" style="padding:6px 16px">修改密码</button>
+	        <button class="btn-test" id="check-update-btn" style="padding:6px 16px">检查更新</button>
+	      </div>
+	      <div class="settings-status" id="update-status" style="margin-top:8px"></div>
+	    `;
 
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
@@ -3281,9 +3282,9 @@
     const codexStatus = panel.querySelector('#codex-status');
     const codexSaveBtn = panel.querySelector('#codex-save-btn');
 
-    const pwOpenModalBtn = panel.querySelector('#pw-open-modal-btn');
-    const checkUpdateBtn = panel.querySelector('#check-update-btn');
-    const updateStatusEl = panel.querySelector('#update-status');
+	    const pwOpenModalBtn = panel.querySelector('#pw-open-modal-btn');
+	    const checkUpdateBtn = panel.querySelector('#check-update-btn');
+	    const updateStatusEl = panel.querySelector('#update-status');
 
     let currentCodexConfig = null;
     let codexEditingProfiles = [];
@@ -3822,12 +3823,12 @@
       renderModelCustomArea();
     };
 
-    // === Notify Config UI (moved to subpage) ===
-    // notify config is handled by openNotifySubpage()
+	    // === Notify Config UI (moved to subpage) ===
+	    // notify config is handled by openNotifySubpage()
 
-    const closeBtn = panel.querySelector('.settings-close');
-    const pwOpenModalBtn = panel.querySelector('#pw-open-modal-btn');
-    pwOpenModalBtn.addEventListener('click', openPasswordModal);
+	    const closeBtn = panel.querySelector('.settings-close');
+	    const pwOpenModalBtn = panel.querySelector('#pw-open-modal-btn');
+	    pwOpenModalBtn.addEventListener('click', openPasswordModal);
 
     // Check update button
     const checkUpdateBtn = panel.querySelector('#check-update-btn');

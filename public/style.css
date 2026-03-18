@@ -1021,10 +1021,10 @@ body.session-loading-active {
   background: transparent;
   border: none;
 }
-/* Codex avatar: GPT logo on green bg */
+/* Codex avatar: transparent bg to match the supplied asset */
 .msg.assistant.agent-codex .msg-avatar {
-  background: #10a37f;
-  color: #fff;
+  background: transparent;
+  border: none;
 }
 
 .msg-bubble {

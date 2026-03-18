@@ -437,27 +437,27 @@ const activeTokens = new Set();
 const AUTH_FAIL_WINDOW = 5 * 60 * 1000; // 5 minutes
 const AUTH_FAIL_MAX = 3;
 const authFailures = new Map(); // ip -> [timestamp, ...]
-	let bannedIPs = new Set();
+let bannedIPs = new Set();
 
-	// Tailscale / loopback whitelist — never ban these IPs.
-	// Extra whitelist can be provided via env var (comma/space separated):
-	//   CC_WEB_IP_WHITELIST="<ip1>,<ip2>"
-	const EXTRA_WHITELIST_IPS = new Set(
-	  String(process.env.CC_WEB_IP_WHITELIST || '')
-	    .split(/[\s,]+/)
-	    .map(s => s.trim())
-	    .filter(Boolean)
-	    .map(s => s.replace(/^::ffff:/, ''))
-	);
+// Tailscale / loopback whitelist — never ban these IPs.
+// Extra whitelist can be provided via env var (comma/space separated):
+//   CC_WEB_IP_WHITELIST="<ip1>,<ip2>"
+const EXTRA_WHITELIST_IPS = new Set(
+  String(process.env.CC_WEB_IP_WHITELIST || '')
+    .split(/[\s,]+/)
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(s => s.replace(/^::ffff:/, ''))
+);
 
-	function isWhitelistedIP(ip) {
-	  if (!ip) return false;
-	  const cleaned = ip.replace(/^::ffff:/, '');
-	  return cleaned === '127.0.0.1'
-	    || cleaned === '::1'
-	    || cleaned.startsWith('100.')
-	    || EXTRA_WHITELIST_IPS.has(cleaned);
-	}
+function isWhitelistedIP(ip) {
+  if (!ip) return false;
+  const cleaned = ip.replace(/^::ffff:/, '');
+  return cleaned === '127.0.0.1'
+    || cleaned === '::1'
+    || cleaned.startsWith('100.')
+    || EXTRA_WHITELIST_IPS.has(cleaned);
+}
 
 function loadBannedIPs() {
   try {
@@ -2055,24 +2055,43 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       break;
     }
 
-	    case '/mode': {
-	      const modeInput = parts[1];
-	      const VALID_MODES = ['default', 'plan', 'yolo'];
-	      const MODE_DESC = { default: '默认（需权限审批，受限操作）', plan: 'Plan（需确认计划后执行）', yolo: 'YOLO（跳过所有权限检查）' };
-	      if (!modeInput) {
-	        const cur = session?.permissionMode || 'yolo';
-	        wsSend(ws, { type: 'system_message', message: `当前模式: ${MODE_DESC[cur] || cur}\n可选: default, plan, yolo` });
-	      } else if (VALID_MODES.includes(modeInput.toLowerCase())) {
-	        const mode = modeInput.toLowerCase();
-	        if (session) {
-	          session.permissionMode = mode;
-	          // Mode switching should not reset runtime context (Claude/Codex both resume).
-	          session.updated = new Date().toISOString();
-	          saveSession(session);
-	        }
-	        wsSend(ws, { type: 'system_message', message: `权限模式已切换为: ${MODE_DESC[mode]}` });
-	        wsSend(ws, { type: 'mode_changed', mode });
-	      } else {
+    case '/init': {
+      if (agent !== 'claude') {
+        wsSend(ws, { type: 'system_message', message: '/init 仅支持 Claude，Codex 暂不支持该命令。' });
+        break;
+      }
+      if (!sessionId || !session) {
+        wsSend(ws, { type: 'system_message', message: '请先进入一个会话后再执行 /init。' });
+        break;
+      }
+      if (activeProcesses.has(sessionId)) {
+        wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止。' });
+        break;
+      }
+      wsSend(ws, { type: 'system_message', message: '正在分析项目并生成 CLAUDE.md ...' });
+      pendingSlashCommands.set(session.id, { kind: 'init' });
+      handleMessage(ws, { text: '/init', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
+      break;
+    }
+
+		    case '/mode': {
+		      const modeInput = parts[1];
+		      const VALID_MODES = ['default', 'plan', 'yolo'];
+		      const MODE_DESC = { default: '默认（需权限审批，受限操作）', plan: 'Plan（需确认计划后执行）', yolo: 'YOLO（跳过所有权限检查）' };
+		      if (!modeInput) {
+		        const cur = session?.permissionMode || 'yolo';
+		        wsSend(ws, { type: 'system_message', message: `当前模式: ${MODE_DESC[cur] || cur}\n可选: default, plan, yolo` });
+		      } else if (VALID_MODES.includes(modeInput.toLowerCase())) {
+		        const mode = modeInput.toLowerCase();
+		        if (session) {
+		          session.permissionMode = mode;
+		          // Mode switching should not reset runtime context (Claude/Codex both resume).
+		          session.updated = new Date().toISOString();
+		          saveSession(session);
+		        }
+		        wsSend(ws, { type: 'system_message', message: `权限模式已切换为: ${MODE_DESC[mode]}` });
+		        wsSend(ws, { type: 'mode_changed', mode });
+		      } else {
 	        wsSend(ws, { type: 'system_message', message: `无效模式: ${modeInput}\n可选: default, plan, yolo` });
       }
       break;
@@ -2088,7 +2107,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         type: 'system_message',
         message: agent === 'codex'
           ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/compact — 执行 Codex /compact 压缩上下文'
-          : base + '\n/model [名称] — 查看/切换模型（opus, sonnet, haiku）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）',
+          : base + '\n/model [名称] — 查看/切换模型（opus, sonnet, haiku）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）\n/init — 分析项目并生成/更新 CLAUDE.md',
       });
       break;
     }
@@ -2330,20 +2349,20 @@ function handleRenameSession(ws, sessionId, title) {
   }
 }
 
-	function handleSetMode(ws, sessionId, mode) {
-	  const VALID_MODES = ['default', 'plan', 'yolo'];
-	  if (!mode || !VALID_MODES.includes(mode)) return;
-	  if (sessionId) {
-	    const session = loadSession(sessionId);
-	    if (session) {
-	      session.permissionMode = mode;
-	      // Same rule as /mode: don't clear runtime context on mode changes.
-	      session.updated = new Date().toISOString();
-	      saveSession(session);
-	    }
-	  }
-	  wsSend(ws, { type: 'mode_changed', mode });
-	}
+		function handleSetMode(ws, sessionId, mode) {
+		  const VALID_MODES = ['default', 'plan', 'yolo'];
+		  if (!mode || !VALID_MODES.includes(mode)) return;
+		  if (sessionId) {
+		    const session = loadSession(sessionId);
+		    if (session) {
+		      session.permissionMode = mode;
+		      // Same rule as /mode: don't clear runtime context on mode changes.
+		      session.updated = new Date().toISOString();
+		      saveSession(session);
+		    }
+		  }
+		  wsSend(ws, { type: 'mode_changed', mode });
+		}
 
 function handleDisconnect(ws, wsId) {
   const affectedSessions = [];
