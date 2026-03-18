@@ -1169,6 +1169,28 @@ function compactDoneMessage(agent) {
     : '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。';
 }
 
+function initStartMessage(agent) {
+  return agent === 'codex'
+    ? '正在分析项目并生成 AGENTS.md ...'
+    : '正在分析项目并生成 CLAUDE.md ...';
+}
+
+function buildCodexInitPrompt(cwd) {
+  const targetPath = path.join(cwd || process.cwd(), 'AGENTS.md');
+  return [
+    'You are running cc-web\'s /init for a Codex session.',
+    'Analyze the current workspace and create or update AGENTS.md at the repository root.',
+    `The file path to write is: ${targetPath}`,
+    'Requirements:',
+    '- Actually write the file; do not stop after summarizing in chat.',
+    '- If AGENTS.md already exists, update it in place instead of creating a duplicate.',
+    '- Keep the document concise and practical for future coding agents working in this repo.',
+    '- Include the project purpose, key entry points, dev/test commands, important workflows, and repo-specific safety constraints.',
+    '- Prefer facts from the actual codebase over README claims when they differ.',
+    '- After editing the file, reply with a brief summary of what you wrote.',
+  ].join('\n');
+}
+
 function compactAutoStartMessage(agent) {
   return agent === 'codex'
     ? '检测到上下文达到上限，正在按 Codex /compact 自动压缩，然后继续当前任务…'
@@ -1825,6 +1847,33 @@ function handleSaveModelConfig(ws, newConfig) {
     const tpl = merged.templates.find(t => t.name === merged.activeTemplate);
     if (tpl) applyCustomTemplateToSettings(tpl);
   }
+
+  // Remap ALL Claude sessions' model to current template values.
+  // Build a reverse map: modelName → tier, from ALL templates (not just old/new).
+  // This handles switches between any pair of templates regardless of name overlap.
+  const modelToTier = new Map();
+  for (const tpl of (merged.templates || [])) {
+    if (tpl.opusModel) modelToTier.set(tpl.opusModel, 'opus');
+    if (tpl.sonnetModel) modelToTier.set(tpl.sonnetModel, 'sonnet');
+    if (tpl.haikuModel) modelToTier.set(tpl.haikuModel, 'haiku');
+  }
+  try {
+    for (const file of fs.readdirSync(SESSIONS_DIR)) {
+      if (!file.endsWith('.json')) continue;
+      const sessionId = file.slice(0, -5);
+      try {
+        const session = loadSession(sessionId);
+        if (!session?.model || session.agent === 'codex') continue;
+        const tier = modelToTier.get(session.model);
+        if (tier && MODEL_MAP[tier] !== session.model) {
+          session.model = MODEL_MAP[tier];
+          session.updated = new Date().toISOString();
+          saveSession(session);
+        }
+      } catch {}
+    }
+  } catch {}
+
   plog('INFO', 'model_config_saved', { mode: merged.mode, activeTemplate: merged.activeTemplate });
   wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
   wsSend(ws, { type: 'system_message', message: '模型配置已保存' });
@@ -2056,10 +2105,6 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
     }
 
     case '/init': {
-      if (agent !== 'claude') {
-        wsSend(ws, { type: 'system_message', message: '/init 仅支持 Claude，Codex 暂不支持该命令。' });
-        break;
-      }
       if (!sessionId || !session) {
         wsSend(ws, { type: 'system_message', message: '请先进入一个会话后再执行 /init。' });
         break;
@@ -2068,9 +2113,13 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止。' });
         break;
       }
-      wsSend(ws, { type: 'system_message', message: '正在分析项目并生成 CLAUDE.md ...' });
+      wsSend(ws, { type: 'system_message', message: initStartMessage(agent) });
       pendingSlashCommands.set(session.id, { kind: 'init' });
-      handleMessage(ws, { text: '/init', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
+      handleMessage(ws, {
+        text: agent === 'codex' ? buildCodexInitPrompt(session.cwd) : '/init',
+        sessionId: session.id,
+        mode: session.permissionMode || 'yolo',
+      }, { hideInHistory: true });
       break;
     }
 
@@ -2106,7 +2155,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       wsSend(ws, {
         type: 'system_message',
         message: agent === 'codex'
-          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/compact — 执行 Codex /compact 压缩上下文'
+          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/compact — 执行 Codex /compact 压缩上下文\n/init — 分析项目并生成/更新 AGENTS.md'
           : base + '\n/model [名称] — 查看/切换模型（opus, sonnet, haiku）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）\n/init — 分析项目并生成/更新 CLAUDE.md',
       });
       break;

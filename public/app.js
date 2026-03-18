@@ -11,7 +11,7 @@
     { cmd: '/mode', desc: '查看/切换权限模式' },
     { cmd: '/cost', desc: '查看会话费用' },
     { cmd: '/compact', desc: '压缩上下文' },
-    { cmd: '/init', desc: '生成/更新 CLAUDE.md' },
+    { cmd: '/init', desc: '生成/更新 Agent 指南文件' },
     { cmd: '/help', desc: '显示帮助' },
   ];
 
@@ -4023,6 +4023,25 @@
     }
   }
 
+  // --- Recent CWD memory (localStorage) ---
+  const RECENT_CWD_KEY = 'cc-web-recent-cwds';
+  const RECENT_CWD_MAX = 5;
+
+  function getRecentCwds() {
+    try {
+      const raw = localStorage.getItem(RECENT_CWD_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  }
+
+  function saveRecentCwd(cwd) {
+    if (!cwd) return;
+    let list = getRecentCwds().filter(p => p !== cwd);
+    list.unshift(cwd);
+    if (list.length > RECENT_CWD_MAX) list = list.slice(0, RECENT_CWD_MAX);
+    try { localStorage.setItem(RECENT_CWD_KEY, JSON.stringify(list)); } catch {}
+  }
+
   // --- New Session Modal ---
   let _onCwdSuggestions = null;
 
@@ -4063,11 +4082,28 @@
     const cwdInput = overlay.querySelector('#ns-cwd-input');
     const cwdList = overlay.querySelector('#ns-cwd-list');
 
-    // Fetch suggestions on focus
+    // Populate datalist with recent cwds + server suggestions
+    function renderCwdOptions(serverPaths) {
+      const recent = getRecentCwds();
+      const seen = new Set();
+      let html = '';
+      // Recent cwds first
+      for (const p of recent) {
+        if (!seen.has(p)) { seen.add(p); html += `<option value="${escapeHtml(p)}" label="最近"></option>`; }
+      }
+      // Server suggestions
+      for (const p of (serverPaths || [])) {
+        if (!seen.has(p)) { seen.add(p); html += `<option value="${escapeHtml(p)}"></option>`; }
+      }
+      cwdList.innerHTML = html;
+    }
+
+    // Pre-fill with local recent cwds immediately
+    renderCwdOptions([]);
+
+    // Fetch server suggestions on focus
     cwdInput.addEventListener('focus', () => {
-      _onCwdSuggestions = (paths) => {
-        cwdList.innerHTML = paths.map(p => `<option value="${escapeHtml(p)}"></option>`).join('');
-      };
+      _onCwdSuggestions = (paths) => { renderCwdOptions(paths); };
       send({ type: 'list_cwd_suggestions' });
     });
 
@@ -4083,6 +4119,7 @@
     overlay.querySelector('#ns-create-btn').addEventListener('click', () => {
       const cwd = cwdInput.value.trim() || null;
       close();
+      if (cwd) saveRecentCwd(cwd);
       send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode });
     });
 
