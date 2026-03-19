@@ -54,6 +54,8 @@ Useful env vars from code:
 ## Important Workflows
 
 - Startup binds only to `127.0.0.1`. Reverse proxy/Tailscale exposure is external to this repo.
+- Complete development work in `/home/cc-dan/cc/cc-web` first, then sync changes into the sanitized release directory `/home/cc-dan/cc/cc-web_v1.2.7` only after the user confirms the work is ready.
+- Treat `/home/cc-dan/cc/cc-web_v1.2.7` as the only publishable tree. Any `git add`, `git commit`, or `git push` for GitHub must be run from that sanitized directory, not from the development directory.
 - Auth is password-or-token over WebSocket. Failed auth bans non-whitelisted IPs after 3 attempts in 5 minutes.
 - New messages spawn detached Claude or Codex subprocesses. Output is written to `sessions/<id>-run/output.jsonl` and tailed back to the UI.
 - `recoverProcesses()` reattaches to still-running detached processes on server restart and finalizes completed runs from leftover run directories.
@@ -64,6 +66,7 @@ Useful env vars from code:
 ## Repo-Specific Safety Constraints
 
 - Treat `config/`, `sessions/`, `logs/`, `.env`, and any tokens/passwords as sensitive local state. Do not commit secrets or runtime artifacts.
+- The sanitized release directory must not retain private or security-sensitive material such as keys, passwords, tokens, real config values, logs, session data, or other local runtime traces.
 - Be careful with detached child processes. Avoid deleting `sessions/*-run/`, PID files, or killing agent processes unless the task explicitly requires it.
 - Prefer facts from code over README. The README is broader and partially out of sync with the checked-out workspace.
 - When changing WebSocket message types or session JSON shape, verify both `server.js` and `public/app.js`.

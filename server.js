@@ -510,9 +510,10 @@ const activeProcesses = new Map();
 const wsSessionMap = new Map();
 
 // Default fallback MODEL_MAP (overridden by model config at runtime)
+// opus/sonnet use [1m] suffix to enable 1M context window by default
 let MODEL_MAP = {
-  opus: 'claude-opus-4-6',
-  sonnet: 'claude-sonnet-4-6',
+  opus: 'claude-opus-4-6[1m]',
+  sonnet: 'claude-sonnet-4-6[1m]',
   haiku: 'claude-haiku-4-5-20251001',
 };
 
@@ -670,11 +671,12 @@ function loadClaudeJsonModelMap() {
     const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
     const env = raw?.env || {};
     const map = {};
-    if (env.ANTHROPIC_DEFAULT_OPUS_MODEL) map.opus = env.ANTHROPIC_DEFAULT_OPUS_MODEL;
-    if (env.ANTHROPIC_DEFAULT_SONNET_MODEL) map.sonnet = env.ANTHROPIC_DEFAULT_SONNET_MODEL;
+    // Append [1m] to opus/sonnet for 1M context window; haiku uses model name as-is
+    if (env.ANTHROPIC_DEFAULT_OPUS_MODEL) map.opus = env.ANTHROPIC_DEFAULT_OPUS_MODEL + '[1m]';
+    if (env.ANTHROPIC_DEFAULT_SONNET_MODEL) map.sonnet = env.ANTHROPIC_DEFAULT_SONNET_MODEL + '[1m]';
     if (env.ANTHROPIC_DEFAULT_HAIKU_MODEL) map.haiku = env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
     // Fallback: ANTHROPIC_MODEL maps to opus slot
-    if (!map.opus && env.ANTHROPIC_MODEL) map.opus = env.ANTHROPIC_MODEL;
+    if (!map.opus && env.ANTHROPIC_MODEL) map.opus = env.ANTHROPIC_MODEL + '[1m]';
     return Object.keys(map).length > 0 ? map : null;
   } catch {
     return null;
@@ -716,8 +718,8 @@ function applyModelConfig() {
   if (config.mode === 'custom' && config.activeTemplate) {
     const tpl = (config.templates || []).find(t => t.name === config.activeTemplate);
     if (tpl) {
-      if (tpl.opusModel) MODEL_MAP.opus = tpl.opusModel;
-      if (tpl.sonnetModel) MODEL_MAP.sonnet = tpl.sonnetModel;
+      if (tpl.opusModel) MODEL_MAP.opus = tpl.opusModel.endsWith('[1m]') ? tpl.opusModel : tpl.opusModel + '[1m]';
+      if (tpl.sonnetModel) MODEL_MAP.sonnet = tpl.sonnetModel.endsWith('[1m]') ? tpl.sonnetModel : tpl.sonnetModel + '[1m]';
       if (tpl.haikuModel) MODEL_MAP.haiku = tpl.haikuModel;
       return;
     }
@@ -2182,7 +2184,8 @@ function handleNewSession(ws, msg) {
     claudeSessionId: null,
     codexThreadId: null,
     // For Codex: explicitly set a default model on creation so we don't inherit Codex CLI defaults.
-    model: agent === 'codex' ? DEFAULT_CODEX_MODEL : null,
+    // For Claude: default to opus (1M) so --model is always passed to CLI.
+    model: agent === 'codex' ? DEFAULT_CODEX_MODEL : MODEL_MAP.opus,
     permissionMode: requestedMode,
     totalCost: 0,
     totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },

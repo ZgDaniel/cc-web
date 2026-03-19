@@ -33,8 +33,8 @@
   const SIDEBAR_SWIPE_MAX_VERTICAL_DRIFT = 42;
 
   const MODEL_OPTIONS = [
-    { value: 'opus', label: 'Opus', desc: '最强大，适合复杂任务' },
-    { value: 'sonnet', label: 'Sonnet', desc: '平衡性能与速度' },
+    { value: 'opus', label: 'Opus', desc: '最强大，1M 上下文' },
+    { value: 'sonnet', label: 'Sonnet', desc: '平衡性能，1M 上下文' },
     { value: 'haiku', label: 'Haiku', desc: '最快速，适合简单任务' },
   ];
 
