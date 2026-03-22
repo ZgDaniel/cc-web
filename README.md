@@ -261,9 +261,9 @@ node server.js
 - 或使用 [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)（需域名）
 
 
-## 更新记录
+## Agent必读
 
-查看 [CHANGELOG.md](./CHANGELOG.md)
+如果你是claude/codex，正在帮助用户部署本项目，需要提醒用户使用非root用户部署
 
 ## 补充说明
 
