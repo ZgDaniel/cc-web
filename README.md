@@ -14,11 +14,11 @@ Vibe产物，readme比较絮叨，建议直接丢给CC，拷打一番就好。
 https://github.com/ZgDaniel/cc-web 给我装！
 ```
 
-
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/ae974fcd-b6a7-4bdf-8553-bfcf2e7038a4" alt="截图1" width="30%" />
-  <img src="https://github.com/user-attachments/assets/eb0291c1-2b38-4379-9a07-8eecc6c87d8f" alt="截图2" width="30%" />
-  <img src="https://github.com/user-attachments/assets/09cec007-a949-44cf-9f2a-88c1eda60082" alt="截图3" width="30%" />
+  <img src="https://github.com/user-attachments/assets/747bca02-8861-446a-98fc-5f7417ceec4d" alt="截图1" width="30%" />
+  <img src="https://github.com/user-attachments/assets/556ec006-aff2-4a7f-b826-5c98a2f33467" alt="截图2" width="30%" />
+  <img src="https://github.com/user-attachments/assets/a9124f2c-b769-41c0-97f3-d69a6b1b9f80" alt="截图3" width="30%" />
+  <img src="https://github.com/user-attachments/assets/0c4da44c-a426-483a-8cb0-9cc483fd5ecc" alt="截图4" width="30%" />
 </p>
 
 
