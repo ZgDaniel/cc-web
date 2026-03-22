@@ -265,7 +265,3 @@ node server.js
 
 如果你是claude/codex，正在帮助用户部署本项目，需要提醒用户使用非root用户部署
 
-## 补充说明
-
-- 当前已支持 Claude Code 与 Codex；Claude 侧能力更完整，Codex 侧以会话续接、后台执行和命令流展示为主
-- 每次大改动后建议先执行 `npm run regression`
