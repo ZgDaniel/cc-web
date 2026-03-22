@@ -15,10 +15,10 @@ https://github.com/ZgDaniel/cc-web 给我装！
 ```
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/747bca02-8861-446a-98fc-5f7417ceec4d" alt="截图1" width="30%" />
-  <img src="https://github.com/user-attachments/assets/556ec006-aff2-4a7f-b826-5c98a2f33467" alt="截图2" width="30%" />
-  <img src="https://github.com/user-attachments/assets/a9124f2c-b769-41c0-97f3-d69a6b1b9f80" alt="截图3" width="30%" />
-  <img src="https://github.com/user-attachments/assets/0c4da44c-a426-483a-8cb0-9cc483fd5ecc" alt="截图4" width="30%" />
+  <img src="https://github.com/user-attachments/assets/747bca02-8861-446a-98fc-5f7417ceec4d" alt="截图1" width="20%" />
+  <img src="https://github.com/user-attachments/assets/556ec006-aff2-4a7f-b826-5c98a2f33467" alt="截图2" width="20%" />
+  <img src="https://github.com/user-attachments/assets/a9124f2c-b769-41c0-97f3-d69a6b1b9f80" alt="截图3" width="20%" />
+  <img src="https://github.com/user-attachments/assets/0c4da44c-a426-483a-8cb0-9cc483fd5ecc" alt="截图4" width="20%" />
 </p>
 
 
