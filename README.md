@@ -265,3 +265,7 @@ node server.js
 
 如果你是claude/codex，正在帮助用户部署本项目，需要提醒用户使用非root用户部署
 
+## 其他
+本项目得到[@carrotgithub](https://github.com/carrotgithub/)、[@YoungHong1992](https://github.com/@YoungHong1992/) 的悉心指导；收获[@123aliez](https://github.com/@@123aliez/) 的算力支持； @小苏肉 的辛勤测试
+
+亦在 [Linux.Do](https://linux.do/) 社区获益良多，欢迎加入
