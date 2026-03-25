@@ -17,8 +17,8 @@ if (fs.existsSync(envPath)) {
 }
 
 const PORT = parseInt(process.env.PORT) || 8002;
-const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
-const CODEX_PATH = process.env.CODEX_PATH || 'codex';
+const CLAUDE_PATH = process.env.CLAUDE_PATH || (process.platform === 'win32' ? 'claude.cmd' : 'claude');
+const CODEX_PATH = process.env.CODEX_PATH || (process.platform === 'win32' ? 'codex.cmd' : 'codex');
 const CONFIG_DIR = process.env.CC_WEB_CONFIG_DIR || path.join(__dirname, 'config');
 const SESSIONS_DIR = process.env.CC_WEB_SESSIONS_DIR || path.join(__dirname, 'sessions');
 const PUBLIC_DIR = process.env.CC_WEB_PUBLIC_DIR || path.join(__dirname, 'public');
@@ -754,6 +754,25 @@ function wsSend(ws, data) {
 
 function sanitizeId(id) {
   return String(id).replace(/[^a-zA-Z0-9\-]/g, '');
+}
+
+function normalizeSessionCwd(cwdValue) {
+  if (cwdValue == null) return null;
+  let cwd = String(cwdValue).trim();
+  if (!cwd) return null;
+
+  // Windows users sometimes paste paths like "~/D:\\project\\repo".
+  // Normalize to a valid drive path to avoid false permission/cwd errors.
+  if (/^~[\\/]+[a-zA-Z]:[\\/]/.test(cwd)) {
+    cwd = cwd.replace(/^~[\\/]+/, '');
+  } else if (cwd === '~' || cwd === '~/') {
+    cwd = process.env.HOME || process.env.USERPROFILE || process.cwd();
+  } else if (/^~[\\/]/.test(cwd)) {
+    const home = process.env.HOME || process.env.USERPROFILE || process.cwd();
+    cwd = path.join(home, cwd.replace(/^~[\\/]+/, ''));
+  }
+
+  return cwd;
 }
 
 function sessionPath(id) {
@@ -2170,7 +2189,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 
 // === Session Handlers ===
 function handleNewSession(ws, msg) {
-  const cwd = (msg && msg.cwd) ? String(msg.cwd) : null;
+  const cwd = normalizeSessionCwd(msg?.cwd);
   const agent = normalizeAgent(msg?.agent);
   const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
   const resolvedCwd = cwd || (agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null);
@@ -2508,6 +2527,10 @@ function handleMessage(ws, msg, options = {}) {
 	    };
 	  }
   normalizeSession(session);
+  const normalizedSessionCwd = normalizeSessionCwd(session.cwd);
+  if (normalizedSessionCwd !== session.cwd) {
+    session.cwd = normalizedSessionCwd;
+  }
 
   if (normalizedText.startsWith('/') && resolvedAttachments.length > 0) {
     return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片。请先发送图片说明，再单独使用 /model 或 /mode。' });
@@ -2626,11 +2649,34 @@ function handleMessage(ws, msg, options = {}) {
     return wsSend(ws, { type: 'error', message: formatRuntimeError(agent, err.message, { exitCode: null, signal: null }) });
   }
 
+  let launchErrorHandled = false;
+  const handleSpawnLaunchError = (err) => {
+    if (launchErrorHandled) return;
+    launchErrorHandled = true;
+    const agent = getSessionAgent(session);
+    const raw = err && err.message ? err.message : String(err || 'unknown spawn error');
+    plog('ERROR', 'process_spawn_runtime_error', {
+      sessionId: currentSessionId.slice(0, 8),
+      agent,
+      command: spawnSpec.command,
+      error: raw,
+    });
+    activeProcesses.delete(currentSessionId);
+    cleanRunDir(currentSessionId);
+    wsSend(ws, { type: 'error', message: formatRuntimeError(agent, raw, { exitCode: null, signal: null }) });
+    wsSend(ws, { type: 'done', sessionId: currentSessionId });
+    sendSessionList(ws);
+  };
+  proc.once('error', handleSpawnLaunchError);
+
   fs.closeSync(inputFd);
   fs.closeSync(outputFd);
   fs.closeSync(errorFd);
 
-  fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
+  const pidValue = Number(proc.pid);
+  if (Number.isFinite(pidValue) && pidValue > 0) {
+    fs.writeFileSync(path.join(dir, 'pid'), String(pidValue));
+  }
   proc.unref(); // Process survives Node.js exit
 
   plog('INFO', 'process_spawn', {
@@ -2645,6 +2691,7 @@ function handleMessage(ws, msg, options = {}) {
 
   // Fast exit detection (while Node.js is running)
   proc.on('exit', (code, signal) => {
+    if (launchErrorHandled) return;
     plog('INFO', 'process_exit_event', {
       sessionId: currentSessionId.slice(0, 8),
       pid: proc.pid,

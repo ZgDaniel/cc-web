@@ -102,6 +102,7 @@
   let currentSessionRunning = false;
   let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
+  let wsReconnectNoticeShown = false;
 
   // --- DOM ---
   const $ = (sel) => document.querySelector(sel);
@@ -1104,38 +1105,46 @@
   const PREVIEW_LANGS = new Set(['html', 'svg']);
   const _previewCodeMap = new Map();
   let _previewCodeId = 0;
+  const markedLib = (typeof window.marked !== 'undefined') ? window.marked : null;
+  const hljsLib = (typeof window.hljs !== 'undefined') ? window.hljs : null;
 
-  const renderer = new marked.Renderer();
-  renderer.code = function (code, language) {
-    const lang = (language || 'plaintext').toLowerCase();
-    let highlighted;
-    try {
-      if (hljs.getLanguage(lang)) {
-        highlighted = hljs.highlight(code, { language: lang }).value;
-      } else {
-        highlighted = hljs.highlightAuto(code).value;
+  if (markedLib && typeof markedLib.Renderer === 'function') {
+    const renderer = new markedLib.Renderer();
+    renderer.code = function (code, language) {
+      const lang = (language || 'plaintext').toLowerCase();
+      let highlighted;
+      try {
+        if (hljsLib && typeof hljsLib.getLanguage === 'function' && hljsLib.getLanguage(lang)) {
+          highlighted = hljsLib.highlight(code, { language: lang }).value;
+        } else if (hljsLib && typeof hljsLib.highlightAuto === 'function') {
+          highlighted = hljsLib.highlightAuto(code).value;
+        } else {
+          highlighted = escapeHtml(code);
+        }
+      } catch {
+        highlighted = escapeHtml(code);
       }
-    } catch {
-      highlighted = escapeHtml(code);
-    }
-    const canPreview = PREVIEW_LANGS.has(lang);
-    const previewBtn = canPreview
-      ? `<button class="code-preview-btn" onclick="ccTogglePreview(this)">Preview</button>`
-      : '';
-    const previewPane = canPreview
-      ? `<div class="code-preview-pane"><iframe class="code-preview-iframe" sandbox="allow-scripts" loading="lazy"></iframe></div>`
-      : '';
-    const cid = canPreview ? (++_previewCodeId) : 0;
-    if (canPreview) _previewCodeMap.set(cid, code);
-    return `<div class="code-block-wrapper${canPreview ? ' has-preview' : ''}"${canPreview ? ` data-cid="${cid}"` : ''}>
+      const canPreview = PREVIEW_LANGS.has(lang);
+      const previewBtn = canPreview
+        ? `<button class="code-preview-btn" onclick="ccTogglePreview(this)">Preview</button>`
+        : '';
+      const previewPane = canPreview
+        ? `<div class="code-preview-pane"><iframe class="code-preview-iframe" sandbox="allow-scripts" loading="lazy"></iframe></div>`
+        : '';
+      const cid = canPreview ? (++_previewCodeId) : 0;
+      if (canPreview) _previewCodeMap.set(cid, code);
+      return `<div class="code-block-wrapper${canPreview ? ' has-preview' : ''}"${canPreview ? ` data-cid="${cid}"` : ''}>
       <div class="code-block-header">
         <span>${escapeHtml(lang)}</span>
         <div class="code-block-actions">${previewBtn}<button class="code-copy-btn" onclick="ccCopyCode(this)">Copy</button></div>
       </div>
       ${previewPane}<pre><code class="hljs language-${escapeHtml(lang)}">${highlighted}</code></pre>
     </div>`;
-  };
-  marked.setOptions({ renderer, breaks: true, gfm: true });
+    };
+    markedLib.setOptions({ renderer, breaks: true, gfm: true });
+  } else {
+    console.warn('marked library is unavailable; markdown rendering fallback enabled.');
+  }
 
   window.ccCopyCode = function (btn) {
     const wrapper = btn.closest('.code-block-wrapper');
@@ -1172,6 +1181,7 @@
 
     ws.onopen = () => {
       reconnectAttempts = 0;
+      wsReconnectNoticeShown = false;
       if (authToken) send({ type: 'auth', token: authToken });
     };
 
@@ -1183,6 +1193,11 @@
 
     ws.onclose = () => {
       clearSessionLoading();
+      if (isGenerating) finishGenerating();
+      if (!wsReconnectNoticeShown) {
+        appendSystemMessage('连接已断开，正在自动重连…');
+        wsReconnectNoticeShown = true;
+      }
       scheduleReconnect();
     };
     ws.onerror = () => {};
@@ -1571,8 +1586,12 @@
 
   function renderMarkdown(text) {
     if (!text) return '<div class="typing-indicator"><span></span><span></span><span></span></div>';
-    try { return marked.parse(text); }
-    catch { return escapeHtml(text); }
+    try {
+      if (markedLib && typeof markedLib.parse === 'function') {
+        return markedLib.parse(text);
+      }
+    } catch {}
+    return escapeHtml(text).replace(/\n/g, '<br>');
   }
 
   function createMsgElement(role, content, attachments = []) {
@@ -4042,6 +4061,16 @@
     try { localStorage.setItem(RECENT_CWD_KEY, JSON.stringify(list)); } catch {}
   }
 
+  function normalizeCwdInput(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return null;
+    // Fix mixed shortcut input like "~/D:\\project\\repo" on Windows.
+    if (/^~[\\/]+[a-zA-Z]:[\\/]/.test(raw)) {
+      return raw.replace(/^~[\\/]+/, '');
+    }
+    return raw;
+  }
+
   // --- New Session Modal ---
   let _onCwdSuggestions = null;
 
@@ -4064,7 +4093,7 @@
             <div>
               <label class="modal-field-label" for="ns-cwd-input">工作目录</label>
               <div class="modal-field-row">
-                <input type="text" id="ns-cwd-input" class="modal-text-input" placeholder="例如 /home/user/project" list="ns-cwd-list" autocomplete="off">
+                <input type="text" id="ns-cwd-input" class="modal-text-input" placeholder="例如 D:\\project\\repo 或 /home/user/project" list="ns-cwd-list" autocomplete="off">
                 <datalist id="ns-cwd-list"></datalist>
               </div>
             </div>
@@ -4117,7 +4146,7 @@
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
     overlay.querySelector('#ns-create-btn').addEventListener('click', () => {
-      const cwd = cwdInput.value.trim() || null;
+      const cwd = normalizeCwdInput(cwdInput.value);
       close();
       if (cwd) saveRecentCwd(cwd);
       send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode });
@@ -4340,7 +4369,26 @@
 
   // Register Service Worker for mobile push notifications
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js').catch(() => {});
+    const swVersion = '20260325';
+    navigator.serviceWorker.getRegistrations()
+      .then((registrations) => Promise.all(registrations.map((registration) => {
+        const scriptUrl = registration.active?.scriptURL
+          || registration.waiting?.scriptURL
+          || registration.installing?.scriptURL
+          || '';
+        try {
+          const parsed = new URL(scriptUrl);
+          // Clean up legacy root registration created by old cc-web bundles.
+          if (parsed.origin === location.origin && parsed.pathname === '/sw.js') {
+            return registration.unregister();
+          }
+        } catch {}
+        return null;
+      })))
+      .catch(() => {})
+      .finally(() => {
+        navigator.serviceWorker.register(`sw.js?v=${swVersion}`).catch(() => {});
+      });
   }
 
   // Restore remembered password
