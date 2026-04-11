@@ -436,8 +436,9 @@ const activeTokens = new Set();
 // === Anti-brute-force ===
 const AUTH_FAIL_WINDOW = 5 * 60 * 1000; // 5 minutes
 const AUTH_FAIL_MAX = 3;
+const BAN_DURATION = 7 * 24 * 60 * 60 * 1000; // 7 days
 const authFailures = new Map(); // ip -> [timestamp, ...]
-let bannedIPs = new Set();
+let bannedIPs = new Map(); // ip -> expireTimestamp
 
 // Tailscale / loopback whitelist — never ban these IPs.
 // Extra whitelist can be provided via env var (comma/space separated):
@@ -462,13 +463,19 @@ function isWhitelistedIP(ip) {
 function loadBannedIPs() {
   try {
     if (fs.existsSync(BANNED_IPS_PATH)) {
-      const list = JSON.parse(fs.readFileSync(BANNED_IPS_PATH, 'utf8'));
-      bannedIPs = new Set(Array.isArray(list) ? list : []);
+      const data = JSON.parse(fs.readFileSync(BANNED_IPS_PATH, 'utf8'));
+      if (Array.isArray(data)) {
+        const exp = Date.now() + BAN_DURATION;
+        bannedIPs = new Map(data.map(ip => [ip, exp]));
+      } else {
+        bannedIPs = new Map(Object.entries(data).map(([ip, t]) => [ip, Number(t)]));
+      }
     }
-  } catch { bannedIPs = new Set(); }
+  } catch { bannedIPs = new Map(); }
 }
 function saveBannedIPs() {
-  fs.writeFileSync(BANNED_IPS_PATH, JSON.stringify([...bannedIPs], null, 2));
+  const obj = Object.fromEntries(bannedIPs);
+  fs.writeFileSync(BANNED_IPS_PATH, JSON.stringify(obj, null, 2));
 }
 loadBannedIPs();
 
@@ -480,6 +487,17 @@ function getClientIP(ws) {
   return req.socket?.remoteAddress || null;
 }
 
+function isBanned(ip) {
+  if (!ip || !bannedIPs.has(ip)) return false;
+  const exp = bannedIPs.get(ip);
+  if (exp !== -1 && Date.now() > exp) {
+    bannedIPs.delete(ip);
+    saveBannedIPs();
+    return false;
+  }
+  return true;
+}
+
 function recordAuthFailure(ip) {
   if (!ip || isWhitelistedIP(ip)) return false;
   const now = Date.now();
@@ -488,7 +506,7 @@ function recordAuthFailure(ip) {
   list = list.filter(t => now - t < AUTH_FAIL_WINDOW);
   authFailures.set(ip, list);
   if (list.length >= AUTH_FAIL_MAX) {
-    bannedIPs.add(ip);
+    bannedIPs.set(ip, Date.now() + BAN_DURATION);
     saveBannedIPs();
     authFailures.delete(ip);
     plog('WARN', 'ip_banned', { ip, reason: `${AUTH_FAIL_MAX} failed auth in ${AUTH_FAIL_WINDOW / 1000}s` });
@@ -1594,7 +1612,7 @@ wss.on('connection', (ws, req) => {
   const clientIP = getClientIP(ws);
 
   // Check if IP is banned
-  if (clientIP && bannedIPs.has(clientIP)) {
+  if (clientIP && isBanned(clientIP)) {
     plog('WARN', 'banned_ip_rejected', { ip: clientIP });
     wsSend(ws, { type: 'auth_result', success: false, banned: true });
     ws.close();
@@ -1617,7 +1635,7 @@ wss.on('connection', (ws, req) => {
 
     if (msg.type === 'auth') {
       // Check ban before processing auth
-      if (clientIP && bannedIPs.has(clientIP)) {
+      if (clientIP && isBanned(clientIP)) {
         wsSend(ws, { type: 'auth_result', success: false, banned: true });
         ws.close();
         return;
@@ -1850,13 +1868,26 @@ function handleSaveModelConfig(ws, newConfig) {
     if (tpl) applyCustomTemplateToSettings(tpl);
   }
 
-  // Remap ALL Claude sessions' model to current template values.
-  // Build a reverse map: modelName → tier, from ALL templates (not just old/new).
-  // This handles switches between any pair of templates regardless of name overlap.
+  // Remap ALL Claude sessions' model to current runtime MODEL_MAP values.
+  // Build reverse map from BOTH pre-save and post-save template model names:
+  // - current.templates: identifies sessions created under old model names (including edited/renamed)
+  // - merged.templates: keeps post-save model names in the lookup as well
+  // Include both raw and [1m]-suffixed keys: applyModelConfig() appends [1m] to
+  // opus/sonnet when storing into session.model, so we need both forms to match.
   const modelToTier = new Map();
-  for (const tpl of (merged.templates || [])) {
-    if (tpl.opusModel) modelToTier.set(tpl.opusModel, 'opus');
-    if (tpl.sonnetModel) modelToTier.set(tpl.sonnetModel, 'sonnet');
+  const lookupTemplates = [
+    ...(Array.isArray(current.templates) ? current.templates : []),
+    ...(Array.isArray(merged.templates) ? merged.templates : []),
+  ];
+  for (const tpl of lookupTemplates) {
+    if (tpl.opusModel) {
+      modelToTier.set(tpl.opusModel, 'opus');
+      if (!tpl.opusModel.endsWith('[1m]')) modelToTier.set(tpl.opusModel + '[1m]', 'opus');
+    }
+    if (tpl.sonnetModel) {
+      modelToTier.set(tpl.sonnetModel, 'sonnet');
+      if (!tpl.sonnetModel.endsWith('[1m]')) modelToTier.set(tpl.sonnetModel + '[1m]', 'sonnet');
+    }
     if (tpl.haikuModel) modelToTier.set(tpl.haikuModel, 'haiku');
   }
   try {
@@ -2578,7 +2609,9 @@ function handleMessage(ws, msg, options = {}) {
   const outputPath = path.join(dir, 'output.jsonl');
   const errorPath = path.join(dir, 'error.log');
 
-  if (isClaudeSession(session) && resolvedAttachments.length > 0) {
+  const useStreamJson = isClaudeSession(session) && resolvedAttachments.length > 0;
+
+  if (useStreamJson) {
     const content = [];
     if (textValue) content.push({ type: 'text', text: textValue });
     for (const attachment of resolvedAttachments) {
@@ -2603,21 +2636,33 @@ function handleMessage(ws, msg, options = {}) {
     fs.writeFileSync(inputPath, textValue);
   }
 
-  const inputFd = fs.openSync(inputPath, 'r');
   const outputFd = fs.openSync(outputPath, 'w');
   const errorFd = fs.openSync(errorPath, 'w');
 
   let proc;
   try {
+    let stdinSource;
+    if (useStreamJson) {
+      // stream-json requires an open pipe (not a closed file) so Claude doesn't exit on EOF
+      stdinSource = 'pipe';
+    } else {
+      stdinSource = fs.openSync(inputPath, 'r');
+    }
     proc = spawn(spawnSpec.command, spawnSpec.args, {
       env: spawnSpec.env,
       cwd: spawnSpec.cwd,
-      stdio: [inputFd, outputFd, errorFd],
+      stdio: [stdinSource, outputFd, errorFd],
       detached: !IS_WIN,
       windowsHide: true,
     });
+    if (useStreamJson) {
+      // Write the stream-json message then close stdin so Claude knows input is done
+      proc.stdin.write(fs.readFileSync(inputPath));
+      proc.stdin.end();
+    } else {
+      fs.closeSync(stdinSource);
+    }
   } catch (err) {
-    fs.closeSync(inputFd);
     fs.closeSync(outputFd);
     fs.closeSync(errorFd);
     cleanRunDir(currentSessionId);
@@ -2626,7 +2671,6 @@ function handleMessage(ws, msg, options = {}) {
     return wsSend(ws, { type: 'error', message: formatRuntimeError(agent, err.message, { exitCode: null, signal: null }) });
   }
 
-  fs.closeSync(inputFd);
   fs.closeSync(outputFd);
   fs.closeSync(errorFd);
 
