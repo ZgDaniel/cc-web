@@ -546,6 +546,7 @@ const DEFAULT_MODEL_CONFIG = {
   mode: 'local',      // 'local' | 'custom'
   templates: [],      // array of { name, apiKey, apiBase, defaultModel, opusModel, sonnetModel, haikuModel }
   activeTemplate: '', // name of active template (for 'custom' mode)
+  localSnapshot: {},  // saved snapshot of local ~/.claude/settings.json API config
 };
 
 const DEFAULT_CODEX_CONFIG = {
@@ -554,12 +555,15 @@ const DEFAULT_CODEX_CONFIG = {
   profiles: [],
   enableSearch: false,
   supportsSearch: false,
+  localSnapshot: {},  // saved snapshot of local ~/.codex config (archive-only, no restore)
 };
 
 function loadModelConfig() {
   try {
     if (fs.existsSync(MODEL_CONFIG_PATH)) {
-      return JSON.parse(fs.readFileSync(MODEL_CONFIG_PATH, 'utf8'));
+      const config = JSON.parse(fs.readFileSync(MODEL_CONFIG_PATH, 'utf8'));
+      if (!config.localSnapshot) config.localSnapshot = {};
+      return config;
     }
   } catch {}
   return JSON.parse(JSON.stringify(DEFAULT_MODEL_CONFIG));
@@ -584,6 +588,7 @@ function loadCodexConfig() {
         enableSearch: false,
         supportsSearch: false,
         storedEnableSearch: !!raw.enableSearch,
+        localSnapshot: raw.localSnapshot || {},
       };
     }
   } catch {}
@@ -616,6 +621,7 @@ function getCodexConfigMasked() {
     enableSearch: false,
     supportsSearch: false,
     storedEnableSearch: !!config.storedEnableSearch,
+    localSnapshot: config.localSnapshot || {},
   };
 }
 
@@ -638,7 +644,97 @@ function getModelConfigMasked() {
       sonnetModel: t.sonnetModel || '',
       haikuModel: t.haikuModel || '',
     })),
+    localSnapshot: config.localSnapshot || {},
   };
+}
+
+// === Dev Config (GitHub / SSH) ===
+const DEV_CONFIG_PATH = path.join(CONFIG_DIR, 'dev.json');
+const DEFAULT_DEV_CONFIG = { github: { token: '', repos: [] }, ssh: { hosts: [] } };
+
+function loadDevConfig() {
+  try {
+    if (fs.existsSync(DEV_CONFIG_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(DEV_CONFIG_PATH, 'utf8'));
+      return {
+        github: {
+          token: raw.github?.token || '',
+          repos: Array.isArray(raw.github?.repos) ? raw.github.repos : [],
+        },
+        ssh: {
+          hosts: Array.isArray(raw.ssh?.hosts) ? raw.ssh.hosts : [],
+        },
+      };
+    }
+  } catch {}
+  return JSON.parse(JSON.stringify(DEFAULT_DEV_CONFIG));
+}
+
+function saveDevConfig(config) {
+  fs.writeFileSync(DEV_CONFIG_PATH, JSON.stringify(config, null, 2));
+}
+
+function getDevConfigMasked() {
+  const config = loadDevConfig();
+  return {
+    github: {
+      token: maskSecret(config.github.token),
+      repos: config.github.repos || [],
+    },
+    ssh: {
+      hosts: (config.ssh.hosts || []).map(h => ({
+        id: h.id || '',
+        name: h.name || '',
+        host: h.host || '',
+        port: h.port || 22,
+        user: h.user || '',
+        authType: h.authType || 'key',
+        identityFile: h.identityFile || '',
+        password: maskSecret(h.password || ''),
+        description: h.description || '',
+      })),
+    },
+  };
+}
+
+function handleSaveDevConfig(ws, msg) {
+  if (!msg.config || typeof msg.config !== 'object') {
+    return wsSend(ws, { type: 'error', message: '无效的开发者配置' });
+  }
+  const current = loadDevConfig();
+  let token = String(msg.config.github?.token || '');
+  // Mask merge: keep existing if masked
+  if (token.includes('****')) token = current.github.token;
+  const repos = Array.isArray(msg.config.github?.repos) ? msg.config.github.repos.map(r => ({
+    id: r.id || ('r_' + crypto.randomBytes(4).toString('hex')),
+    name: String(r.name || '').trim(),
+    url: String(r.url || '').trim(),
+    branch: String(r.branch || 'main').trim(),
+    notes: String(r.notes || '').trim(),
+  })).filter(r => r.name && r.url) : [];
+  const oldHosts = Array.isArray(current.ssh?.hosts) ? current.ssh.hosts : [];
+  const hosts = Array.isArray(msg.config.ssh?.hosts) ? msg.config.ssh.hosts.map(h => {
+    const old = oldHosts.find(oh => oh.id === h.id || oh.name === h.name);
+    const authType = h.authType === 'password' ? 'password' : 'key';
+    let password = String(h.password || '');
+    if (password.includes('****')) password = old?.password || '';
+    return {
+      id: h.id || ('h_' + crypto.randomBytes(4).toString('hex')),
+      name: String(h.name || '').trim(),
+      host: String(h.host || '').trim(),
+      port: parseInt(h.port) || 22,
+      user: String(h.user || '').trim(),
+      authType,
+      identityFile: authType === 'key' ? String(h.identityFile || '').trim() : '',
+      password: authType === 'password' ? password : '',
+      description: String(h.description || '').trim(),
+    };
+  }).filter(h => h.name && h.host) : [];
+  const merged = { github: { token, repos }, ssh: { hosts } };
+  saveDevConfig(merged);
+  plog('INFO', 'dev_config_saved', { repoCount: repos.length, hostCount: hosts.length });
+  wsSend(ws, { type: 'dev_config', config: getDevConfigMasked() });
+  wsSend(ws, { type: 'system_message', message: '开发者配置已保存' });
 }
 
 const CODEX_RUNTIME_HOME = path.join(CONFIG_DIR, 'codex-runtime-home');
@@ -930,6 +1026,9 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
     session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
   }
+  if (!Object.prototype.hasOwnProperty.call(session, 'taskMode')) session.taskMode = 'local';
+  if (!Object.prototype.hasOwnProperty.call(session, 'sshHostId')) session.sshHostId = '';
+  if (!Object.prototype.hasOwnProperty.call(session, 'remoteCwd')) session.remoteCwd = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'messages')) session.messages = [];
   if (Array.isArray(session.messages)) {
     session.messages = session.messages.map((message) => {
@@ -1720,6 +1819,24 @@ wss.on('connection', (ws, req) => {
       case 'check_update':
         handleCheckUpdate(ws);
         break;
+      case 'read_claude_local_config':
+        handleReadClaudeLocalConfig(ws);
+        break;
+      case 'read_codex_local_config':
+        handleReadCodexLocalConfig(ws);
+        break;
+      case 'save_local_snapshot':
+        handleSaveLocalSnapshot(ws, msg);
+        break;
+      case 'restore_claude_local_snapshot':
+        handleRestoreClaudeLocalSnapshot(ws);
+        break;
+      case 'get_dev_config':
+        wsSend(ws, { type: 'dev_config', config: getDevConfigMasked() });
+        break;
+      case 'save_dev_config':
+        handleSaveDevConfig(ws, msg);
+        break;
       case 'list_native_sessions':
         handleListNativeSessions(ws);
         break;
@@ -1836,6 +1953,7 @@ function handleSaveModelConfig(ws, newConfig) {
     mode: newConfig.mode,
     activeTemplate: newConfig.activeTemplate || '',
     templates: [],
+    localSnapshot: newConfig.localSnapshot || current.localSnapshot || {},
   };
 
   // Merge templates: keep existing secrets if masked
@@ -1939,6 +2057,7 @@ function handleSaveCodexConfig(ws, newConfig) {
     enableSearch: false,
     supportsSearch: false,
     storedEnableSearch: requestedSearch,
+    localSnapshot: newConfig.localSnapshot || current.localSnapshot || {},
   };
   if (merged.mode === 'custom' && merged.profiles.length > 0 && !merged.profiles.some((profile) => profile.name === merged.activeProfile)) {
     merged.activeProfile = merged.profiles[0].name;
@@ -1958,6 +2077,89 @@ function handleSaveCodexConfig(ws, newConfig) {
       ? 'Codex 配置已保存。当前 cc-web 的 Codex exec 路径暂未接入 Web Search，已自动忽略该开关。'
       : 'Codex 配置已保存',
   });
+}
+
+// === Local Config Snapshot Handlers ===
+function handleReadClaudeLocalConfig(ws) {
+  let settings = {};
+  let sourceFound = false;
+  try {
+    if (fs.existsSync(CLAUDE_SETTINGS_PATH)) {
+      settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
+      sourceFound = true;
+    }
+  } catch {}
+  const env = settings.env || {};
+  const config = {
+    apiKey: env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY || '',
+    apiBase: env.ANTHROPIC_BASE_URL || '',
+    defaultModel: env.ANTHROPIC_MODEL || '',
+    opusModel: env.ANTHROPIC_DEFAULT_OPUS_MODEL || '',
+    sonnetModel: env.ANTHROPIC_DEFAULT_SONNET_MODEL || '',
+    haikuModel: env.ANTHROPIC_DEFAULT_HAIKU_MODEL || '',
+  };
+  wsSend(ws, { type: 'claude_local_config', config, sourceFound });
+}
+
+function handleReadCodexLocalConfig(ws) {
+  let config = { apiKey: '', apiBase: '' };
+  let sourceFound = false;
+  let hasApiKey = false;
+
+  // Read ~/.codex/config.toml for api_base
+  const codexConfigToml = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'config.toml');
+  try {
+    if (fs.existsSync(codexConfigToml)) {
+      sourceFound = true;
+      const toml = fs.readFileSync(codexConfigToml, 'utf8');
+      const baseMatch = toml.match(/base_url\s*=\s*"([^"]+)"/);
+      if (baseMatch) config.apiBase = baseMatch[1];
+    }
+  } catch {}
+
+  // Read ~/.codex/auth.json for api_key
+  const codexAuthJson = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'auth.json');
+  try {
+    if (fs.existsSync(codexAuthJson)) {
+      const auth = JSON.parse(fs.readFileSync(codexAuthJson, 'utf8'));
+      if (auth.OPENAI_API_KEY) {
+        config.apiKey = auth.OPENAI_API_KEY;
+        hasApiKey = true;
+      }
+    }
+  } catch {}
+
+  const result = { type: 'codex_local_config', config, sourceFound, hasApiKey };
+  if (!hasApiKey) result.warning = '本机使用登录态认证，未检测到 API Key';
+  wsSend(ws, result);
+}
+
+function handleSaveLocalSnapshot(ws, msg) {
+  const config = loadModelConfig();
+  config.localSnapshot = msg.snapshot || {};
+  saveModelConfig(config);
+  wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
+  wsSend(ws, { type: 'system_message', message: '本地配置快照已保存' });
+}
+
+function handleRestoreClaudeLocalSnapshot(ws) {
+  const config = loadModelConfig();
+  const snapshot = config.localSnapshot;
+  if (!snapshot || Object.keys(snapshot).length === 0) {
+    return wsSend(ws, { type: 'error', message: '没有已保存的本地配置快照' });
+  }
+  applyCustomTemplateToSettings(snapshot);
+  // Switch to local mode after restore
+  config.mode = 'local';
+  config.activeTemplate = '';
+  saveModelConfig(config);
+  // Reset MODEL_MAP to local defaults
+  MODEL_MAP.opus = 'claude-opus-4-6';
+  MODEL_MAP.sonnet = 'claude-sonnet-4-6';
+  MODEL_MAP.haiku = 'claude-haiku-4-5-20251001';
+  applyModelConfig();
+  wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
+  wsSend(ws, { type: 'system_message', message: '已恢复本地配置快照到 ~/.claude/settings.json' });
 }
 
 // === Fetch Upstream Models ===
@@ -2055,6 +2257,9 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           cwd: session.cwd || null,
           totalCost: session.totalCost || 0,
           totalUsage: session.totalUsage || null,
+          taskMode: session.taskMode || 'local',
+          sshHostId: session.sshHostId || '',
+          remoteCwd: session.remoteCwd || '',
         });
       }
       wsSend(ws, { type: 'system_message', message: '会话已清除，上下文已重置。' });
@@ -2156,6 +2361,68 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       break;
     }
 
+    case '/github': {
+      if (!sessionId || !session) {
+        wsSend(ws, { type: 'system_message', message: '请先进入一个会话后再执行 /github。' });
+        break;
+      }
+      if (activeProcesses.has(sessionId)) {
+        wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止。' });
+        break;
+      }
+      const ghArgs = parts.slice(1).join(' ').trim() || '列出所有可用仓库';
+      const ghPrompt = [
+        '[系统指令]',
+        '用户请求执行 GitHub 相关操作。请按以下步骤执行：',
+        `1. 使用 Read 工具读取 ${DEV_CONFIG_PATH} 获取 GitHub token 和仓库信息`,
+        '2. 根据用户的自然语言指令匹配对应的仓库（按 name 或 notes 字段）',
+        '3. 使用读取到的 token 进行 git 认证（可设置环境变量 GIT_TOKEN 或直接在 URL 中使用）',
+        '4. 严格禁止在回复中打印、回显或引用 token 的完整内容',
+        '5. 操作完成后简要报告结果',
+        '',
+        `用户指令：${ghArgs}`,
+      ].join('\n');
+      pendingSlashCommands.set(session.id, { kind: 'github' });
+      handleMessage(ws, {
+        text: ghPrompt,
+        sessionId: session.id,
+        mode: session.permissionMode || 'yolo',
+      }, { hideInHistory: true });
+      break;
+    }
+
+    case '/ssh': {
+      if (!sessionId || !session) {
+        wsSend(ws, { type: 'system_message', message: '请先进入一个会话后再执行 /ssh。' });
+        break;
+      }
+      if (activeProcesses.has(sessionId)) {
+        wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止。' });
+        break;
+      }
+      const sshArgs = parts.slice(1).join(' ').trim() || '列出所有可用主机';
+      const sshPrompt = [
+        '[系统指令]',
+        '用户请求执行 SSH 远程操作。请按以下步骤执行：',
+        `1. 使用 Read 工具读取 ${DEV_CONFIG_PATH} 获取 SSH 主机信息`,
+        '2. 根据用户的自然语言指令匹配对应的主机（按 name 或 description 字段）',
+        '3. 根据主机的 authType 字段选择认证方式：',
+        '   - authType 为 "key" 时：使用 ssh -i {identityFile} -p {port} {user}@{host} 连接',
+        '   - authType 为 "password" 时：使用 sshpass -p {password} ssh -p {port} {user}@{host} 连接（如系统无 sshpass 可先安装）',
+        '4. 严格禁止在回复中打印任何密钥或密码内容',
+        '5. 操作完成后简要报告结果',
+        '',
+        `用户指令：${sshArgs}`,
+      ].join('\n');
+      pendingSlashCommands.set(session.id, { kind: 'ssh' });
+      handleMessage(ws, {
+        text: sshPrompt,
+        sessionId: session.id,
+        mode: session.permissionMode || 'yolo',
+      }, { hideInHistory: true });
+      break;
+    }
+
 		    case '/mode': {
 		      const modeInput = parts[1];
 		      const VALID_MODES = ['default', 'plan', 'yolo'];
@@ -2184,6 +2451,8 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         '/clear — 清除当前会话（含上下文）\n' +
         '/mode [模式] — 查看/切换权限模式（default, plan, yolo）\n' +
         '/cost — 查看当前会话累计统计\n' +
+        '/github [指令] — GitHub 操作（读取开发者配置后执行）\n' +
+        '/ssh [指令] — SSH 远程操作（读取开发者配置后执行）\n' +
         '/help — 显示本帮助';
       wsSend(ws, {
         type: 'system_message',
@@ -2204,7 +2473,24 @@ function handleNewSession(ws, msg) {
   const cwd = (msg && msg.cwd) ? String(msg.cwd) : null;
   const agent = normalizeAgent(msg?.agent);
   const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
-  const resolvedCwd = cwd || (agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null);
+  const taskMode = msg?.taskMode === 'remote' ? 'remote' : 'local';
+  const sshHostId = String(msg?.sshHostId || '').trim();
+  const remoteCwd = String(msg?.remoteCwd || '').trim();
+
+  let resolvedCwd = cwd || (agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null);
+  let hostInfo = null;
+
+  // Remote task: create host-specific directory and inject host info
+  if (taskMode === 'remote' && sshHostId) {
+    const devConfig = loadDevConfig();
+    hostInfo = (devConfig.ssh.hosts || []).find(h => h.id === sshHostId) || null;
+    if (hostInfo) {
+      const hostDir = path.join(CONFIG_DIR, 'host', sshHostId);
+      fs.mkdirSync(hostDir, { recursive: true });
+      resolvedCwd = hostDir;
+    }
+  }
+
   const id = crypto.randomUUID();
   const session = {
     id,
@@ -2214,14 +2500,15 @@ function handleNewSession(ws, msg) {
     agent,
     claudeSessionId: null,
     codexThreadId: null,
-    // For Codex: explicitly set a default model on creation so we don't inherit Codex CLI defaults.
-    // For Claude: default to opus (1M) so --model is always passed to CLI.
     model: agent === 'codex' ? DEFAULT_CODEX_MODEL : MODEL_MAP.opus,
     permissionMode: requestedMode,
     totalCost: 0,
     totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
     messages: [],
     cwd: resolvedCwd,
+    taskMode,
+    sshHostId: taskMode === 'remote' ? sshHostId : '',
+    remoteCwd: taskMode === 'remote' ? remoteCwd : '',
   };
   saveSession(session);
   wsSessionMap.set(ws, id);
@@ -2240,8 +2527,38 @@ function handleNewSession(ws, msg) {
     hasUnread: false,
     historyPending: false,
     isRunning: false,
+    taskMode: session.taskMode,
+    sshHostId: session.sshHostId,
+    remoteCwd: session.remoteCwd,
   });
   sendSessionList(ws);
+
+  // Inject initial prompt for remote sessions
+  if (taskMode === 'remote' && hostInfo) {
+    const authType = hostInfo.authType || 'key';
+    const authInfo = authType === 'password'
+      ? `密码认证（密码已配置，使用 sshpass 连接）`
+      : `密钥认证：${hostInfo.identityFile || '(未配置)'}`;
+    const sshCmd = authType === 'password'
+      ? `sshpass -p <password> ssh -p ${hostInfo.port} ${hostInfo.user}@${hostInfo.host}`
+      : `ssh -i ${hostInfo.identityFile} -p ${hostInfo.port} ${hostInfo.user}@${hostInfo.host}`;
+    const initPrompt = [
+      '[系统上下文]',
+      '当前为远程任务会话。目标主机信息：',
+      `- 主机名：${hostInfo.name}`,
+      `- 地址：${hostInfo.user}@${hostInfo.host}:${hostInfo.port}`,
+      `- 认证方式：${authInfo}`,
+      `- 远端工作目录：${remoteCwd || 'SSH 默认目录'}`,
+      `本地工作目录为 ${resolvedCwd}。`,
+      `连接命令：${sshCmd}`,
+      '严格禁止在回复中打印任何密钥或密码内容。',
+    ].join('\n');
+    handleMessage(ws, {
+      text: initPrompt,
+      sessionId: id,
+      mode: requestedMode,
+    }, { hideInHistory: true });
+  }
 }
 
 function handleLoadSession(ws, sessionId) {
@@ -2291,6 +2608,9 @@ function handleLoadSession(ws, sessionId) {
     historyPending: olderChunks.length > 0,
     updated: session.updated,
     isRunning: activeProcesses.has(sessionId),
+    taskMode: session.taskMode || 'local',
+    sshHostId: session.sshHostId || '',
+    remoteCwd: session.remoteCwd || '',
   });
 
   if (olderChunks.length > 0) {
@@ -2590,6 +2910,9 @@ function handleMessage(ws, msg, options = {}) {
       hasUnread: false,
       historyPending: false,
       isRunning: false,
+      taskMode: session.taskMode || 'local',
+      sshHostId: session.sshHostId || '',
+      remoteCwd: session.remoteCwd || '',
     });
   }
   sendSessionList(ws);
@@ -3075,6 +3398,9 @@ function handleImportNativeSession(ws, msg) {
     hasUnread: false,
     historyPending: false,
     isRunning: false,
+    taskMode: session.taskMode || 'local',
+    sshHostId: session.sshHostId || '',
+    remoteCwd: session.remoteCwd || '',
   });
   sendSessionList(ws);
 }
@@ -3174,6 +3500,9 @@ function handleImportCodexSession(ws, msg) {
     hasUnread: false,
     historyPending: false,
     isRunning: false,
+    taskMode: session.taskMode || 'local',
+    sshHostId: session.sshHostId || '',
+    remoteCwd: session.remoteCwd || '',
   });
   sendSessionList(ws);
 }
