@@ -25,18 +25,11 @@ https://github.com/ZgDaniel/cc-web 给我装！
 ## 功能特性
 
 - **超轻量** — 后端性能占用少，前端通过 web 访问
-- **双 Agent 会话** — 新建会话时可选择 Claude 或 Codex，沿用相同的 Web 会话与后台任务模型
-- **Agent 视图隔离** — 侧边栏切换 Claude / Codex 后，仅展示当前 Agent 的会话与最近记录，互不干扰
-- **独立 Agent 设置** — Claude 与 Codex 拥有各自的设置入口与默认行为，保持贴近各自原生 CLI 的使用方式
 - **多会话管理** — 创建、切换、重命名、删除会话，删除时同步清除本地 Claude 历史记录
-- **会话续接** — 基于 `--resume` 实现跨消息上下文保持，也可通过 SSH 使用 `tmux attach -t claude` 命令加入会话
 - **本地历史导入** — Claude 可导入 `~/.claude/projects/` 会话；Codex 可导入 `~/.codex/sessions/` rollout 历史
-- **后台任务** — 关闭浏览器后 Claude 进程继续运行，完成后推送通知
-- **多渠道通知** — 支持 PushPlus / Telegram / Server酱 / 飞书机器人 / QQ（Qmsg），Web UI 内可视化配置
-- **进程持久化** — detached 进程 + PID 文件，服务重启不丢失运行中的任务
-- **多 API 切换** — 可配置多个 API 方案，UI 中一键切换，即时生效
-- **密码认证** — 自动生成初始密码、首次登录强制改密、Web UI 修改密码
-- **隔离式回归脚本** — `npm run regression` 在临时目录中使用 mock Claude / Codex CLI 校验主路径，不污染真实数据
+- **后台任务** — 关闭浏览器后 Claude 进程继续运行，完成后推送通知，支持 PushPlus / Telegram / Server酱 / 飞书机器人 / QQ（Qmsg）
+- **多 API 切换** — 可配置多个 API 方案，一键切换，即时生效
+- **开发者配置** — 可保存主机SSH信息、github token，实现快速管理远程主机、管理github仓库
 
 ## 前提条件
 
@@ -265,7 +258,7 @@ node server.js
 
 查看 [CHANGELOG.md](./CHANGELOG.md)
 
-## 补充说明
+## 致谢
 
-- 当前已支持 Claude Code 与 Codex；Claude 侧能力更完整，Codex 侧以会话续接、后台执行和命令流展示为主
-- 每次大改动后建议先执行 `npm run regression`
+- 本项目得到@carroxaitech、@YoungHong1992的悉心指导，@123aliez的算力支持，@lytxsy的深度测试，受益良多
+- 项目亦得到linux.do启发

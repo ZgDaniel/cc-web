@@ -26,6 +26,7 @@ A lightweight browser interface for Claude Code and Codex, designed to keep each
 - **Multi-channel notifications**: PushPlus / Telegram / ServerChan / Feishu bot / QQ (Qmsg), configurable in Web UI.
 - **Process persistence**: detached subprocess + PID files; running tasks survive service restarts.
 - **Multi-API switching**: configure multiple API profiles and switch between them instantly from the UI.
+- **Developer config**: save SSH host info (key/password auth) and GitHub tokens for quick remote host management and repository operations via `/ssh` and `/github` commands.
 - **Password-based auth**: initial password generation, forced first-login reset, and password change in Web UI.
 
 ## Requirements
@@ -104,12 +105,16 @@ Passwords are stored in `config/auth.json` and support generation + UI updates:
 ```text
 cc-web/
 ├── server.js              # Node.js backend (HTTP + WebSocket + process management + notifications)
+├── lib/
+│   ├── agent-runtime.js    # Claude / Codex runtime adapter
+│   └── codex-rollouts.js   # Codex rollout history parser
 ├── public/
 │   ├── index.html          # UI structure
 │   ├── app.js              # Frontend logic (WebSocket, UI interactions)
 │   ├── style.css           # Styles
 │   └── sw.js               # Service Worker (mobile notifications)
 ├── config/
+│   ├── codex.json          # Codex isolated config (generated at runtime)
 │   ├── notify.json         # Notification channel config (generated at runtime)
 │   └── auth.json           # Auth config (generated at runtime)
 ├── sessions/               # Chat history JSON files (generated at runtime)
@@ -243,6 +248,12 @@ node server.js
 - Alternative: [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) (requires domain setup).
 
 ## Release Notes
+
+- **v1.3.0**
+  - **Developer settings**: SSH host management (key/password auth) with `/ssh` command; GitHub token & repo management with `/github` command
+  - **Unified settings panel**: Claude and Codex API configs now in one panel
+  - **Local config templates**: read/snapshot/restore local API config with "本地配置" template
+  - **New session redesign**: local/remote task selection, pinned directories, SSH remote host connection
 
 - **v1.2.10**
   - Implemented `/init` behavior aligned with native Claude Code and Codex CLI
