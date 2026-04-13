@@ -260,5 +260,5 @@ node server.js
 
 ## 致谢
 
-- 本项目得到@carroxaitech、@YoungHong1992的悉心指导，@123aliez的算力支持，@lytxsy的深度测试，受益良多
-- 项目亦得到linux.do启发
+- 本项目得到 [@carroxaitech](https://github.com/carroxaitech)、[@YoungHong1992](https://github.com/YoungHong1992)的悉心指导，得到[@123aliez](https://github.com/123aliez)的算力支持，[@lytxsy](https://github.com/lytxsy)的深度测试，受益良多
+- 项目亦得到[linux.do](https://linux.do)启发
