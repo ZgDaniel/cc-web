@@ -4429,31 +4429,31 @@
     function renderLocalView() {
       const currentPinned = getPinnedCwds(targetAgent);
       const currentRecent = getRecentCwds().filter(p => !currentPinned.includes(p));
-      const allDirs = [...currentPinned, ...currentRecent].slice(0, 5);
+      const filledDirs = [...currentPinned, ...currentRecent].slice(0, 4);
 
       localView.innerHTML = `
         <div style="display:flex;flex-direction:column;gap:6px">
-          ${allDirs.map((dir, i) => {
+          ${filledDirs.map((dir, i) => {
             const isPinned = currentPinned.includes(dir);
             return `
               <div style="display:flex;gap:6px;align-items:center">
-                <input type="text" class="modal-text-input ns-cwd-item" value="${escapeHtml(dir)}" data-idx="${i}" style="flex:1;${isPinned ? '' : 'opacity:0.6'}" readonly>
+                <input type="text" class="modal-text-input ns-cwd-item" value="${escapeHtml(dir)}" data-idx="${i}" style="flex:1;${isPinned ? '' : 'opacity:0.6'}">
                 <button class="btn-test ns-pin-btn" data-idx="${i}" data-cwd="${escapeHtml(dir)}" style="padding:2px 6px;font-size:0.9em;${isPinned ? 'color:var(--accent)' : ''}" title="${isPinned ? '取消固定' : '固定'}">${isPinned ? '★' : '☆'}</button>
                 <button class="btn-test ns-del-dir-btn" data-idx="${i}" data-cwd="${escapeHtml(dir)}" style="padding:2px 6px;font-size:0.9em" title="移除">✕</button>
               </div>
             `;
           }).join('')}
-          ${allDirs.length < 5 ? `
-            <div style="display:flex;gap:6px;align-items:center">
-              <input type="text" id="ns-cwd-custom" class="modal-text-input" placeholder="输入自定义目录" style="flex:1">
-            </div>
-          ` : ''}
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="text" id="ns-cwd-custom" class="modal-text-input" placeholder="输入自定义目录" style="flex:1">
+          </div>
         </div>
       `;
 
       localView.querySelectorAll('.ns-pin-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-          const cwd = btn.dataset.cwd;
+          const rowInput = btn.closest('div')?.querySelector('.ns-cwd-item');
+          const cwd = rowInput?.value?.trim() || btn.dataset.cwd;
+          if (!cwd) return;
           const currentPinned2 = getPinnedCwds(targetAgent);
           if (currentPinned2.includes(cwd)) {
             removePinnedCwd(targetAgent, cwd);
@@ -4466,9 +4466,10 @@
 
       localView.querySelectorAll('.ns-del-dir-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-          const cwd = btn.dataset.cwd;
+          const rowInput = btn.closest('div')?.querySelector('.ns-cwd-item');
+          const cwd = rowInput?.value?.trim() || btn.dataset.cwd;
+          if (!cwd) return;
           removePinnedCwd(targetAgent, cwd);
-          // Also remove from recent
           let recents = getRecentCwds().filter(p => p !== cwd);
           try { localStorage.setItem(RECENT_CWD_KEY, JSON.stringify(recents)); } catch {}
           renderLocalView();
@@ -4535,13 +4536,10 @@
     overlay.querySelector('#ns-create-btn').addEventListener('click', () => {
       if (currentTab === 'local') {
         const customInput = localView.querySelector('#ns-cwd-custom');
-        const selectedInput = localView.querySelector('.ns-cwd-item:focus, .ns-cwd-item:checked');
-        // Try to find selected/entered cwd
+        const editedItems = Array.from(localView.querySelectorAll('.ns-cwd-item')).map(input => input.value.trim()).filter(Boolean);
         let cwd = customInput?.value?.trim() || null;
         if (!cwd) {
-          // Default to first available directory
-          const items = localView.querySelectorAll('.ns-cwd-item');
-          cwd = items.length > 0 ? items[0].value.trim() : null;
+          cwd = editedItems[0] || null;
         }
         close();
         if (cwd) saveRecentCwd(cwd);
