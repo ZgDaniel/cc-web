@@ -810,7 +810,7 @@ function applyCustomTemplateToSettings(tpl) {
   for (const [k, v] of Object.entries(settings.env || {})) {
     if (!SETTINGS_API_KEYS.includes(k)) cleanedEnv[k] = v;
   }
-  if (tpl.apiKey)       { cleanedEnv.ANTHROPIC_AUTH_TOKEN = tpl.apiKey; cleanedEnv.ANTHROPIC_API_KEY = tpl.apiKey; }
+  if (tpl.apiKey)       { cleanedEnv.ANTHROPIC_AUTH_TOKEN = tpl.apiKey; }
   if (tpl.apiBase)      cleanedEnv.ANTHROPIC_BASE_URL = tpl.apiBase;
   if (tpl.defaultModel) cleanedEnv.ANTHROPIC_MODEL = tpl.defaultModel;
   if (tpl.opusModel)    cleanedEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = tpl.opusModel;

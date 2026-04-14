@@ -4426,32 +4426,63 @@
     const recent = getRecentCwds().filter(p => !pinned.includes(p));
     const dirs = [...pinned, ...recent].slice(0, 5);
 
+    let selectedLocalIndex = 0;
+
     function renderLocalView() {
       const currentPinned = getPinnedCwds(targetAgent);
       const currentRecent = getRecentCwds().filter(p => !currentPinned.includes(p));
       const filledDirs = [...currentPinned, ...currentRecent].slice(0, 4);
+      const maxIndex = filledDirs.length;
+      if (selectedLocalIndex > maxIndex) selectedLocalIndex = maxIndex;
 
       localView.innerHTML = `
         <div style="display:flex;flex-direction:column;gap:6px">
           ${filledDirs.map((dir, i) => {
             const isPinned = currentPinned.includes(dir);
+            const isSelected = selectedLocalIndex === i;
             return `
-              <div style="display:flex;gap:6px;align-items:center">
+              <div class="ns-cwd-row" data-local-row="${i}" style="display:flex;gap:6px;align-items:center;padding:4px 6px;border:1px solid ${isSelected ? 'var(--accent)' : 'transparent'};border-radius:8px;background:${isSelected ? 'var(--accent-dim,rgba(100,150,255,0.08))' : 'transparent'};cursor:pointer">
+                <input type="radio" name="ns-local-cwd" class="ns-cwd-radio" data-local-radio="${i}" ${isSelected ? 'checked' : ''}>
                 <input type="text" class="modal-text-input ns-cwd-item" value="${escapeHtml(dir)}" data-idx="${i}" style="flex:1;${isPinned ? '' : 'opacity:0.6'}">
                 <button class="btn-test ns-pin-btn" data-idx="${i}" data-cwd="${escapeHtml(dir)}" style="padding:2px 6px;font-size:0.9em;${isPinned ? 'color:var(--accent)' : ''}" title="${isPinned ? '取消固定' : '固定'}">${isPinned ? '★' : '☆'}</button>
                 <button class="btn-test ns-del-dir-btn" data-idx="${i}" data-cwd="${escapeHtml(dir)}" style="padding:2px 6px;font-size:0.9em" title="移除">✕</button>
               </div>
             `;
           }).join('')}
-          <div style="display:flex;gap:6px;align-items:center">
+          <div class="ns-cwd-row" data-local-row="${filledDirs.length}" style="display:flex;gap:6px;align-items:center;padding:4px 6px;border:1px solid ${selectedLocalIndex === filledDirs.length ? 'var(--accent)' : 'transparent'};border-radius:8px;background:${selectedLocalIndex === filledDirs.length ? 'var(--accent-dim,rgba(100,150,255,0.08))' : 'transparent'};cursor:pointer">
+            <input type="radio" name="ns-local-cwd" class="ns-cwd-radio" data-local-radio="${filledDirs.length}" ${selectedLocalIndex === filledDirs.length ? 'checked' : ''}>
             <input type="text" id="ns-cwd-custom" class="modal-text-input" placeholder="输入自定义目录" style="flex:1">
           </div>
         </div>
       `;
 
+      localView.querySelectorAll('[data-local-row]').forEach(row => {
+        row.addEventListener('click', (e) => {
+          if (e.target.closest('.ns-pin-btn') || e.target.closest('.ns-del-dir-btn')) return;
+          selectedLocalIndex = Number(row.dataset.localRow);
+          renderLocalView();
+        });
+      });
+
+      localView.querySelectorAll('.ns-cwd-item, #ns-cwd-custom').forEach(input => {
+        input.addEventListener('focus', () => {
+          const row = input.closest('[data-local-row]');
+          if (!row) return;
+          selectedLocalIndex = Number(row.dataset.localRow);
+          renderLocalView();
+          const freshInput = localView.querySelector(row.dataset.localRow === String(filledDirs.length) ? '#ns-cwd-custom' : `.ns-cwd-item[data-idx="${row.dataset.localRow}"]`);
+          if (freshInput) {
+            const val = freshInput.value;
+            freshInput.focus();
+            if (typeof freshInput.setSelectionRange === 'function') freshInput.setSelectionRange(val.length, val.length);
+          }
+        });
+      });
+
       localView.querySelectorAll('.ns-pin-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const rowInput = btn.closest('div')?.querySelector('.ns-cwd-item');
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const rowInput = btn.closest('[data-local-row]')?.querySelector('.ns-cwd-item');
           const cwd = rowInput?.value?.trim() || btn.dataset.cwd;
           if (!cwd) return;
           const currentPinned2 = getPinnedCwds(targetAgent);
@@ -4460,18 +4491,21 @@
           } else {
             savePinnedCwd(targetAgent, cwd);
           }
+          selectedLocalIndex = Number(btn.dataset.idx || 0);
           renderLocalView();
         });
       });
 
       localView.querySelectorAll('.ns-del-dir-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const rowInput = btn.closest('div')?.querySelector('.ns-cwd-item');
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const rowInput = btn.closest('[data-local-row]')?.querySelector('.ns-cwd-item');
           const cwd = rowInput?.value?.trim() || btn.dataset.cwd;
           if (!cwd) return;
           removePinnedCwd(targetAgent, cwd);
           let recents = getRecentCwds().filter(p => p !== cwd);
           try { localStorage.setItem(RECENT_CWD_KEY, JSON.stringify(recents)); } catch {}
+          if (selectedLocalIndex > 0) selectedLocalIndex -= 1;
           renderLocalView();
         });
       });
@@ -4536,13 +4570,19 @@
     overlay.querySelector('#ns-create-btn').addEventListener('click', () => {
       if (currentTab === 'local') {
         const customInput = localView.querySelector('#ns-cwd-custom');
-        const editedItems = Array.from(localView.querySelectorAll('.ns-cwd-item')).map(input => input.value.trim()).filter(Boolean);
-        let cwd = customInput?.value?.trim() || null;
+        const editedItems = Array.from(localView.querySelectorAll('.ns-cwd-item')).map(input => input.value.trim());
+        let cwd = null;
+        if (selectedLocalIndex === editedItems.length) {
+          cwd = customInput?.value?.trim() || null;
+        } else {
+          cwd = editedItems[selectedLocalIndex] || null;
+        }
         if (!cwd) {
-          cwd = editedItems[0] || null;
+          alert('请选择或输入工作目录');
+          return;
         }
         close();
-        if (cwd) saveRecentCwd(cwd);
+        saveRecentCwd(cwd);
         send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode, taskMode: 'local' });
       } else {
         // Remote task
