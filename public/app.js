@@ -40,13 +40,6 @@
     { value: 'haiku', label: 'Haiku', desc: '最快速，适合简单任务' },
   ];
 
-	  const DEFAULT_CODEX_MODEL_OPTIONS = [
-	    { value: 'gpt-5.4', label: 'GPT-5.4', desc: '当前主力 Codex 模型' },
-	    { value: 'gpt-5.3-codex', label: 'GPT-5.3 Codex', desc: '偏工程执行场景' },
-	    { value: 'gpt-5.2-codex', label: 'GPT-5.2 Codex', desc: '兼容旧路由与旧配置' },
-	    { value: 'gpt-5.2', label: 'GPT-5.2', desc: '通用 OpenAI 兼容模型' },
-	  ];
-
   const MODE_PICKER_OPTIONS = [
     { value: 'yolo', label: 'YOLO', desc: '跳过所有权限检查' },
     { value: 'plan', label: 'Plan', desc: '执行前需确认计划' },
@@ -1318,13 +1311,46 @@
 	    return { base: (m[1] || '').trim(), level: (m[2] || '').trim().toLowerCase() };
 	  }
 
-	  function _isCodexModelAtLeast52(model) {
-	    const { base } = _splitCodexThinkingModel(model);
-	    // Accept only GPT-5.2+ (hide/remove older and other families from picker).
-	    const m = String(base || '').trim().match(/^gpt-5\.(\d+)(?:-.+)?$/i);
-	    if (!m) return false;
-	    const minor = Number(m[1] || 0);
-	    return Number.isFinite(minor) && minor >= 2;
+	  function _parseCodexModelListText(text) {
+	    const seen = new Set();
+	    const models = [];
+	    String(text || '')
+	      .split(/\r?\n|,/)
+	      .map((item) => item.trim())
+	      .filter(Boolean)
+	      .forEach((item) => {
+	        if (seen.has(item)) return;
+	        seen.add(item);
+	        models.push(item);
+	      });
+	    return models;
+	  }
+
+	  function normalizeCodexProfile(profile) {
+	    const normalized = {
+	      name: String(profile?.name || '').trim(),
+	      apiKey: String(profile?.apiKey || ''),
+	      apiBase: String(profile?.apiBase || '').trim(),
+	      model: String(profile?.model || '').trim(),
+	      models: [],
+	    };
+	    const seen = new Set();
+	    function addModel(value) {
+	      const model = String(value || '').trim();
+	      if (!model || seen.has(model)) return;
+	      seen.add(model);
+	      normalized.models.push(model);
+	    }
+	    if (Array.isArray(profile?.models)) profile.models.forEach(addModel);
+	    addModel(normalized.model);
+	    return normalized;
+	  }
+
+	  function getActiveCodexProfileConfig() {
+	    const config = codexConfigCache || null;
+	    if (!config || config.mode !== 'custom' || !config.activeProfile) return null;
+	    const profile = (config.profiles || []).find((item) => item.name === config.activeProfile) || null;
+	    return profile ? normalizeCodexProfile(profile) : null;
 	  }
 
 	  function getCodexBaseModelOptions() {
@@ -1339,16 +1365,13 @@
 	    }
 
 	    function addBaseOption(value, label, desc) {
-	      if (!_isCodexModelAtLeast52(value)) return;
 	      const { base } = _splitCodexThinkingModel(value);
 	      addOption(base, label || base, desc);
 	    }
 
-	    DEFAULT_CODEX_MODEL_OPTIONS.forEach((opt) => addBaseOption(opt.value, opt.label, opt.desc));
-	    addBaseOption(currentModel, currentModel, '当前会话模型');
-	    sessions
-	      .filter((s) => normalizeAgent(s.agent) === 'codex' && s.id === currentSessionId)
-	      .forEach((s) => addBaseOption(s.model, s.model, '当前会话已保存模型'));
+	    const activeProfile = getActiveCodexProfileConfig();
+	    const configuredModels = Array.isArray(activeProfile?.models) ? activeProfile.models : [];
+	    configuredModels.forEach((model) => addBaseOption(model, model, 'Profile 已配置模型'));
 
 	    return options;
 	  }
@@ -2914,6 +2937,10 @@
 	    if (currentAgent === 'codex') {
 	      const current = _splitCodexThinkingModel(currentModel || '');
 	      const baseOptions = getCodexBaseModelOptions();
+	      if (baseOptions.length === 0) {
+	        appendSystemMessage('当前 Codex Profile 未配置 /model 候选列表。请先在设置 -> Codex API 配置中填写模型列表，或直接输入 /model <模型名>。');
+	        return;
+	      }
 	      showOptionPicker('选择 Codex 模型', baseOptions, current.base || '', (baseValue) => {
 	        const base = String(baseValue || '').trim();
 	        const thinkingOptions = [
@@ -3914,7 +3941,7 @@
     function renderCodexConfigArea() {
       const isLocal = codexActiveProfile === '';
       const profileOptions = codexEditingProfiles.map((profile) =>
-        `<option value="${escapeHtml(profile.name)}">${escapeHtml(profile.name)}</option>`
+        `<option value="${escapeHtml(profile.name)}"${profile.name === codexActiveProfile ? ' selected' : ''}>${escapeHtml(profile.name)}</option>`
       ).join('');
 
       if (isLocal) {
@@ -3952,8 +3979,11 @@
       }
 
       // Custom profile selected
-      const currentProfile = codexEditingProfiles.find((profile) => profile.name === codexActiveProfile);
+      const currentProfileRaw = codexEditingProfiles.find((profile) => profile.name === codexActiveProfile);
+      const currentProfile = currentProfileRaw ? normalizeCodexProfile(currentProfileRaw) : null;
       const summaryBase = currentProfile?.apiBase ? escapeHtml(currentProfile.apiBase) : '默认';
+      const summaryModel = currentProfile?.model ? escapeHtml(currentProfile.model) : '未设置';
+      const summaryModelsCount = Array.isArray(currentProfile?.models) ? currentProfile.models.length : 0;
 
       codexConfigArea.innerHTML = `
         <div class="settings-field">
@@ -3969,7 +3999,7 @@
           </div>
         </div>
         <div class="settings-inline-note">
-          当前 Profile：<strong>${escapeHtml(currentProfile?.name || '未选择')}</strong> · API Base：<code>${summaryBase}</code>
+          当前 Profile：<strong>${escapeHtml(currentProfile?.name || '未选择')}</strong> · API Base：<code>${summaryBase}</code> · 默认模型：<code>${summaryModel}</code> · /model 候选：<code>${summaryModelsCount}</code> 项
         </div>
       `;
 
@@ -4000,7 +4030,8 @@
       const current = profileName
         ? codexEditingProfiles.find((profile) => profile.name === profileName)
         : null;
-      const draft = current || { name: '', apiKey: '', apiBase: '' };
+      const draft = current ? normalizeCodexProfile(current) : { name: '', apiKey: '', apiBase: '', model: '', models: [] };
+      const initialModelListText = Array.isArray(draft.models) ? draft.models.join('\n') : '';
       const modalOverlay = document.createElement('div');
       modalOverlay.className = 'settings-overlay';
       modalOverlay.style.zIndex = '10001';
@@ -4024,8 +4055,32 @@
           <label>API Base URL</label>
           <input type="text" id="codex-profile-apibase" placeholder="https://api.openai.com/v1" value="${escapeHtml(draft.apiBase || '')}">
         </div>
+        <div class="settings-divider" style="margin:12px 0"></div>
+        <div class="settings-field">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:600">获取上游模型列表</label>
+          <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
+            <label style="font-size:0.85em;display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input type="checkbox" id="codex-profile-custom-endpoint"> 端点
+            </label>
+            <input type="text" id="codex-profile-models-endpoint" placeholder="/v1/models" style="flex:1;display:none" value="">
+          </div>
+          <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
+            <button class="btn-test" id="codex-profile-fetch-models" style="padding:4px 12px;white-space:nowrap">获取模型</button>
+            <span id="codex-profile-fetch-status" style="font-size:0.85em;color:var(--text-secondary)"></span>
+          </div>
+        </div>
+        <div class="settings-divider" style="margin:12px 0"></div>
+        <div class="settings-field">
+          <label>默认模型</label>
+          <input type="text" id="codex-profile-model" list="codex-profile-dl-models" placeholder="gpt-5.5" value="${escapeHtml(draft.model || '')}" autocomplete="off">
+        </div>
+        <datalist id="codex-profile-dl-models"></datalist>
+        <div class="settings-field">
+          <label>/model 候选列表</label>
+          <textarea id="codex-profile-model-list" rows="7" placeholder="每行一个模型，例如&#10;gpt-5.5&#10;gpt-5.4&#10;gpt-5.3-codex" style="resize:vertical">${escapeHtml(initialModelListText)}</textarea>
+        </div>
         <div class="settings-inline-note">
-          Codex 只把 API 入口和密钥切换到当前 Profile，模型 ID 仍由会话内模型切换逻辑控制。
+          默认模型会用于新会话；<code>/model</code> 弹出的候选项只来自这里配置的列表。
         </div>
         <div class="settings-actions">
           <button class="btn-save" id="codex-profile-ok">确定</button>
@@ -4033,24 +4088,86 @@
       `;
       modalOverlay.appendChild(modal);
       document.body.appendChild(modalOverlay);
-      const closeModal = () => document.body.removeChild(modalOverlay);
+      const customEndpointCb = modal.querySelector('#codex-profile-custom-endpoint');
+      const endpointInput = modal.querySelector('#codex-profile-models-endpoint');
+      const fetchBtn = modal.querySelector('#codex-profile-fetch-models');
+      const fetchStatus = modal.querySelector('#codex-profile-fetch-status');
+      const datalist = modal.querySelector('#codex-profile-dl-models');
+      const defaultModelInput = modal.querySelector('#codex-profile-model');
+      const modelListTextarea = modal.querySelector('#codex-profile-model-list');
+      customEndpointCb.addEventListener('change', () => {
+        endpointInput.style.display = customEndpointCb.checked ? '' : 'none';
+      });
+      fetchBtn.addEventListener('click', () => {
+        const apiBase = modal.querySelector('#codex-profile-apibase').value.trim();
+        const apiKey = modal.querySelector('#codex-profile-apikey').value.trim();
+        if (!apiBase || !apiKey) {
+          fetchStatus.textContent = '请先填写 API Base 和 API Key';
+          fetchStatus.style.color = 'var(--text-error, #e85d5d)';
+          return;
+        }
+        const modelsEndpoint = customEndpointCb.checked ? endpointInput.value.trim() : '';
+        fetchBtn.disabled = true;
+        fetchStatus.textContent = '正在获取...';
+        fetchStatus.style.color = 'var(--text-secondary)';
+        _onFetchModelsResult = (result) => {
+          _onFetchModelsResult = null;
+          fetchBtn.disabled = false;
+          if (result.success) {
+            datalist.innerHTML = result.models.map((m) => `<option value="${escapeHtml(m)}">`).join('');
+            const fetchedText = result.models.join('\n');
+            const currentText = modelListTextarea.value.trim();
+            if (!currentText) {
+              modelListTextarea.value = fetchedText;
+            } else if (currentText !== fetchedText && confirm('是否使用拉取结果覆盖当前 /model 候选列表？')) {
+              modelListTextarea.value = fetchedText;
+            }
+            if (!defaultModelInput.value.trim() && result.models[0]) {
+              defaultModelInput.value = result.models[0];
+            }
+            fetchStatus.textContent = `获取到 ${result.models.length} 个模型`;
+            fetchStatus.style.color = 'var(--text-success, #5dbe5d)';
+          } else {
+            fetchStatus.textContent = result.message || '获取失败';
+            fetchStatus.style.color = 'var(--text-error, #e85d5d)';
+          }
+        };
+        send({
+          type: 'fetch_models',
+          apiBase,
+          apiKey,
+          modelsEndpoint: modelsEndpoint || undefined,
+          profileName: current?.name || modal.querySelector('#codex-profile-name').value.trim(),
+        });
+      });
+      const closeModal = () => {
+        _onFetchModelsResult = null;
+        document.body.removeChild(modalOverlay);
+      };
       modal.querySelector('#codex-profile-modal-close').addEventListener('click', closeModal);
       modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
       modal.querySelector('#codex-profile-ok').addEventListener('click', () => {
         const name = modal.querySelector('#codex-profile-name').value.trim();
         const apiKey = modal.querySelector('#codex-profile-apikey').value.trim();
         const apiBase = modal.querySelector('#codex-profile-apibase').value.trim();
+        const model = defaultModelInput.value.trim();
+        const models = _parseCodexModelListText(modelListTextarea.value);
         if (!name) { alert('请填写 Profile 名称'); return; }
         if (!apiKey) { alert('请填写 API Key'); return; }
         if (!apiBase) { alert('请填写 API Base URL'); return; }
+        if (!model) { alert('请填写模型'); return; }
+        if (!models.length) { alert('请至少填写一个 /model 候选模型'); return; }
+        if (!models.includes(model)) models.unshift(model);
         const existing = codexEditingProfiles.find((profile) => profile.name === name);
         if (existing && existing !== current) { alert('Profile 名称已存在'); return; }
         if (current) {
           current.name = name;
           current.apiKey = apiKey;
           current.apiBase = apiBase;
+          current.model = model;
+          current.models = models;
         } else {
-          codexEditingProfiles.push({ name, apiKey, apiBase });
+          codexEditingProfiles.push({ name, apiKey, apiBase, model, models });
         }
         codexActiveProfile = name;
         closeModal();
@@ -4060,7 +4177,7 @@
 
     _onCodexConfig = (config) => {
       currentCodexConfig = config || {};
-      codexEditingProfiles = (currentCodexConfig.profiles || []).map((profile) => ({ ...profile }));
+      codexEditingProfiles = (currentCodexConfig.profiles || []).map((profile) => normalizeCodexProfile(profile));
       if (currentCodexConfig.mode === 'local') {
         codexActiveProfile = '';
       } else {
@@ -4097,6 +4214,7 @@
       const fields = [
         ['API Key', config.apiKey || '(空)'],
         ['API Base URL', config.apiBase || '(空)'],
+        ['模型', config.model || '(空)'],
       ];
       modal.innerHTML = `
         <div class="settings-header">

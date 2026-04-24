@@ -338,7 +338,13 @@ async function main() {
       config: {
         mode: 'custom',
         activeProfile: 'Regression Profile',
-        profiles: [{ name: 'Regression Profile', apiKey: 'sk-regression', apiBase: 'https://example.com/v1' }],
+        profiles: [{
+          name: 'Regression Profile',
+          apiKey: 'sk-regression',
+          apiBase: 'https://example.com/v1',
+          model: 'gpt-5.5',
+          models: ['gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex'],
+        }],
         enableSearch: true,
       },
     }));
@@ -346,6 +352,8 @@ async function main() {
     assert(codexConfigMsg.config.mode === 'custom', 'Codex config mode save/load failed');
     assert(codexConfigMsg.config.activeProfile === 'Regression Profile', 'Codex active profile save/load failed');
     assert(Array.isArray(codexConfigMsg.config.profiles) && codexConfigMsg.config.profiles[0]?.apiKey.includes('****'), 'Codex profile API key should be masked');
+    assert(codexConfigMsg.config.profiles[0]?.model === 'gpt-5.5', 'Codex profile model save/load failed');
+    assert(Array.isArray(codexConfigMsg.config.profiles[0]?.models) && codexConfigMsg.config.profiles[0].models.length === 3, 'Codex profile model list save/load failed');
     assert(codexConfigMsg.config.supportsSearch === false, 'Codex config should expose unsupported search capability');
     assert(codexConfigMsg.config.enableSearch === false, 'Codex config should ignore unsupported search toggle');
 
@@ -354,7 +362,7 @@ async function main() {
     ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: codexInitCwd, mode: 'plan' }));
     const codexSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === codexInitCwd);
     assert(codexSession.mode === 'plan', 'Codex new_session should follow requested mode');
-    assert(codexSession.model === 'gpt-5.4', 'Codex new_session should inject default model gpt-5.4');
+    assert(codexSession.model === 'gpt-5.5', 'Codex new_session should inject configured profile model');
 
     ws.send(JSON.stringify({ type: 'message', text: '/init', sessionId: codexSession.sessionId, mode: 'plan', agent: 'codex' }));
     const codexInitStart = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /AGENTS\.md/.test(msg.message || ''));
@@ -410,9 +418,40 @@ async function main() {
 	    assert(lastSpawn.includes('-s read-only'), 'Codex plan mode should set sandbox read-only');
 	    assert(lastSpawn.includes('-s read-only resume'), 'Codex resume in plan mode must place -s before resume subcommand');
 
-    const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'config.toml'), 'utf8');
+    ws.send(JSON.stringify({
+      type: 'save_codex_config',
+      config: {
+        mode: 'custom',
+        activeProfile: 'Regression Profile 2',
+        profiles: [{
+          name: 'Regression Profile 2',
+          apiKey: 'sk-regression-2',
+          apiBase: 'https://example.org/v1',
+          model: 'gpt-5.4',
+          models: ['gpt-5.4'],
+        }],
+      },
+    }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'codex_config' && msg.config.activeProfile === 'Regression Profile 2');
+    const storedAfterProfileSwitch = JSON.parse(fs.readFileSync(codexSessionPath, 'utf8'));
+    assert(storedAfterProfileSwitch.codexThreadId === threadIdBeforeMode, 'Codex profile switch should not clear thread id');
+    assert(storedAfterProfileSwitch.model === 'gpt-5.4', 'Codex profile switch should update existing session model');
+
+    ws.send(JSON.stringify({ type: 'message', text: 'third codex prompt', sessionId: firstMessageSession.sessionId, mode: 'plan', agent: 'codex' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
+    const processLogAfterProfileSwitch = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8');
+    const profileSwitchSpawn = processLogAfterProfileSwitch
+      .trim()
+      .split('\n')
+      .filter((line) => line.includes(`"event":"process_spawn"`) && line.includes(firstMessageSession.sessionId.slice(0, 8)))
+      .pop() || '';
+    assert(profileSwitchSpawn.includes('resume') && profileSwitchSpawn.includes(threadIdBeforeMode), 'Codex profile switch should keep resume context');
+    assert(profileSwitchSpawn.includes('--model gpt-5.4'), 'Codex profile switch should run with new profile model');
+
+    const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-session-home', firstMessageSession.sessionId, 'config.toml'), 'utf8');
     assert(runtimeToml.includes('preferred_auth_method = "apikey"'), 'Codex custom profile should write isolated runtime auth mode');
-    assert(runtimeToml.includes('base_url = "https://example.com/v1"'), 'Codex custom profile should write isolated runtime base_url');
+    assert(runtimeToml.includes('base_url = "https://example.org/v1"'), 'Codex custom profile should write isolated runtime base_url');
+    assert(runtimeToml.includes('model = "gpt-5.4"'), 'Codex custom profile should write isolated runtime model');
 
     ws.send(JSON.stringify({ type: 'message', text: '/compact', sessionId: firstMessageSession.sessionId, mode: 'yolo', agent: 'codex' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /正在执行/.test(msg.message || '') && /Codex \/compact/.test(msg.message || ''));

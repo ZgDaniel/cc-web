@@ -164,7 +164,8 @@ function getSummaryApiCredentials(summaryConfig) {
     if (codexCfg.mode === 'custom' && codexCfg.activeProfile) {
       const profile = (codexCfg.profiles || []).find(p => p.name === codexCfg.activeProfile);
       if (profile && profile.apiKey && profile.apiBase) {
-        return { apiBase: profile.apiBase, apiKey: profile.apiKey, model: summaryConfig.model || '' };
+        const resolvedModel = splitCodexModelSpec(summaryConfig.model || profile.model || DEFAULT_CODEX_MODEL).base || DEFAULT_CODEX_MODEL;
+        return { apiBase: profile.apiBase, apiKey: profile.apiKey, model: resolvedModel };
       }
     }
     return null;
@@ -428,8 +429,16 @@ function validatePasswordStrength(pw) {
   return { valid: true, message: '' };
 }
 
-let authConfig = loadAuthConfig();
-let PASSWORD = authConfig.password;
+let authConfig = null;
+let PASSWORD = '';
+
+function ensureAuthLoaded() {
+  if (!authConfig) {
+    authConfig = loadAuthConfig();
+    PASSWORD = authConfig.password;
+  }
+  return authConfig;
+}
 
 const activeTokens = new Set();
 
@@ -537,9 +546,11 @@ let MODEL_MAP = {
 
 const VALID_AGENTS = new Set(['claude', 'codex']);
 
-// Codex CLI has its own default model if --model is omitted. We override it for new Codex sessions
-// to keep cc-web behavior stable and predictable.
-const DEFAULT_CODEX_MODEL = 'gpt-5.4';
+// Final fallback only. New Codex sessions prefer:
+// 1) active custom profile model
+// 2) ~/.codex/config.toml top-level model
+// 3) this constant
+const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 
 // === Model Config ===
 const DEFAULT_MODEL_CONFIG = {
@@ -557,6 +568,80 @@ const DEFAULT_CODEX_CONFIG = {
   supportsSearch: false,
   localSnapshot: {},  // saved snapshot of local ~/.codex config (archive-only, no restore)
 };
+
+function splitCodexModelSpec(model) {
+  const raw = String(model || '').trim();
+  if (!raw) return { raw: '', base: '', reasoning: '' };
+  const match = raw.match(/^(.*)\((medium|high|xhigh)\)\s*$/i);
+  if (!match) return { raw, base: raw, reasoning: '' };
+  return {
+    raw,
+    base: String(match[1] || '').trim(),
+    reasoning: String(match[2] || '').trim().toLowerCase(),
+  };
+}
+
+function normalizeCodexModelList(models, defaultModel = '') {
+  const seen = new Set();
+  const list = [];
+
+  function addModel(value) {
+    const model = String(value || '').trim();
+    if (!model || seen.has(model)) return;
+    seen.add(model);
+    list.push(model);
+  }
+
+  if (Array.isArray(models)) {
+    models.forEach(addModel);
+  }
+  addModel(defaultModel);
+  return list;
+}
+
+function readCodexLocalConfigSnapshot() {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+  const config = { apiKey: '', apiBase: '', model: '' };
+  let sourceFound = false;
+  let hasApiKey = false;
+
+  const codexConfigToml = path.join(homeDir, '.codex', 'config.toml');
+  try {
+    if (fs.existsSync(codexConfigToml)) {
+      sourceFound = true;
+      const toml = fs.readFileSync(codexConfigToml, 'utf8');
+      const baseMatch = toml.match(/base_url\s*=\s*"([^"]+)"/);
+      const modelMatch = toml.match(/^\s*model\s*=\s*"([^"]+)"/m);
+      if (baseMatch) config.apiBase = baseMatch[1];
+      if (modelMatch) config.model = modelMatch[1];
+    }
+  } catch {}
+
+  const codexAuthJson = path.join(homeDir, '.codex', 'auth.json');
+  try {
+    if (fs.existsSync(codexAuthJson)) {
+      sourceFound = true;
+      const auth = JSON.parse(fs.readFileSync(codexAuthJson, 'utf8'));
+      if (auth.OPENAI_API_KEY) {
+        config.apiKey = auth.OPENAI_API_KEY;
+        hasApiKey = true;
+      }
+    }
+  } catch {}
+
+  return { config, sourceFound, hasApiKey };
+}
+
+function resolveDefaultCodexModel() {
+  const codexConfig = loadCodexConfig();
+  if (codexConfig.mode === 'custom' && codexConfig.activeProfile) {
+    const activeProfile = (codexConfig.profiles || []).find((profile) => profile.name === codexConfig.activeProfile);
+    const profileModel = String(activeProfile?.model || '').trim();
+    return profileModel || DEFAULT_CODEX_MODEL;
+  }
+  const localModel = String(readCodexLocalConfigSnapshot().config.model || '').trim();
+  return localModel || DEFAULT_CODEX_MODEL;
+}
 
 function loadModelConfig() {
   try {
@@ -584,6 +669,8 @@ function loadCodexConfig() {
           name: String(profile?.name || '').trim(),
           apiKey: String(profile?.apiKey || ''),
           apiBase: String(profile?.apiBase || '').trim(),
+          model: String(profile?.model || '').trim(),
+          models: normalizeCodexModelList(profile?.models, profile?.model),
         })).filter((profile) => profile.name) : [],
         enableSearch: false,
         supportsSearch: false,
@@ -603,6 +690,8 @@ function saveCodexConfig(config) {
       name: String(profile?.name || '').trim(),
       apiKey: String(profile?.apiKey || ''),
       apiBase: String(profile?.apiBase || '').trim(),
+      model: String(profile?.model || '').trim(),
+      models: normalizeCodexModelList(profile?.models, profile?.model),
     })).filter((profile) => profile.name) : [],
     enableSearch: false,
   }, null, 2));
@@ -617,6 +706,8 @@ function getCodexConfigMasked() {
       name: profile.name,
       apiKey: maskSecret(profile.apiKey),
       apiBase: profile.apiBase || '',
+      model: profile.model || '',
+      models: normalizeCodexModelList(profile.models, profile.model),
     })),
     enableSearch: false,
     supportsSearch: false,
@@ -743,8 +834,90 @@ function tomlString(value) {
   return JSON.stringify(String(value || ''));
 }
 
-function prepareCodexCustomRuntime(config) {
-  if (!config || config.mode !== 'custom') return { mode: 'local' };
+function normalizeCodexRuntimeApiBase(apiBase) {
+  const raw = String(apiBase || '').trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  try {
+    const url = new URL(raw);
+    if (!url.pathname || url.pathname === '/') {
+      url.pathname = '/v1';
+      return url.toString().replace(/\/+$/, '');
+    }
+    return url.toString().replace(/\/+$/, '');
+  } catch {
+    return raw;
+  }
+}
+
+function codexSessionHomeDir(sessionId) {
+  return path.join(CONFIG_DIR, 'codex-session-home', sanitizeId(sessionId || 'default'));
+}
+
+function walkJsonlFiles(dir, files = []) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return files;
+  }
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) walkJsonlFiles(fullPath, files);
+    else if (entry.isFile() && fullPath.endsWith('.jsonl')) files.push(fullPath);
+  }
+  return files;
+}
+
+function copyCodexThreadRollouts(threadId, targetHomeDir) {
+  if (!threadId || !targetHomeDir) return;
+  const targetSessionsDir = path.join(targetHomeDir, 'sessions');
+  fs.mkdirSync(targetSessionsDir, { recursive: true });
+  const sourceDirs = [CODEX_SESSIONS_DIR, path.join(CODEX_RUNTIME_HOME, 'sessions')];
+  for (const sourceDir of sourceDirs) {
+    try {
+      for (const filePath of walkJsonlFiles(sourceDir)) {
+        if (!filePath.includes(threadId)) continue;
+        const rel = path.relative(sourceDir, filePath);
+        if (rel.startsWith('..') || path.isAbsolute(rel)) continue;
+        const target = path.join(targetSessionsDir, rel);
+        if (fs.existsSync(target)) continue;
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.copyFileSync(filePath, target);
+      }
+    } catch {}
+  }
+}
+
+function prepareCodexLocalRuntimeHome(homeDir) {
+  fs.mkdirSync(homeDir, { recursive: true });
+  const sourceHome = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex');
+  for (const filename of ['config.toml', 'auth.json']) {
+    try {
+      const source = path.join(sourceHome, filename);
+      if (!fs.existsSync(source)) continue;
+      fs.copyFileSync(source, path.join(homeDir, filename));
+    } catch {}
+  }
+}
+
+function ensureCodexSessionHome(session) {
+  if (!session?.id) return CODEX_RUNTIME_HOME;
+  if (!session.codexHomeDir) session.codexHomeDir = codexSessionHomeDir(session.id);
+  if (session.codexThreadId) copyCodexThreadRollouts(session.codexThreadId, session.codexHomeDir);
+  fs.mkdirSync(session.codexHomeDir, { recursive: true });
+  return session.codexHomeDir;
+}
+
+function prepareCodexCustomRuntime(config, session = null) {
+  const homeDir = ensureCodexSessionHome(session);
+  if (!config || config.mode !== 'custom') {
+    prepareCodexLocalRuntimeHome(homeDir);
+    if (session) {
+      session.codexHomeDir = homeDir;
+      session.codexRuntimeKey = 'local';
+    }
+    return { mode: 'local', homeDir, runtimeKey: 'local' };
+  }
   const profiles = Array.isArray(config.profiles) ? config.profiles : [];
   const activeProfile = profiles.find((profile) => profile.name === config.activeProfile) || null;
   if (!activeProfile) {
@@ -754,25 +927,35 @@ function prepareCodexCustomRuntime(config) {
     return { error: `Codex profile「${activeProfile.name}」缺少 API Key 或 API Base URL。` };
   }
 
-  fs.mkdirSync(CODEX_RUNTIME_HOME, { recursive: true });
+  fs.mkdirSync(homeDir, { recursive: true });
+  const modelSpec = splitCodexModelSpec(activeProfile.model || DEFAULT_CODEX_MODEL);
+  const runtimeApiBase = normalizeCodexRuntimeApiBase(activeProfile.apiBase);
   const configToml = [
     'preferred_auth_method = "apikey"',
     'model_provider = "openai_compat"',
+    ...(modelSpec.base ? [`model = ${tomlString(modelSpec.base)}`] : []),
+    ...(modelSpec.reasoning ? [`model_reasoning_effort = ${tomlString(modelSpec.reasoning)}`] : []),
     '',
     '[model_providers.openai_compat]',
     `name = ${tomlString(activeProfile.name || 'OpenAI Compat')}`,
-    `base_url = ${tomlString(activeProfile.apiBase)}`,
+    `base_url = ${tomlString(runtimeApiBase)}`,
     'env_key = "OPENAI_API_KEY"',
     'wire_api = "responses"',
     '',
   ].join('\n');
-  fs.writeFileSync(path.join(CODEX_RUNTIME_HOME, 'config.toml'), configToml);
+  fs.writeFileSync(path.join(homeDir, 'config.toml'), configToml);
+  if (session) {
+    session.codexHomeDir = homeDir;
+    session.codexRuntimeKey = `custom:${activeProfile.name}`;
+  }
 
   return {
     mode: 'custom',
-    homeDir: CODEX_RUNTIME_HOME,
+    homeDir,
     apiKey: activeProfile.apiKey,
-    apiBase: activeProfile.apiBase,
+    apiBase: runtimeApiBase,
+    model: activeProfile.model || '',
+    runtimeKey: `custom:${activeProfile.name}`,
     profileName: activeProfile.name,
   };
 }
@@ -1022,6 +1205,8 @@ function normalizeSession(session) {
   session.agent = normalizeAgent(session.agent);
   if (!Object.prototype.hasOwnProperty.call(session, 'claudeSessionId')) session.claudeSessionId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexThreadId')) session.codexThreadId = null;
+  if (!Object.prototype.hasOwnProperty.call(session, 'codexHomeDir')) session.codexHomeDir = '';
+  if (!Object.prototype.hasOwnProperty.call(session, 'codexRuntimeKey')) session.codexRuntimeKey = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'totalCost')) session.totalCost = 0;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
     session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
@@ -1243,6 +1428,9 @@ function formatRuntimeError(agent, raw, context = {}) {
   }
 
   if (agent === 'codex') {
+    if (/stream disconnected before completion|stream closed before response\.completed|response\.completed/i.test(condensed)) {
+      return 'Codex 上游响应流提前中断：当前自定义 API 的 Responses 流式协议没有完整发送 response.completed。请检查该 API 端点是否完整兼容 OpenAI Responses SSE，或切回确认兼容的 API 模板。';
+    }
     if (/ENOENT|not found|No such file/i.test(condensed)) {
       return '找不到 Codex CLI。请检查 Codex 设置里的 CLI 路径，或确认系统 PATH 中可直接运行 `codex`。';
     }
@@ -1733,6 +1921,7 @@ wss.on('connection', (ws, req) => {
     }
 
     if (msg.type === 'auth') {
+      ensureAuthLoaded();
       // Check ban before processing auth
       if (clientIP && isBanned(clientIP)) {
         wsSend(ws, { type: 'auth_result', success: false, banned: true });
@@ -2043,10 +2232,19 @@ function handleSaveCodexConfig(ws, newConfig) {
     if (!name) continue;
     const old = oldProfiles.find((item) => item.name === name);
     const rawApiKey = String(profile?.apiKey || '');
+    const rawModel = String(profile?.model || '').trim();
+    const mergedModel = rawModel || String(old?.model || '').trim();
+    const incomingModels = Array.isArray(profile?.models) ? profile.models : null;
+    const mergedModelsSource = incomingModels && incomingModels.length > 0 ? incomingModels : old?.models;
     mergedProfiles.push({
       name,
       apiKey: rawApiKey && !rawApiKey.includes('****') ? rawApiKey : (old?.apiKey || ''),
       apiBase: String(profile?.apiBase || '').trim(),
+      model: mergedModel,
+      models: normalizeCodexModelList(
+        mergedModelsSource,
+        mergedModel,
+      ),
     });
   }
   const requestedSearch = !!newConfig.enableSearch;
@@ -2063,10 +2261,27 @@ function handleSaveCodexConfig(ws, newConfig) {
     merged.activeProfile = merged.profiles[0].name;
   }
   saveCodexConfig(merged);
+  const nextDefaultModel = resolveDefaultCodexModel();
+  if (nextDefaultModel) {
+    try {
+      for (const file of fs.readdirSync(SESSIONS_DIR)) {
+        if (!file.endsWith('.json')) continue;
+        const sessionId = file.slice(0, -5);
+        try {
+          const session = loadSession(sessionId);
+          if (!session || getSessionAgent(session) !== 'codex') continue;
+          session.model = nextDefaultModel;
+          session.updated = new Date().toISOString();
+          saveSession(session);
+        } catch {}
+      }
+    } catch {}
+  }
   plog('INFO', 'codex_config_saved', {
     mode: merged.mode,
     activeProfile: merged.activeProfile || null,
     profileCount: merged.profiles.length,
+    defaultModel: nextDefaultModel || null,
     enableSearchRequested: requestedSearch,
     enableSearchEffective: false,
   });
@@ -2102,33 +2317,7 @@ function handleReadClaudeLocalConfig(ws) {
 }
 
 function handleReadCodexLocalConfig(ws) {
-  let config = { apiKey: '', apiBase: '' };
-  let sourceFound = false;
-  let hasApiKey = false;
-
-  // Read ~/.codex/config.toml for api_base
-  const codexConfigToml = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'config.toml');
-  try {
-    if (fs.existsSync(codexConfigToml)) {
-      sourceFound = true;
-      const toml = fs.readFileSync(codexConfigToml, 'utf8');
-      const baseMatch = toml.match(/base_url\s*=\s*"([^"]+)"/);
-      if (baseMatch) config.apiBase = baseMatch[1];
-    }
-  } catch {}
-
-  // Read ~/.codex/auth.json for api_key
-  const codexAuthJson = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'auth.json');
-  try {
-    if (fs.existsSync(codexAuthJson)) {
-      const auth = JSON.parse(fs.readFileSync(codexAuthJson, 'utf8'));
-      if (auth.OPENAI_API_KEY) {
-        config.apiKey = auth.OPENAI_API_KEY;
-        hasApiKey = true;
-      }
-    }
-  } catch {}
-
+  const { config, sourceFound, hasApiKey } = readCodexLocalConfigSnapshot();
   const result = { type: 'codex_local_config', config, sourceFound, hasApiKey };
   if (!hasApiKey) result.warning = '本机使用登录态认证，未检测到 API Key';
   wsSend(ws, result);
@@ -2181,13 +2370,18 @@ function handleFetchModels(ws, msg) {
   // Resolve real apiKey (if masked, look up saved config by template name or apiBase)
   let realKey = apiKey;
   if (apiKey.includes('****')) {
-    const config = loadModelConfig();
-    const saved = (config.templates || []);
-    // Match by template name first, then by apiBase
-    const tpl = (msg.templateName && saved.find(t => t.name === msg.templateName))
-      || saved.find(t => t.apiBase && t.apiBase.replace(/\/+$/, '') === base)
+    const modelConfig = loadModelConfig();
+    const codexConfig = loadCodexConfig();
+    const savedTemplates = modelConfig.templates || [];
+    const savedProfiles = codexConfig.profiles || [];
+    const tpl = (msg.templateName && savedTemplates.find((t) => t.name === msg.templateName))
+      || savedTemplates.find((t) => t.apiBase && t.apiBase.replace(/\/+$/, '') === base)
       || null;
-    if (tpl && tpl.apiKey && !tpl.apiKey.includes('****')) realKey = tpl.apiKey;
+    const profile = (msg.profileName && savedProfiles.find((p) => p.name === msg.profileName))
+      || savedProfiles.find((p) => p.apiBase && p.apiBase.replace(/\/+$/, '') === base)
+      || null;
+    if (tpl?.apiKey && !tpl.apiKey.includes('****')) realKey = tpl.apiKey;
+    else if (profile?.apiKey && !profile.apiKey.includes('****')) realKey = profile.apiKey;
     else return wsSend(ws, { type: 'fetch_models_result', success: false, message: 'API Key 已脱敏，请重新输入完整 Key' });
   }
 
@@ -2270,7 +2464,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       const modelInput = parts[1];
       if (agent === 'codex') {
         if (!modelInput) {
-          const current = session?.model || '配置默认模型';
+          const current = session?.model || resolveDefaultCodexModel() || '配置默认模型';
           wsSend(ws, { type: 'system_message', message: `当前 Codex 模型: ${current}\n用法: /model <模型名>` });
         } else {
           if (session) {
@@ -2500,7 +2694,7 @@ function handleNewSession(ws, msg) {
     agent,
     claudeSessionId: null,
     codexThreadId: null,
-    model: agent === 'codex' ? DEFAULT_CODEX_MODEL : MODEL_MAP.opus,
+    model: agent === 'codex' ? resolveDefaultCodexModel() : MODEL_MAP.opus,
     permissionMode: requestedMode,
     totalCost: 0,
     totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
@@ -2850,7 +3044,7 @@ function handleMessage(ws, msg, options = {}) {
 	      agent,
 	      claudeSessionId: null,
 	      codexThreadId: null,
-	      model: agent === 'codex' ? DEFAULT_CODEX_MODEL : null,
+	      model: agent === 'codex' ? resolveDefaultCodexModel() : null,
 	      permissionMode: mode || 'yolo',
 	      totalCost: 0,
 	      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
@@ -2923,6 +3117,7 @@ function handleMessage(ws, msg, options = {}) {
   if (spawnSpec?.error) {
     return wsSend(ws, { type: 'error', message: spawnSpec.error });
   }
+  saveSession(session);
 
   // === Detached process with file-based I/O ===
   const dir = runDir(currentSessionId);
@@ -3007,6 +3202,8 @@ function handleMessage(ws, msg, options = {}) {
     mode: spawnSpec.mode,
     model: session.model || 'default',
     resume: spawnSpec.resume,
+    codexHomeDir: spawnSpec.codexHomeDir || null,
+    codexRuntimeKey: spawnSpec.codexRuntimeKey || null,
     args: spawnSpec.args.join(' '),
   });
 
@@ -3034,6 +3231,8 @@ function handleMessage(ws, msg, options = {}) {
     lastUsage: null,
     lastError: null,
     errorSent: false,
+    codexHomeDir: spawnSpec.codexHomeDir || '',
+    codexRuntimeKey: spawnSpec.codexRuntimeKey || '',
     tailer: null,
   };
   activeProcesses.set(currentSessionId, entry);
@@ -3538,6 +3737,96 @@ setInterval(() => {
 
 plog('INFO', 'server_start', { port: PORT });
 
+let shuttingDown = false;
+
+function shutdown(reason, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  plog('INFO', 'server_shutdown_start', { reason, activeProcesses: activeProcesses.size });
+
+  try {
+    for (const client of wss.clients) {
+      try { client.close(1001, 'server shutting down'); } catch {}
+    }
+  } catch {}
+
+  try {
+    for (const [, entry] of activeProcesses) {
+      if (entry.tailer) entry.tailer.stop();
+    }
+  } catch {}
+
+  const forceTimer = setTimeout(() => {
+    plog('WARN', 'server_shutdown_forced', { reason });
+    process.exit(exitCode);
+  }, 5000);
+  forceTimer.unref?.();
+
+  try {
+    server.close(() => {
+      clearTimeout(forceTimer);
+      plog('INFO', 'server_shutdown_complete', { reason });
+      process.exit(exitCode);
+    });
+  } catch (err) {
+    clearTimeout(forceTimer);
+    plog('ERROR', 'server_shutdown_error', { reason, error: err.message });
+    process.exit(exitCode);
+  }
+}
+
+function killPortOccupant(port) {
+  try {
+    const result = require('child_process').execSync(`lsof -ti :${port}`, { encoding: 'utf8' }).trim();
+    if (!result) return false;
+    for (const pid of result.split('\n').map(Number).filter(Boolean)) {
+      try { process.kill(pid, 'SIGKILL'); } catch {}
+    }
+    // Wait for port to be released
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      try {
+        const check = require('child_process').execSync(`lsof -ti :${port}`, { encoding: 'utf8' }).trim();
+        if (!check) return true;
+      } catch { return true; }
+      require('child_process').execSync('sleep 0.2', { stdio: 'ignore' });
+    }
+    return true;
+  } catch { return false; }
+}
+
+function handleServerListenError(err) {
+  if (err && err.code === 'EADDRINUSE') {
+    plog('WARN', 'server_port_in_use_retry', { port: PORT, host: '127.0.0.1' });
+    if (killPortOccupant(PORT)) {
+      try { server.listen(PORT, '127.0.0.1'); } catch {}
+      return;
+    }
+    plog('ERROR', 'server_port_in_use', { port: PORT, error: err.message });
+    console.error(`CC-Web server failed: 127.0.0.1:${PORT} is already in use.`);
+    process.exit(98);
+    return;
+  }
+  plog('ERROR', 'server_error', { error: err?.message || String(err) });
+  console.error(err);
+  process.exit(1);
+}
+
+server.on('error', handleServerListenError);
+
+process.on('SIGTERM', () => shutdown('SIGTERM', 0));
+process.on('SIGINT', () => shutdown('SIGINT', 0));
+process.on('uncaughtException', (err) => {
+  if (err && err.code === 'EADDRINUSE') return handleServerListenError(err);
+  plog('ERROR', 'uncaught_exception', { error: err?.stack || err?.message || String(err) });
+  console.error(err);
+  shutdown('uncaughtException', 1);
+});
+process.on('unhandledRejection', (reason) => {
+  plog('ERROR', 'unhandled_rejection', { error: reason?.stack || reason?.message || String(reason) });
+});
+
 server.listen(PORT, '127.0.0.1', () => {
+  ensureAuthLoaded();
   console.log(`CC-Web server listening on 127.0.0.1:${PORT}`);
 });
