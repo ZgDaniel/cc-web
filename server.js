@@ -440,7 +440,27 @@ function ensureAuthLoaded() {
   return authConfig;
 }
 
-const activeTokens = new Set();
+const activeTokens = new Map(); // token -> lastActive timestamp
+
+const TOKEN_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+function isTokenValid(token) {
+  if (!token || !activeTokens.has(token)) return false;
+  const now = Date.now();
+  if (now - activeTokens.get(token) > TOKEN_TTL) {
+    activeTokens.delete(token);
+    return false;
+  }
+  activeTokens.set(token, now);
+  return true;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, ts] of activeTokens) {
+    if (now - ts > TOKEN_TTL) activeTokens.delete(token);
+  }
+}, 6 * 60 * 60 * 1000).unref();
 
 // === Anti-brute-force ===
 const AUTH_FAIL_WINDOW = 5 * 60 * 1000; // 5 minutes
@@ -487,14 +507,6 @@ function saveBannedIPs() {
   fs.writeFileSync(BANNED_IPS_PATH, JSON.stringify(obj, null, 2));
 }
 loadBannedIPs();
-
-function getClientIP(ws) {
-  const req = ws._req;
-  if (!req) return null;
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded) return forwarded.split(',')[0].trim();
-  return req.socket?.remoteAddress || null;
-}
 
 function isBanned(ip) {
   if (!ip || !bannedIPs.has(ip)) return false;
@@ -1045,8 +1057,12 @@ const MIME_TYPES = {
 
 // === Utility Functions ===
 
-function wsSend(ws, data) {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
+const WS_BACKLOG_LIMIT = 4 * 1024 * 1024; // 4MB per socket
+
+function wsSend(ws, data, dropIfBacklogged = false) {
+  if (!ws || ws.readyState !== 1) return;
+  if (dropIfBacklogged && ws.bufferedAmount > WS_BACKLOG_LIMIT) return;
+  ws.send(JSON.stringify(data));
 }
 
 function sanitizeId(id) {
@@ -1581,12 +1597,15 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   // Save result to session
   const session = loadSession(sessionId);
   if (session && entry.fullText) {
-    session.messages.push({
+    const msg = {
       role: 'assistant',
       content: entry.fullText,
       toolCalls: entry.toolCalls || [],
       timestamp: new Date().toISOString(),
-    });
+    };
+    if (entry.fullTextTruncated) msg.truncated = true;
+    if (entry.toolCallsTruncated) msg.toolCallsTruncated = true;
+    session.messages.push(msg);
     session.updated = new Date().toISOString();
     if (!entry.ws) session.hasUnread = true;
     saveSession(session);
@@ -1784,7 +1803,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/api/attachments') {
     const token = extractBearerToken(req);
-    if (!token || !activeTokens.has(token)) {
+    if (!isTokenValid(token)) {
       return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
     }
     const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
@@ -1858,7 +1877,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'DELETE' && url.pathname.startsWith('/api/attachments/')) {
     const token = extractBearerToken(req);
-    if (!token || !activeTokens.has(token)) {
+    if (!isTokenValid(token)) {
       return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
     }
     const id = sanitizeId(url.pathname.split('/').pop() || '');
@@ -1895,8 +1914,9 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
-  ws._req = req;
-  const clientIP = getClientIP(ws);
+  const forwarded = req.headers['x-forwarded-for'];
+  const clientIP = forwarded ? forwarded.split(',')[0].trim()
+    : req.socket?.remoteAddress || null;
 
   // Check if IP is banned
   if (clientIP && isBanned(clientIP)) {
@@ -1928,9 +1948,10 @@ wss.on('connection', (ws, req) => {
         ws.close();
         return;
       }
-      if (msg.password === PASSWORD || (msg.token && activeTokens.has(msg.token))) {
-        authToken = msg.token && activeTokens.has(msg.token) ? msg.token : crypto.randomBytes(32).toString('hex');
-        activeTokens.add(authToken);
+      const tokenValid = isTokenValid(msg.token);
+      if (msg.password === PASSWORD || tokenValid) {
+        authToken = tokenValid ? msg.token : crypto.randomBytes(32).toString('hex');
+        activeTokens.set(authToken, Date.now());
         authenticated = true;
         wsSend(ws, { type: 'auth_result', success: true, token: authToken, mustChangePassword: !!authConfig.mustChange });
         sendSessionList(ws);
@@ -2127,7 +2148,7 @@ function handleChangePassword(ws, msg, currentToken) {
 
   // Generate new token for current connection
   const newToken = crypto.randomBytes(32).toString('hex');
-  activeTokens.add(newToken);
+  activeTokens.set(newToken, Date.now());
 
   wsSend(ws, { type: 'password_changed', success: true, token: newToken, message: '密码修改成功' });
 }
