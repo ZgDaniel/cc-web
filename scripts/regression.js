@@ -479,7 +479,24 @@ async function main() {
 	    ), 20000);
 	    if (autoCompactRetry.type === 'text_delta') {
 	      assert(/trigger codex context limit/.test(autoCompactRetry.text || ''), 'Codex auto /compact should replay the failed prompt after compact');
+	      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === autoCompactSession.sessionId);
 	    }
+
+    const invalidEncryptedCwd = path.join(tempRoot, 'codex-invalid-encrypted');
+    mkdirp(invalidEncryptedCwd);
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: invalidEncryptedCwd, mode: 'yolo' }));
+    const invalidEncryptedSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === invalidEncryptedCwd);
+    ws.send(JSON.stringify({ type: 'message', text: 'warm up invalid encrypted', sessionId: invalidEncryptedSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === invalidEncryptedSession.sessionId);
+    const invalidEncryptedSessionPath = path.join(sessionsDir, `${invalidEncryptedSession.sessionId}.json`);
+    const storedBeforeInvalidEncrypted = JSON.parse(fs.readFileSync(invalidEncryptedSessionPath, 'utf8'));
+    assert(storedBeforeInvalidEncrypted.codexThreadId, 'Codex invalid encrypted fixture should start with a persisted thread id');
+    ws.send(JSON.stringify({ type: 'message', text: 'trigger invalid encrypted content', sessionId: invalidEncryptedSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    const invalidEncryptedError = await nextMessage(messages, ws, (msg) => msg.type === 'error' && /加密上下文/.test(msg.message || ''));
+    assert(/重新发送/.test(invalidEncryptedError.message || ''), 'Codex invalid encrypted error should explain retry after reset');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === invalidEncryptedSession.sessionId);
+    const storedAfterInvalidEncrypted = JSON.parse(fs.readFileSync(invalidEncryptedSessionPath, 'utf8'));
+    assert(!storedAfterInvalidEncrypted.codexThreadId, 'Codex invalid encrypted error should clear stale thread id');
 
     const claudeAttachment = await uploadAttachment(port, token, {
       filename: 'claude-test.png',

@@ -1444,6 +1444,9 @@ function formatRuntimeError(agent, raw, context = {}) {
   }
 
   if (agent === 'codex') {
+    if (/invalid_encrypted_content|encrypted content.*could not be/i.test(condensed)) {
+      return 'Codex 官方接口无法恢复这个旧会话的加密上下文。通常是该会话曾使用过不同的 provider、账号或登录态。已重置 Codex 上下文绑定，请重新发送一次消息以建立新的官方会话。';
+    }
     if (/stream disconnected before completion|stream closed before response\.completed|response\.completed/i.test(condensed)) {
       return 'Codex 上游响应流提前中断：当前自定义 API 的 Responses 流式协议没有完整发送 response.completed。请检查该 API 端点是否完整兼容 OpenAI Responses SSE，或切回确认兼容的 API 模板。';
     }
@@ -1478,6 +1481,10 @@ function formatRuntimeError(agent, raw, context = {}) {
     return 'Claude 鉴权失败。请确认本机 Claude CLI 已完成登录，且凭据仍然有效。';
   }
   return `Claude 任务失败${exitInfo}：${condensed}`;
+}
+
+function isCodexEncryptedContentError(raw) {
+  return /invalid_encrypted_content|encrypted content.*could not be/i.test(String(raw || ''));
 }
 
 function compactStartMessage(agent) {
@@ -1617,6 +1624,17 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     }
     session.updated = new Date().toISOString();
     saveSession(session);
+  }
+
+  if (session && entry.agent === 'codex' && rawCompletionError && isCodexEncryptedContentError(rawCompletionError)) {
+    clearRuntimeSessionId(session);
+    session.codexRuntimeKey = entry.codexRuntimeKey || session.codexRuntimeKey || '';
+    session.updated = new Date().toISOString();
+    saveSession(session);
+    plog('WARN', 'codex_encrypted_context_reset', {
+      sessionId: sessionId.slice(0, 8),
+      codexRuntimeKey: session.codexRuntimeKey || null,
+    });
   }
 
   let shouldReturnForFollowup = false;

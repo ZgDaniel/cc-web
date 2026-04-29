@@ -83,6 +83,16 @@ function readStdin() {
     process.exit(1);
   }
 
+  if (input === 'trigger invalid encrypted content') {
+    process.stdout.write(`${JSON.stringify({
+      type: 'turn.failed',
+      error: {
+        message: '{"type":"error","error":{"code":"invalid_encrypted_content","message":"The encrypted content QVhO... could not be verified."},"status":400}',
+      },
+    })}\n`);
+    process.exit(1);
+  }
+
   const responseText = input === '/compact'
     ? 'Codex compact finished.'
     : isInitPrompt
