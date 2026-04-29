@@ -241,10 +241,8 @@ node server.js
 ```
 
 **LAN access** (same Wi-Fi):
-- For security, CC-Web listens on `127.0.0.1` by default, so opening `http://<your-lan-ip>:8002` does not work out of the box.
-- Prefer exposing CC-Web through a reverse proxy such as Nginx, or through Tailscale / Cloudflare Tunnel, with firewall rules limiting who can connect.
-- If you intentionally want direct LAN access on a trusted network, change the bind address from `127.0.0.1` to `0.0.0.0` yourself (for example, add `HOST=0.0.0.0` and make the startup code read it), then open `http://<your-lan-ip>:8002`.
-- Do not expose `0.0.0.0:8002` directly on a public server.
+- For security, CC-Web listens on `127.0.0.1` by default. Prefer exposing it through a reverse proxy such as Nginx, or through Tailscale / Cloudflare Tunnel, with firewall rules limiting who can connect.
+- If LAN access is required, change the bind address from `127.0.0.1` to `0.0.0.0` (for example, add `HOST=0.0.0.0` and make the startup code read it), then open `http://<your-lan-ip>:8002`.
 
 **Remote access**:
 - Recommended: [Tailscale](https://tailscale.com/) for secure private networking.
