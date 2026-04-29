@@ -3,11 +3,6 @@ sessions/
 logs/
 attachments/
 .env
-config/notify.json
-config/auth.json
-config/model.json
-config/codex.json
-config/dev.json
-config/host/
+config/
 CLAUDE.md
 AGENTS.md
