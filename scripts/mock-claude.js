@@ -24,14 +24,50 @@ function readStdin() {
 
   process.stdout.write(`${JSON.stringify({ type: 'system', session_id: sessionId })}\n`);
 
+  // Resolve effectiveInput so /goal detection works for both text stdin and stream-json input.
+  let streamPayload = null;
+  let effectiveInput = input;
+  if (usesStreamJson) {
+    try { streamPayload = JSON.parse(input.split('\n').find(Boolean) || '{}'); } catch {}
+    const blocks = streamPayload?.message?.content || [];
+    effectiveInput = blocks
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text || '')
+      .join(' ')
+      .trim();
+  }
+
+  if (/^\/goal(?:\s|$)/i.test(effectiveInput)) {
+    // Simulate two-turn goal: assistant -> synthetic user(Stop hook feedback) -> assistant -> result.
+    process.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      session_id: sessionId,
+      message: { content: [{ type: 'text', text: 'GOAL_TURN_1' }] },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'user',
+      session_id: sessionId,
+      isSynthetic: true,
+      message: { role: 'user', content: [{ type: 'text', text: 'Stop hook feedback:\n[goal]: keep going' }] },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      session_id: sessionId,
+      message: { content: [{ type: 'text', text: 'GOAL_TURN_2' }] },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'result',
+      session_id: sessionId,
+      total_cost_usd: 0,
+    })}\n`);
+    return;
+  }
+
   let text = '';
   if (usesStreamJson) {
-    let payload = null;
-    try { payload = JSON.parse(input.split('\n').find(Boolean) || '{}'); } catch {}
-    const blocks = payload?.message?.content || [];
+    const blocks = streamPayload?.message?.content || [];
     const imageCount = blocks.filter((block) => block.type === 'image').length;
-    const promptText = blocks.filter((block) => block.type === 'text').map((block) => block.text || '').join(' ').trim();
-    text = `Claude mock handled stream-json (${imageCount} image): ${promptText || '[no text]'}`;
+    text = `Claude mock handled stream-json (${imageCount} image): ${effectiveInput || '[no text]'}`;
   } else if (input === '/compact') {
     text = 'Claude compact finished.';
   } else {

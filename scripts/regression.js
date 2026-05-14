@@ -515,6 +515,30 @@ async function main() {
     assert(lastClaudeSpawn.includes(`--resume ${claudeSessionIdBeforeMode}`), 'Claude mode switch should keep --resume session id');
     assert(lastClaudeSpawn.includes('--permission-mode plan'), 'Claude plan mode should set --permission-mode plan');
 
+    // /goal multi-turn coverage: ensure cc-web does not intercept /goal, surfaces synthetic
+    // Stop hook feedback as a goal_feedback system_message, never persists it to session.messages,
+    // AND preserves the strict event order TURN_1 -> feedback -> TURN_2.
+    const goalEvents = [];
+    const goalListener = (buf) => {
+      try { goalEvents.push(JSON.parse(String(buf))); } catch {}
+    };
+    ws.on('message', goalListener);
+    ws.send(JSON.stringify({ type: 'message', text: '/goal verify multi-turn', sessionId: claudeImageSession.sessionId, mode: 'plan', agent: 'claude' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === claudeImageSession.sessionId);
+    ws.off('message', goalListener);
+    const idxTurn1 = goalEvents.findIndex((e) => e.type === 'text_delta' && /GOAL_TURN_1/.test(e.text || ''));
+    const idxFeedback = goalEvents.findIndex((e) => e.type === 'system_message' && e.kind === 'goal_feedback');
+    const idxTurn2 = goalEvents.findIndex((e) => e.type === 'text_delta' && /GOAL_TURN_2/.test(e.text || ''));
+    assert(idxTurn1 >= 0, '/goal should emit GOAL_TURN_1 text_delta');
+    assert(idxFeedback >= 0, '/goal should emit goal_feedback system_message');
+    assert(idxTurn2 >= 0, '/goal should emit GOAL_TURN_2 text_delta');
+    assert(idxTurn1 < idxFeedback && idxFeedback < idxTurn2, '/goal events must arrive in order: TURN_1 -> feedback -> TURN_2');
+    assert(/keep going/.test(goalEvents[idxFeedback].message || ''), '/goal feedback must contain evaluator hint');
+    const goalUnknownCmd = goalEvents.find((e) => e.type === 'system_message' && /未知指令/.test(e.message || ''));
+    assert(!goalUnknownCmd, '/goal must bypass cc-web slash command interceptor (no "未知指令")');
+    const goalSessionJson = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
+    assert(!JSON.stringify(goalSessionJson.messages || []).includes('Stop hook feedback'), '/goal Stop hook feedback must not be persisted to session.messages');
+
     ws.send(JSON.stringify({ type: 'list_native_sessions' }));
     const nativeSessions = await nextMessage(messages, ws, (msg) => msg.type === 'native_sessions');
     assert(nativeSessions.groups?.length > 0, 'Claude native session listing failed');

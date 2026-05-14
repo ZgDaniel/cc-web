@@ -12,6 +12,7 @@
     { cmd: '/cost', desc: '查看会话费用' },
     { cmd: '/compact', desc: '压缩上下文' },
     { cmd: '/init', desc: '生成/更新 Agent 指南文件' },
+    { cmd: '/goal', desc: 'Claude 自治多轮工作直到条件达成' },
     { cmd: '/github', desc: 'GitHub 操作（读取开发者配置后执行）' },
     { cmd: '/ssh', desc: 'SSH 远程操作（读取开发者配置后执行）' },
     { cmd: '/help', desc: '显示帮助' },
@@ -84,6 +85,10 @@
   let cmdMenuIndex = -1;
   let currentMode = 'yolo';
   let currentModel = 'opus';
+  // /goal awareness (B+)
+  const sessionGoalState = new Map(); // sessionId -> { active, turns, lastFeedback }
+  const SESSION_GOAL_STATE_CAP = 100;
+  let pendingGoalForNewSession = null;
   let currentAgent = AGENT_LABELS[localStorage.getItem('cc-web-agent')] ? localStorage.getItem('cc-web-agent') : DEFAULT_AGENT;
   let currentTheme = (document.documentElement.dataset.theme || localStorage.getItem('cc-web-theme') || 'washi');
   let codexConfigCache = null;
@@ -1449,6 +1454,12 @@
     ws.onopen = () => {
       reconnectAttempts = 0;
       if (authToken) send({ type: 'auth', token: authToken });
+      // B+: On (re)connect, drop optimistic /goal flags. Initial connect has empty state (no-op);
+      // on reconnect this lets subsequent isRunning=false snapshots clear stale UI from before
+      // we missed the pre-active → active session_list pair. Also clear any pending state for a
+      // new session that may have been orphaned across the disconnect.
+      for (const gs of sessionGoalState.values()) gs.optimistic = false;
+      pendingGoalForNewSession = null;
     };
 
     ws.onmessage = (e) => {
@@ -1517,9 +1528,22 @@
         sessions = msg.sessions || [];
         reconcileSessionCacheWithSessions();
         renderSessionList();
+        // B+: clear stale goal active flag for any session no longer running.
+        // Skip optimistic states (still in "kicked off but not yet confirmed" window) so the
+        // pre-activeProcesses.set session_list snapshot does not wipe a freshly-set goal.
+        // Sessions seen as isRunning=true here are confirmed, so we drop optimistic for those —
+        // this lets a later isRunning=false (after WS reconnect / task done while offline) clear them.
+        for (const s of sessions) {
+          if (!s) continue;
+          const gs = sessionGoalState.get(s.id);
+          if (!gs) continue;
+          if (s.isRunning) gs.optimistic = false;
+          else if (!gs.optimistic) gs.active = false;
+        }
         if (currentSessionId) {
           setCurrentSessionRunningState(!!getSessionMeta(currentSessionId)?.isRunning);
         }
+        updateGoalBar();
         if (pendingInitialSessionLoad) {
           pendingInitialSessionLoad = false;
           syncViewForAgent(currentAgent, { preserveCurrent: false, loadLast: true });
@@ -1546,6 +1570,24 @@
             finishSessionSwitch(msg.sessionId);
           }
         }
+        // B+: transfer any pending /goal state to the freshly created session (via LRU helper)
+        if (pendingGoalForNewSession && msg.sessionId) {
+          setGoalState(msg.sessionId, pendingGoalForNewSession);
+          pendingGoalForNewSession = null;
+        }
+        // B+: server confirms session is now running — drop optimistic flag so any future
+        // isRunning=false snapshot (e.g. after a WS reconnect) can safely clear the bar.
+        if (msg.isRunning === true) {
+          const gs = sessionGoalState.get(msg.sessionId);
+          if (gs) gs.optimistic = false;
+        }
+        // B+: if session is not running, clear stale goal active — but never clobber an optimistic
+        // state that the user just kicked off (session_list may arrive before activeProcesses.set).
+        if (msg.isRunning === false) {
+          const gs = sessionGoalState.get(msg.sessionId);
+          if (gs && !gs.optimistic) gs.active = false;
+        }
+        updateGoalBar();
         break;
 
       case 'session_history_chunk':
@@ -1574,13 +1616,13 @@
         break;
 
       case 'text_delta':
-        if (!isGenerating) startGenerating();
+        if (!isGenerating || !document.getElementById('streaming-msg')) startGenerating();
         pendingText += msg.text;
         scheduleRender();
         break;
 
       case 'tool_start':
-        if (!isGenerating) startGenerating();
+        if (!isGenerating || !document.getElementById('streaming-msg')) startGenerating();
         activeToolCalls.set(msg.toolUseId, { name: msg.name, input: msg.input, kind: msg.kind || null, meta: msg.meta || null, done: false });
         appendToolCall(msg.toolUseId, msg.name, msg.input, false, msg.kind || null, msg.meta || null);
         break;
@@ -1616,9 +1658,31 @@
         finishGenerating(msg.sessionId);
         break;
 
-      case 'system_message':
-        appendSystemMessage(msg.message);
+      case 'system_message': {
+        if (msg.kind === 'goal_feedback') {
+          // Close the current streaming bubble so feedback appears between turns,
+          // and let the next text_delta open a fresh assistant bubble.
+          flushRender();
+          const streamingMsg = document.getElementById('streaming-msg');
+          if (streamingMsg) {
+            streamingMsg.removeAttribute('id');
+            streamingMsg.querySelectorAll('.typing-indicator').forEach((el) => el.remove());
+          }
+          const cleaned = (msg.message || '').replace(/^Stop hook feedback:\s*\n?/, '');
+          appendSystemMessage(`◎ Goal · ${cleaned}`);
+          if (currentSessionId) {
+            const gs = getGoalState(currentSessionId);
+            gs.active = true;
+            gs.turns += 1;
+            gs.lastFeedback = cleaned.slice(0, 200);
+            gs.optimistic = false; // server-confirmed, no longer at risk of premature clear
+            updateGoalBar();
+          }
+        } else {
+          appendSystemMessage(msg.message);
+        }
         break;
+      }
 
       case 'mode_changed':
         if (msg.mode && MODE_LABELS[msg.mode]) {
@@ -1680,6 +1744,11 @@
         if (!isGenerating && currentSessionId) {
           setCurrentSessionRunningState(!!getSessionMeta(currentSessionId)?.isRunning);
         }
+        // B+: server-side reject (e.g. expired attachment) — drop any pending optimistic /goal state
+        if (pendingGoalForNewSession) {
+          pendingGoalForNewSession = null;
+          updateGoalBar();
+        }
         if (isGenerating) finishGenerating();
         break;
 
@@ -1728,12 +1797,18 @@
         // A background task completed (browser was disconnected or viewing another session)
         showToast(`「${msg.title}」任务完成`, msg.sessionId);
         showBrowserNotification(msg.title);
+        // B+: process exited; done is authoritative — clear optimism too
+        {
+          const gs = sessionGoalState.get(msg.sessionId);
+          if (gs) { gs.active = false; gs.optimistic = false; }
+        }
         if (msg.sessionId === currentSessionId) {
           // Reload current session to show completed response
           openSession(msg.sessionId, { forceSync: true, blocking: false });
         } else {
           send({ type: 'list_sessions' });
         }
+        updateGoalBar();
         break;
 
       case 'password_changed':
@@ -1835,6 +1910,14 @@
     activeToolCalls.clear();
     toolGroupCount = 0;
     hasGrouped = false;
+    // /goal: process exited, mark goal inactive (B+); done is authoritative — clear optimism too
+    const goalSid = sessionId || currentSessionId;
+    const goalState = goalSid ? sessionGoalState.get(goalSid) : null;
+    if (goalState) {
+      goalState.active = false;
+      goalState.optimistic = false;
+    }
+    updateGoalBar();
   }
 
   // --- Rendering ---
@@ -2463,6 +2546,54 @@
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
   }
 
+  // --- /goal state helpers (B+) ---
+  function getGoalState(sid) {
+    if (!sid) return null;
+    let s = sessionGoalState.get(sid);
+    if (!s) {
+      s = { active: false, turns: 0, lastFeedback: '', optimistic: false };
+      setGoalState(sid, s);
+    }
+    return s;
+  }
+
+  function setGoalState(sid, state) {
+    if (!sid) return;
+    // LRU-style: re-insert moves entry to the end, so oldest is always at front.
+    if (sessionGoalState.has(sid)) sessionGoalState.delete(sid);
+    sessionGoalState.set(sid, state);
+    while (sessionGoalState.size > SESSION_GOAL_STATE_CAP) {
+      const oldest = sessionGoalState.keys().next().value;
+      sessionGoalState.delete(oldest);
+    }
+  }
+
+  function classifyGoalCommand(rawText) {
+    const text = (rawText || '').trim();
+    if (!/^\/goal(?:\s|$)/i.test(text)) return null;
+    const rest = text.replace(/^\/goal\s*/i, '').trim();
+    if (!rest) return 'status';
+    if (/^(clear|stop|off|reset|none|cancel)$/i.test(rest)) return 'clear';
+    return 'set';
+  }
+
+  function updateGoalBar() {
+    const bar = document.getElementById('goal-status-bar');
+    if (!bar) return;
+    const s = currentSessionId ? sessionGoalState.get(currentSessionId) : null;
+    const active = !!(s && s.active);
+    bar.hidden = !active;
+    if (active) {
+      const turnsEl = document.getElementById('goal-status-turns');
+      const fbEl = document.getElementById('goal-status-feedback');
+      if (turnsEl) turnsEl.textContent = `评估 ${s.turns}`;
+      if (fbEl) fbEl.textContent = s.lastFeedback || '等待首次评估…';
+    }
+    if (typeof abortBtn !== 'undefined' && abortBtn) {
+      abortBtn.title = active ? '停止 Goal 任务' : '停止';
+    }
+  }
+
   function appendSystemMessage(message) {
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
@@ -2593,10 +2724,12 @@
               localStorage.removeItem(getAgentSessionStorageKey(currentAgent));
             }
             invalidateSessionCache(s.id);
+            sessionGoalState.delete(s.id);
             send({ type: 'delete_session', sessionId: s.id });
             if (s.id === currentSessionId) {
               resetChatView(currentAgent);
             }
+            updateGoalBar();
           };
           if (skipDeleteConfirm) {
             doDelete();
@@ -2980,8 +3113,33 @@
     hideCmdMenu();
     hideOptionPicker();
 
-    // Slash commands: don't show as user bubble
-    if (text.startsWith('/')) {
+    // B+: /goal awareness (set/clear/status) + /clear resets goal state for this session
+    const goalCmd = classifyGoalCommand(text);
+    if (goalCmd === 'set') {
+      const newState = { active: true, turns: 0, lastFeedback: '等待首次评估…', optimistic: true };
+      if (currentSessionId) {
+        setGoalState(currentSessionId, newState);
+      } else {
+        pendingGoalForNewSession = newState;
+      }
+      updateGoalBar();
+    } else if (goalCmd === 'clear' && currentSessionId) {
+      const gs = sessionGoalState.get(currentSessionId);
+      if (gs) {
+        gs.lastFeedback = '清除中…';
+        updateGoalBar();
+      }
+    }
+    if (/^\/clear\s*$/i.test(text) && currentSessionId && pendingAttachments.length === 0) {
+      sessionGoalState.delete(currentSessionId);
+      pendingGoalForNewSession = null;
+      updateGoalBar();
+    }
+
+    // Slash commands: don't show as user bubble.
+    // /goal is special: it carries the user's real intent for Claude, so it falls through
+    // to the normal message path (renders user bubble, starts streaming UI).
+    if (text.startsWith('/') && !/^\/goal(?:\s|$)/i.test(text)) {
       if (pendingAttachments.length > 0) {
         appendError('命令消息暂不支持附带图片，请先移除图片或发送普通消息。');
         return;
@@ -3103,6 +3261,20 @@
   });
   sendBtn.addEventListener('click', sendMessage);
   abortBtn.addEventListener('click', () => send({ type: 'abort' }));
+  // B+: goal status bar's own stop button — same semantics as abort, but also nudges UI
+  const goalStopBtn = document.getElementById('goal-status-stop');
+  if (goalStopBtn) {
+    goalStopBtn.addEventListener('click', () => {
+      if (currentSessionId) {
+        const gs = sessionGoalState.get(currentSessionId);
+        if (gs) {
+          gs.lastFeedback = '停止中…';
+          updateGoalBar();
+        }
+      }
+      send({ type: 'abort' });
+    });
+  }
   if (attachBtn && imageUploadInput) {
     attachBtn.addEventListener('click', () => imageUploadInput.click());
     imageUploadInput.addEventListener('change', () => {

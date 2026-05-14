@@ -78,6 +78,14 @@
         <span id="cost-display" class="cost-display" hidden></span>
       </header>
 
+      <div id="goal-status-bar" class="goal-status-bar" hidden role="status" aria-live="polite">
+        <span class="goal-status-icon" aria-hidden="true">◎</span>
+        <span class="goal-status-label">Goal active</span>
+        <span id="goal-status-turns" class="goal-status-turns">评估 0</span>
+        <span id="goal-status-feedback" class="goal-status-feedback"></span>
+        <button type="button" id="goal-status-stop" class="goal-status-stop" title="停止 Goal">停止</button>
+      </div>
+
       <div class="messages-wrap">
         <div id="messages" class="messages">
           <div class="welcome-msg">

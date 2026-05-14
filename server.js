@@ -1969,7 +1969,7 @@ wss.on('connection', (ws, req) => {
 
     switch (msg.type) {
       case 'message':
-        if (msg.text && msg.text.trim().startsWith('/')) {
+        if (msg.text && msg.text.trim().startsWith('/') && !/^\/goal(?:\s|$)/i.test(msg.text.trim())) {
           handleSlashCommand(ws, msg.text.trim(), msg.sessionId, msg.agent);
         } else {
           handleMessage(ws, msg);
@@ -2666,6 +2666,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         '/clear — 清除当前会话（含上下文）\n' +
         '/mode [模式] — 查看/切换权限模式（default, plan, yolo）\n' +
         '/cost — 查看当前会话累计统计\n' +
+        '/goal <条件> — Claude 自治多轮工作直到条件达成\n' +
         '/github [指令] — GitHub 操作（读取开发者配置后执行）\n' +
         '/ssh [指令] — SSH 远程操作（读取开发者配置后执行）\n' +
         '/help — 显示本帮助';
@@ -3075,7 +3076,7 @@ function handleMessage(ws, msg, options = {}) {
 	  }
   normalizeSession(session);
 
-  if (normalizedText.startsWith('/') && resolvedAttachments.length > 0) {
+  if (normalizedText.startsWith('/') && !/^\/goal(?:\s|$)/i.test(normalizedText) && resolvedAttachments.length > 0) {
     return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片。请先发送图片说明，再单独使用 /model 或 /mode。' });
   }
 
