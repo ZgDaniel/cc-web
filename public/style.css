@@ -63,6 +63,11 @@ html[data-theme='coolvibe'] {
   --danger: #d65567;
   --info: #1976a4;
   --scrollbar-thumb: #a7c4ce;
+  --goal-bar-bg: rgba(8, 145, 178, 0.07);
+  --goal-bar-border: rgba(8, 145, 178, 0.18);
+  --goal-bar-fg: #2a5a6a;
+  --goal-bar-accent: #0b7289;
+  --goal-bar-badge: rgba(8, 145, 178, 0.14);
   --font-ui: 'Chivo Mono', ui-monospace, monospace;
   --page-background:
     radial-gradient(circle at top, rgba(8, 145, 178, 0.12), transparent 34%),
@@ -307,6 +312,11 @@ html[data-theme='editorial'] {
   --danger: #c05c42;
   --info: #4f6f87;
   --scrollbar-thumb: #bba995;
+  --goal-bar-bg: rgba(139, 94, 60, 0.07);
+  --goal-bar-border: rgba(139, 94, 60, 0.18);
+  --goal-bar-fg: #5a5148;
+  --goal-bar-accent: #71482d;
+  --goal-bar-badge: rgba(139, 94, 60, 0.14);
   --font-ui: 'Avenir Next', 'Segoe UI', 'PingFang SC', sans-serif;
   --page-background:
     radial-gradient(circle at top left, rgba(139, 94, 60, 0.08), transparent 38%),
