@@ -1,3 +1,29 @@
+/**
+ * cc-web 前端客户端（约 5175 行，单文件 IIFE）。
+ *
+ * 顶层组织（区间为近似值，随重构漂移）：
+ *   1-141     常量 + 全局状态 + DOM 缓存
+ *   160-634   主题 / 通知子页 / Dev 子页（GitHub repos + SSH hosts）
+ *   636-798   session LRU 缓存
+ *   799-1043  附件与图片上传
+ *   1044-1448 agent/session 视图切换 + marked/hljs 配置
+ *   1449-1870 socket 通信 + handleServerMessage（30 case 无 default）
+ *   1870-2500 流式渲染（flushRender / renderMarkdown / createMsgElement）
+ *             + tool 渲染（command_execution/reasoning/file_change/mcp_tool_call/AskUserQuestion 分流）
+ *   2500-2700 Goal 状态机 + 系统消息 + 错误
+ *   2700-2960 session 列表 + 侧栏手势
+ *   2960-3140 斜杠菜单 + Model/Mode picker
+ *   3140-3220 sendMessage
+ *   3691-4453 设置面板（含模板编辑 / Codex Profile / Claude 本地配置 modal）
+ *   4659-5100 新建会话 modal + Native/Codex 导入 modal
+ *
+ * 协议契约：服务端→客户端 30 个 type 在 handleServerMessage 处理；
+ * 客户端→服务端消息见 server.js switch + auth 分支（共 31 type）。
+ * 详见 docs/PROTOCOL.md。
+ *
+ * 安全注意：renderMarkdown 经 DOMPurify sanitize + decorateCodeBlocks DOM API 注入受信任 UI。
+ * 详细架构与契约见 docs/。
+ */
 // === CC-Web Frontend ===
 (function () {
   'use strict';
@@ -102,6 +128,9 @@
   let currentSessionRunning = false;
   let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
+  // 区分首次 auth 成功 vs WS 重连后的 auth 成功：
+  // 仅首次才触发整区会话加载 + scrollToBottom，避免重连打断用户阅读
+  let hasInitialAuthCompleted = false;
 
   // --- DOM ---
   const $ = (sel) => document.querySelector(sel);
@@ -109,7 +138,6 @@
   const loginForm = $('#login-form');
   const loginPassword = $('#login-password');
   const loginError = $('#login-error');
-  const rememberPw = $('#remember-pw');
   const app = $('#app');
   const sessionLoadingOverlay = $('#session-loading-overlay');
   const sessionLoadingLabel = $('#session-loading-label');
@@ -884,9 +912,10 @@
         resolve(authToken);
         return;
       }
-      const savedPassword = localStorage.getItem('cc-web-pw');
-      if (!savedPassword) {
-        reject(new Error('登录状态已失效，请刷新页面后重新登录再上传图片。'));
+      // 仅依赖持久 token：无 token 直接拒绝，不再用密码重登
+      const savedToken = localStorage.getItem('cc-web-token');
+      if (!savedToken) {
+        reject(new Error('登录已过期，请重新登录后再上传图片。'));
         return;
       }
       const timeout = setTimeout(() => {
@@ -904,15 +933,14 @@
       };
       const onFailed = () => {
         cleanup();
-        reject(new Error('登录状态已失效，请刷新页面后重新登录再上传图片。'));
+        reject(new Error('登录已过期，请重新登录后再上传图片。'));
       };
       document.addEventListener('cc-web-auth-restored', onRestored);
       document.addEventListener('cc-web-auth-failed', onFailed);
 
+      // WS 断开 → 重连（connect 内部会用持久 token 重新鉴权）
       if (!ws || ws.readyState > 1) {
         connect();
-      } else if (ws.readyState === 1) {
-        send({ type: 'auth', password: savedPassword });
       }
     });
   }
@@ -1383,9 +1411,9 @@
 
   // --- marked config ---
   const PREVIEW_LANGS = new Set(['html', 'svg']);
-  const _previewCodeMap = new Map();
-  let _previewCodeId = 0;
 
+  // 简化 renderer.code：仅输出纯 <pre><code>，按钮/iframe 由 decorateCodeBlocks 在
+  // DOMPurify sanitize 之后通过 DOM API 注入（受信任代码不经过 sanitize）。
   const renderer = new marked.Renderer();
   renderer.code = function (code, language) {
     const lang = (language || 'plaintext').toLowerCase();
@@ -1399,52 +1427,87 @@
     } catch {
       highlighted = escapeHtml(code);
     }
-    const canPreview = PREVIEW_LANGS.has(lang);
-    const previewBtn = canPreview
-      ? `<button class="code-preview-btn" onclick="ccTogglePreview(this)">Preview</button>`
-      : '';
-    const previewPane = canPreview
-      ? `<div class="code-preview-pane"><iframe class="code-preview-iframe" sandbox="allow-scripts" loading="lazy"></iframe></div>`
-      : '';
-    const cid = canPreview ? (++_previewCodeId) : 0;
-    if (canPreview) _previewCodeMap.set(cid, code);
-    return `<div class="code-block-wrapper${canPreview ? ' has-preview' : ''}"${canPreview ? ` data-cid="${cid}"` : ''}>
-      <div class="code-block-header">
-        <span>${escapeHtml(lang)}</span>
-        <div class="code-block-actions">${previewBtn}<button class="code-copy-btn" onclick="ccCopyCode(this)">Copy</button></div>
-      </div>
-      ${previewPane}<pre><code class="hljs language-${escapeHtml(lang)}">${highlighted}</code></pre>
-    </div>`;
+    return `<pre><code class="hljs language-${escapeHtml(lang)}" data-lang="${escapeHtml(lang)}">${highlighted}</code></pre>`;
   };
   marked.setOptions({ renderer, breaks: true, gfm: true });
 
-  window.ccCopyCode = function (btn) {
-    const wrapper = btn.closest('.code-block-wrapper');
-    const cid = wrapper.dataset.cid ? Number(wrapper.dataset.cid) : 0;
-    const code = (cid && _previewCodeMap.has(cid)) ? _previewCodeMap.get(cid) : wrapper.querySelector('code').textContent;
-    navigator.clipboard.writeText(code).then(() => {
-      btn.textContent = 'Copied!';
-      setTimeout(() => btn.textContent = 'Copy', 1500);
-    });
-  };
+  // 在 sanitize 之后通过 DOM API 装饰代码块：Copy/Preview 按钮 + 预览 iframe。
+  // 幂等：每个 pre.ccweb-decorated 跳过，避免流式刷新重复装饰导致 iframe 状态丢失。
+  // 闭包捕获当前 code 文本，不再用全局 cid Map（避免流式刷新产生废弃条目）。
+  function decorateCodeBlocks(container) {
+    if (!container) return;
+    const nodes = container.querySelectorAll('pre > code.hljs:not([data-cc-decorated])');
+    nodes.forEach((codeEl) => {
+      codeEl.dataset.ccDecorated = '1';
+      const pre = codeEl.parentElement;
+      const lang = codeEl.dataset.lang || 'plaintext';
+      const rawCode = codeEl.textContent;
 
-  window.ccTogglePreview = function (btn) {
-    const wrapper = btn.closest('.code-block-wrapper');
-    const inPreview = wrapper.classList.contains('preview-mode');
-    if (inPreview) {
-      wrapper.classList.remove('preview-mode');
-      btn.textContent = 'Preview';
-    } else {
-      const iframe = wrapper.querySelector('.code-preview-iframe');
-      if (iframe && !iframe.dataset.loaded) {
-        const cid = wrapper.dataset.cid ? Number(wrapper.dataset.cid) : 0;
-        iframe.srcdoc = (cid && _previewCodeMap.has(cid)) ? _previewCodeMap.get(cid) : '';
-        iframe.dataset.loaded = '1';
+      const wrapper = document.createElement('div');
+      wrapper.className = 'code-block-wrapper';
+      const canPreview = PREVIEW_LANGS.has(lang);
+      if (canPreview) wrapper.classList.add('has-preview');
+
+      const header = document.createElement('div');
+      header.className = 'code-block-header';
+      const langLabel = document.createElement('span');
+      langLabel.textContent = lang;
+      const actions = document.createElement('div');
+      actions.className = 'code-block-actions';
+
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'code-copy-btn';
+      copyBtn.textContent = 'Copy';
+      copyBtn.addEventListener('click', () => {
+        navigator.clipboard.writeText(rawCode).then(() => {
+          copyBtn.textContent = 'Copied!';
+          setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+        });
+      });
+      actions.appendChild(copyBtn);
+
+      let previewPane = null;
+      let iframe = null;
+      if (canPreview) {
+        const previewBtn = document.createElement('button');
+        previewBtn.type = 'button';
+        previewBtn.className = 'code-preview-btn';
+        previewBtn.textContent = 'Preview';
+        previewBtn.addEventListener('click', () => {
+          const inPreview = wrapper.classList.contains('preview-mode');
+          if (inPreview) {
+            wrapper.classList.remove('preview-mode');
+            previewBtn.textContent = 'Preview';
+          } else {
+            if (iframe && !iframe.dataset.loaded) {
+              iframe.srcdoc = rawCode;
+              iframe.dataset.loaded = '1';
+            }
+            wrapper.classList.add('preview-mode');
+            previewBtn.textContent = 'Source';
+          }
+        });
+        actions.appendChild(previewBtn);
+
+        previewPane = document.createElement('div');
+        previewPane.className = 'code-preview-pane';
+        iframe = document.createElement('iframe');
+        iframe.className = 'code-preview-iframe';
+        iframe.setAttribute('sandbox', 'allow-scripts');
+        iframe.setAttribute('loading', 'lazy');
+        previewPane.appendChild(iframe);
       }
-      wrapper.classList.add('preview-mode');
-      btn.textContent = 'Source';
-    }
-  };
+
+      header.appendChild(langLabel);
+      header.appendChild(actions);
+
+      pre.parentElement.insertBefore(wrapper, pre);
+      wrapper.appendChild(header);
+      if (previewPane) wrapper.appendChild(previewPane);
+      wrapper.appendChild(pre);
+    });
+  }
 
   // --- WebSocket ---
   function connect() {
@@ -1490,6 +1553,14 @@
   }
 
   // --- Server Message Handler ---
+  /**
+   * 服务端→客户端消息分发（30 个 case，无 default）。
+   *
+   * 职责混合：鉴权 / 会话同步 / 流式渲染 / 配置同步 / Goal 状态机。
+   * 完整 type 清单与契约见 docs/PROTOCOL.md "服务端 → 客户端"。
+   *
+   * @param {object} msg - { type, ...payload }
+   */
   function handleServerMessage(msg) {
     switch (msg.type) {
       case 'auth_result':
@@ -1503,12 +1574,15 @@
           // Check if must change password
           if (msg.mustChangePassword) {
             showForceChangePassword();
-          } else {
+          } else if (!hasInitialAuthCompleted) {
+            // 仅首次 auth 成功才触发整区会话加载；WS 重连不触发，保留用户滚动位置
+            hasInitialAuthCompleted = true;
             pendingInitialSessionLoad = true;
           }
         } else {
           authToken = null;
           localStorage.removeItem('cc-web-token');
+          hasInitialAuthCompleted = false;  // auth 失败：重置首次加载状态，下次登录重新触发
           document.dispatchEvent(new CustomEvent('cc-web-auth-failed'));
           loginOverlay.hidden = false;
           app.hidden = true;
@@ -1518,7 +1592,14 @@
             loginPassword.disabled = true;
             loginForm.querySelector('button[type="submit"]').disabled = true;
           } else {
-            loginError.textContent = '密码错误';
+            const reason = msg.reason;
+            if (reason === 'invalid_password') {
+              loginError.textContent = '密码错误';
+            } else if (reason === 'session_expired') {
+              loginError.textContent = '登录已过期，请重新登录';
+            } else {
+              loginError.textContent = '登录失败，请重新登录';
+            }
             loginError.hidden = false;
           }
         }
@@ -1929,6 +2010,7 @@
     }, RENDER_DEBOUNCE);
   }
 
+  // 不变量：操作 #streaming-msg 元素渲染流式输出，无元素时立即返回。
   function flushRender() {
     const streamEl = document.getElementById('streaming-msg');
     if (!streamEl) return;
@@ -1937,13 +2019,28 @@
     let textDiv = bubble.querySelector('.msg-text');
     if (!textDiv) { textDiv = bubble; }
     textDiv.innerHTML = renderMarkdown(pendingText);
+    decorateCodeBlocks(textDiv);
     scrollToBottom();
   }
 
+  // 不变量：marked.parse 输出经 DOMPurify sanitize 后返回。Copy/Preview 按钮 + 预览
+  // iframe 由 decorateCodeBlocks 在 sanitize 之后通过 DOM API 注入（受信任代码）。
+  // assistant 文本与 reasoning 均走此路径，输出进主文档（非沙箱 iframe）。
+  // Fail-closed：DOMPurify 加载失败时降级为纯文本 escape，绝不输出未 sanitize 的 HTML。
   function renderMarkdown(text) {
     if (!text) return '<div class="typing-indicator"><span></span><span></span><span></span></div>';
-    try { return marked.parse(text); }
-    catch { return escapeHtml(text); }
+    try {
+      const raw = marked.parse(text);
+      if (typeof DOMPurify === 'undefined') {
+        return `<pre>${escapeHtml(text)}</pre>`;
+      }
+      return DOMPurify.sanitize(raw, {
+        FORBID_TAGS: ['style', 'iframe', 'object', 'embed', 'base', 'form', 'input', 'button', 'svg', 'math'],
+        FORBID_ATTR: ['style'],
+      });
+    } catch {
+      return escapeHtml(text);
+    }
   }
 
   function createMsgElement(role, content, attachments = []) {
@@ -1984,6 +2081,7 @@
       }
     } else {
       bubble.innerHTML = content ? renderMarkdown(content) : '';
+      if (content) decorateCodeBlocks(bubble);
       if (attachments.length > 0) {
         bubble.insertAdjacentHTML('beforeend', renderAttachmentLabels(attachments));
       }
@@ -2389,6 +2487,7 @@
       content.className = 'tool-call-content reasoning';
       const text = stringifyToolValue(effectiveResult || effectiveInput);
       content.innerHTML = text ? renderMarkdown(text) : '<div class="tool-call-empty">暂无推理内容</div>';
+      if (text) decorateCodeBlocks(content);
       return content;
     }
 
@@ -3107,6 +3206,8 @@
   }
 
   // --- Send Message ---
+  // 不变量：空文本+无附件、生成中、会话加载阻塞时立即返回。
+  // /goal 在此走普通消息路径，由服务端 handleMessage 识别。
   function sendMessage() {
     const text = msgInput.value.trim();
     if ((!text && pendingAttachments.length === 0) || isGenerating || isBlockingSessionLoad()) return;
@@ -3196,12 +3297,6 @@
     if (!pw) return;
     loginError.hidden = true;
     loginPasswordValue = pw;
-    // Remember password
-    if (rememberPw.checked) {
-      localStorage.setItem('cc-web-pw', pw);
-    } else {
-      localStorage.removeItem('cc-web-pw');
-    }
     send({ type: 'auth', password: pw });
     // Request notification permission on first user interaction
     requestNotificationPermission();
@@ -4541,7 +4636,7 @@
       submitBtn.disabled = true;
       statusEl.textContent = '正在修改...';
       statusEl.className = 'fc-status';
-      send({ type: 'change_password', currentPassword: loginPasswordValue || localStorage.getItem('cc-web-pw') || '', newPassword: newPw });
+      send({ type: 'change_password', currentPassword: loginPasswordValue, newPassword: newPw });
     });
 
     newPwInput.focus();
@@ -4575,16 +4670,14 @@
       // Update token
       authToken = msg.token;
       localStorage.setItem('cc-web-token', msg.token);
-      // Update remembered password
-      if (localStorage.getItem('cc-web-pw')) {
-        // Clear old remembered password since it's changed
-        localStorage.removeItem('cc-web-pw');
-      }
+      // 清理旧版可能残留的明文密码缓存
+      localStorage.removeItem('cc-web-pw');
 
       // If force-change overlay is open, close it and load sessions
       const fcOverlay = document.getElementById('force-change-overlay');
       if (fcOverlay) {
         hideForceChangePassword();
+        hasInitialAuthCompleted = true;  // 强制改密完成后视为已完成首次 auth（之前的 auth 因 mustChange=true 没有触发）
         syncViewForAgent(currentAgent, { preserveCurrent: false, loadLast: true });
         showToast('密码修改成功');
       }
@@ -5104,12 +5197,8 @@
     navigator.serviceWorker.register('/sw.js').catch(() => {});
   }
 
-  // Restore remembered password
-  const savedPw = localStorage.getItem('cc-web-pw');
-  if (savedPw) {
-    loginPassword.value = savedPw;
-    rememberPw.checked = true;
-  }
+  // 清理旧版密码缓存（已不再持久化明文密码）
+  localStorage.removeItem('cc-web-pw');
 
   // Visibility change: re-sync state when user returns to tab (critical for mobile)
   document.addEventListener('visibilitychange', () => {

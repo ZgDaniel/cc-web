@@ -1,5 +1,32 @@
 # 更新记录
 
+## v1.4.0
+
+### 安全加固（5 大目标）
+
+- **鉴权系统现代化**：密码改 scrypt 哈希（`N=16384 r=8 p=1`）+ 16 字节随机 salt；token 改 sha256 指纹存储（绝不落盘原始值），新增 24h 滑动续期 + 7 天绝对过期；改密走 `revokeAllTokens` 原子封装（先空 `tokens.json` → 再写 hash → 签新 token），任意点崩溃都不会出现「密码已改但旧 token 仍可用」
+- **改密踢下线**：A 标签页改密后，B 标签页等所有其他已认证 WS 连接立即被关闭（前置 `_ccwebAuthed=false` 防 close race），旧 token 失效，旧 WS 重连时被踢回登录页
+- **聊天内容 XSS 纵深防御**：marked 解析 → **DOMPurify sanitize**（fail-closed：未加载时降级 `<pre>escape</pre>`）→ decorateCodeBlocks 用 DOM API 注入 Copy/Preview 受信任 UI；兜底为统一 CSP 响应头（禁止 `unsafe-inline`、`object-src 'none'`、仅允许 cdnjs CDN）
+- **客户端 IP 解析加固**：默认**完全不信任** `X-Forwarded-For`（防 XFF 伪造绕过 IP 封禁）；新增 `CC_WEB_TRUSTED_PROXIES` 环境变量，配置后启用「XFF 链 + socket，从右往左跳过可信代理」标准算法；非法 IP token 污染整条 XFF 链时整体丢弃回退 socket
+- **HTTP `/api/*` 前置封禁**：被封 IP 调用 API 直接返回 403，不消耗 token 验证算力
+- **长期健壮性**：所有 session / config 落盘改走 `atomicWriteJson`（tmp + rename），含密钥的 `dev.json` / `codex.json` / `notify.json` / `auth.json` / `tokens.json` 强制 `0600`；中断按钮改用 `kill(-pid)` 杀**整个进程组**，避免孙子进程变孤儿继续烧 token
+
+### 体验改进
+
+- **WS 重连不打断阅读**：前端 `hasInitialAuthCompleted` 区分「首次鉴权成功」与「重连鉴权成功」，重连不再触发会话列表/历史重载，保留用户当前滚动位置与正在浏览的旧消息
+
+### 文档
+
+- 新增 `docs/ARCHITECTURE.md` 「安全防御层」（8 层纵深防御表 + 兜底）与「前端渲染管线」（marked → DOMPurify → decorateCodeBlocks 流程图）
+- 新增 `docs/RUNTIME.md` 「原子写」「中断进程组」「WebSocket 重连与改密踢下线」三节
+- 新增 `docs/PROTOCOL.md` 「HTTP 响应头」「/api/* 前置封禁」「客户端 IP 解析」「鉴权握手细节」四节
+- 新增 `docs/CONFIG.md` 「客户端 IP 解析（防 X-Forwarded-For 伪造）」整节
+- 更新 `README.md` / `README.en.md`：Nginx 反代示例补 `X-Forwarded-For $remote_addr` 清洗行 + `CC_WEB_TRUSTED_PROXIES` 配置说明
+
+### 测试
+
+- `scripts/regression.js` 新增 7 项独立断言模块：改密原子失效集成、token 迁移单元、CSP + DOMPurify + 无内联 onclick、WS 重连不重渲染、原子写 + 进程组 kill + 旧 token 拒绝、XFF 纯函数 8 case、IP 封禁 trusted_proxies 场景
+
 ## v1.3.1
 
 ### 新增

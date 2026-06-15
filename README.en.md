@@ -221,12 +221,24 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
 
+        # Critical: scrub client-forged XFF (overwrite, not append)
+        # Otherwise attackers can inject forged entries into the XFF chain
+        proxy_set_header X-Forwarded-For $remote_addr;
+
         # Long-running tasks may take time
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }
 }
 ```
+
+**Behind a reverse proxy, you must declare the proxy as trusted.** CC-Web defaults to ignoring `X-Forwarded-For` entirely and uses the raw socket remote address (this prevents XFF spoofing from bypassing IP bans). Once you put Nginx in front, every request appears to come from `127.0.0.1`. You need to tell CC-Web to trust the proxy via `.env` or your systemd unit:
+
+```bash
+CC_WEB_TRUSTED_PROXIES="127.0.0.1,::1"
+```
+
+When the socket remote is on the trusted list, CC-Web walks the XFF chain from right to left, skips trusted proxies, and picks the first untrusted IP as the real client (used for IP-ban counters). See [docs/CONFIG.md](./docs/CONFIG.md) for details.
 
 ### Windows Deployment
 

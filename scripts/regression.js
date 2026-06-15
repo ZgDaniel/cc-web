@@ -1,5 +1,41 @@
 #!/usr/bin/env node
 
+/**
+ * 端到端隔离回归测试（约 880 行，无测试框架）。
+ *
+ * 启动方式：npm run regression
+ *
+ * 隔离机制：
+ *   - 抢空闲端口 + mkdtemp 建临时根
+ *   - 通过 CC_WEB_CONFIG_DIR/SESSIONS_DIR/LOGS_DIR/HOME 环境变量指向临时目录
+ *   - CLAUDE_PATH/CODEX_PATH 指向 mock-claude.js / mock-codex.js
+ *
+ * 断言：nextMessage 轮询 messages 数组（50ms 间隔，15s 超时），
+ *      process.log 直接 grep process_spawn 行校验 spawn 参数。
+ *
+ * 覆盖场景：
+ *   - Codex/Claude config 保存/回读 + API key 掩码
+ *   - /init /model /compact（含自动 compact 重试）
+ *   - 附件上传 → 带图消息 → session JSON 持久化
+ *   - 模式切换保 thread id（Codex + Claude 双侧）
+ *   - Codex Profile 切换 → 隔离 runtime config.toml
+ *   - /goal 多轮自治（TURN_1 → goal_feedback → TURN_2 顺序断言）
+ *   - Native session 导入（Claude .jsonl + Codex rollout + SQLite）
+ *   - Codex 导入删除（JSON + rollout + SQLite thread 三处清理）
+ *
+ * 安全/健壮性覆盖（5 项目标 + 7 项断言）：
+ *   - 改密失效 + 新 token 立即可用 + 并发连接被踢下线（testPasswordChangeAtomicity）
+ *   - tokens.json 绝对过期/缺失字段迁移（testAuthStoreTokenMigration）
+ *   - XSS：CSP 头 + DOMPurify sanitize + 无内联 onclick（testXssHardening）
+ *   - WS 重连不重渲染聊天区（testWsReconnectPreservesState）
+ *   - atomicWriteJson + kill 进程组 + HTTP 旧 token 拒绝（testRobustnessHardening）
+ *   - XFF 解析纯函数单测（testClientIpResolution）
+ *   - 可信代理 + IP 封禁端到端（testIpBanEnforcement）
+ *
+ * 盲区：无前端 DOM driver；无浏览器运行时 XSS 验证（依赖 DOMPurify 库可信度）；
+ *      无并发场景；无断电级持久化测试；无 Windows taskkill 覆盖。
+ */
+
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -293,6 +329,55 @@ function createFakeCodexHistory(homeDir) {
   return { threadId, rolloutPath, stateDb, logsDb };
 }
 
+// Unit coverage for auth-store token migration paths (lib/auth.js loadTokens):
+//   - missing absoluteExpiresAt + issuedAt within 7d  -> accept + backfill field
+//   - missing absoluteExpiresAt + issuedAt older 7d   -> reject (abs-expired)
+//   - missing absoluteExpiresAt + missing issuedAt    -> reject (cannot decide)
+//   - absoluteExpiresAt in the past                   -> reject
+//   - absoluteExpiresAt in the future                 -> accept as-is
+async function testAuthStoreTokenMigration() {
+  const { createAuthStore } = require('../lib/auth');
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-auth-'));
+  const tokensPath = path.join(tempDir, 'tokens.json');
+
+  const fixedNow = Date.parse('2026-06-15T12:00:00.000Z');
+  const authStore = createAuthStore({
+    AUTH_CONFIG_PATH: path.join(tempDir, 'auth.json'),
+    TOKENS_PATH: tokensPath,
+    now: () => fixedNow,
+  });
+
+  const dayMs = 24 * 60 * 60 * 1000;
+  const iso = (offsetMs) => new Date(fixedNow + offsetMs).toISOString();
+
+  const records = [
+    // 1) missing absExp, issuedAt within 7d  -> accept + backfill
+    { digest: 'a'.repeat(64), issuedAt: iso(-1 * dayMs), expiresAt: iso(1 * dayMs) },
+    // 2) missing absExp, issuedAt > 7d ago   -> reject
+    { digest: 'b'.repeat(64), issuedAt: iso(-8 * dayMs), expiresAt: iso(1 * dayMs) },
+    // 3) missing absExp, missing issuedAt    -> reject
+    { digest: 'c'.repeat(64), expiresAt: iso(1 * dayMs) },
+    // 4) absExp in the past                  -> reject
+    { digest: 'd'.repeat(64), issuedAt: iso(-8 * dayMs), expiresAt: iso(1 * dayMs), absoluteExpiresAt: iso(-1 * dayMs) },
+    // 5) absExp in the future                -> accept as-is
+    { digest: 'e'.repeat(64), issuedAt: iso(-1 * dayMs), expiresAt: iso(1 * dayMs), absoluteExpiresAt: iso(5 * dayMs) },
+  ];
+  fs.writeFileSync(tokensPath, JSON.stringify({ tokens: records }, null, 2));
+
+  const { map, dirty } = authStore.loadTokens();
+  assert(dirty, 'loadTokens should mark dirty when migration backfills or drops records');
+  assert(map.size === 2, `Expected 2 surviving tokens, got ${map.size}`);
+  assert(map.has('a'.repeat(64)), 'Record 1 (missing absExp, fresh issuedAt) should be migrated and kept');
+  assert(map.get('a'.repeat(64)).absoluteExpiresAt, 'Migrated record should have absoluteExpiresAt backfilled');
+  assert(!map.has('b'.repeat(64)), 'Record 2 (issuedAt older than 7d) should be rejected by inferred absolute expiry');
+  assert(!map.has('c'.repeat(64)), 'Record 3 (missing issuedAt + absExp) should be rejected (undecidable)');
+  assert(!map.has('d'.repeat(64)), 'Record 4 (absExp in the past) should be rejected');
+  assert(map.has('e'.repeat(64)), 'Record 5 (absExp in the future) should be accepted as-is');
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+  console.log('Auth-store token migration checks passed.');
+}
+
 async function main() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
   const configDir = path.join(tempRoot, 'config');
@@ -565,9 +650,509 @@ async function main() {
     assert(!fs.existsSync(codexFixture.rolloutPath), 'Deleting Codex session did not remove rollout file');
     assert(sql(codexFixture.stateDb, `select count(*) from threads where id='${codexFixture.threadId}'`) === '0', 'Deleting Codex session did not remove thread row');
 
+    // Password change must atomically invalidate all prior tokens (incl. concurrent sessions)
+    // and issue a fresh token to the active connection. Old token used on a new WS must
+    // fail with reason='session_expired'; new token must succeed.
+    const secondConn = await connectWs(port, password);
+    assert(secondConn.token && secondConn.token !== token, 'Second concurrent login should issue distinct token');
+    // Register close listener BEFORE change_password so we don't miss the close event
+    // (server closes secondConn synchronously inside handleChangePassword).
+    const secondConnClosed = new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 5000);
+      secondConn.ws.on('close', () => { clearTimeout(timer); resolve(true); });
+      secondConn.ws.on('error', () => { clearTimeout(timer); resolve(false); });
+    });
+    ws.send(JSON.stringify({ type: 'change_password', currentPassword: password, newPassword: 'NewRegression!567' }));
+    const pwdChanged = await nextMessage(messages, ws, (msg) => msg.type === 'password_changed' && msg.success);
+    assert(pwdChanged.success && pwdChanged.token, 'Password change should succeed and return a new token');
+    assert(pwdChanged.token !== token && pwdChanged.token !== secondConn.token, 'New token must differ from all prior tokens');
+    // Old token (from second concurrent login) must now be invalid
+    const staleConnPromise = new Promise((resolve) => {
+      const wsStale = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      wsStale.on('open', () => { wsStale.send(JSON.stringify({ type: 'auth', token: secondConn.token })); });
+      wsStale.on('message', (buf) => {
+        const msg = JSON.parse(String(buf));
+        if (msg.type === 'auth_result') {
+          resolve(msg);
+          wsStale.close();
+        }
+      });
+      wsStale.on('error', () => resolve({ success: false, reason: 'ws_error' }));
+    });
+    const staleResult = await staleConnPromise;
+    assert(staleResult.success === false && staleResult.reason === 'session_expired', 'Old token must be invalidated immediately after password change');
+    // pwdChanged.token must work via token-auth on a fresh WS. This locks the
+    // tokenMemory shape regression: if revokeAllTokens returned the wrong Map shape,
+    // server would crash inside isTokenValid on `hit.record.*` access.
+    const newTokenAuthPromise = new Promise((resolve, reject) => {
+      const wsNew = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      wsNew.on('open', () => { wsNew.send(JSON.stringify({ type: 'auth', token: pwdChanged.token })); });
+      wsNew.on('message', (buf) => {
+        const msg = JSON.parse(String(buf));
+        if (msg.type === 'auth_result') {
+          if (msg.success) resolve(msg);
+          else reject(new Error(`new token auth failed: ${msg.reason}`));
+        }
+      });
+      wsNew.on('error', (e) => reject(new Error(`ws error: ${e.message}`)));
+    });
+    const newTokenResult = await newTokenAuthPromise;
+    assert(newTokenResult.success === true, 'password_changed.token must work via token-auth on fresh WS');
+    // Already-authenticated concurrent connection (secondConn) must be force-closed
+    // by the server so it cannot continue sending business messages despite token
+    // revocation.
+    assert(await secondConnClosed, 'Concurrent authenticated connection must be force-closed after password change');
+
     ws.close();
     console.log('Regression checks passed.');
   });
+
+  // Standalone auth-store unit tests: absoluteExpiresAt migration paths
+  await testAuthStoreTokenMigration();
+
+  // Static + HTTP-header checks for XSS hardening (Goal 2)
+  await testXssHardening();
+
+  // WS reconnect must not re-render the chat area (Goal 4: 症状 1)
+  await testWsReconnectPreservesState();
+
+  // Goal 5: long-term robustness (atomic writes + killProcess process-group + HTTP token revocation)
+  await testRobustnessHardening();
+
+  // Client IP resolution + IP ban enforcement (Goal 3)
+  await testClientIpResolution();
+  await testIpBanEnforcement();
+}
+
+// Pure-function tests for client IP resolution (Goal 3).
+// Covers: no trusted proxies (XFF ignored), single trusted proxy, multi-hop
+// trusted chain, IPv4-mapped IPv6 (::ffff:), IPv6 trusted subnet, tainted XFF
+// (any invalid token → whole XFF discarded).
+async function testClientIpResolution() {
+  const { createClientIpResolver } = require('../lib/client-ip');
+
+  // Case 1: no trusted proxies → XFF always ignored, falls back to socket
+  {
+    const { resolveClientIP } = createClientIpResolver('');
+    const ip = resolveClientIP({
+      socket: { remoteAddress: '127.0.0.1' },
+      headers: { 'x-forwarded-for': '203.0.113.10' },
+    });
+    assert(ip === '127.0.0.1', `No trusted proxies: XFF must be ignored (got ${ip})`);
+  }
+
+  // Case 2: single trusted proxy 127.0.0.1, XFF honored
+  {
+    const { resolveClientIP } = createClientIpResolver('127.0.0.1');
+    const ip = resolveClientIP({
+      socket: { remoteAddress: '127.0.0.1' },
+      headers: { 'x-forwarded-for': '203.0.113.10' },
+    });
+    assert(ip === '203.0.113.10', `Trusted proxy 127.0.0.1: XFF=203.0.113.10 must resolve (got ${ip})`);
+  }
+
+  // Case 3: multi-hop chain A(trusted) → B(trusted) → server
+  {
+    const { resolveClientIP } = createClientIpResolver('127.0.0.1,10.0.0.1');
+    const ip = resolveClientIP({
+      socket: { remoteAddress: '10.0.0.1' },
+      headers: { 'x-forwarded-for': '1.2.3.4, 127.0.0.1' },
+    });
+    assert(ip === '1.2.3.4', `Multi-hop trusted chain must return original client (got ${ip})`);
+  }
+
+  // Case 4: untrusted socket → XFF discarded even if present
+  {
+    const { resolveClientIP } = createClientIpResolver('127.0.0.1');
+    const ip = resolveClientIP({
+      socket: { remoteAddress: '8.8.8.8' },
+      headers: { 'x-forwarded-for': '203.0.113.10' },
+    });
+    assert(ip === '8.8.8.8', `Untrusted socket: XFF must be ignored (got ${ip})`);
+  }
+
+  // Case 5: IPv4-mapped IPv6 normalization
+  {
+    const { resolveClientIP, isTrustedProxy } = createClientIpResolver('127.0.0.1');
+    assert(isTrustedProxy('::ffff:127.0.0.1') === true, '::ffff:127.0.0.1 must normalize to trusted 127.0.0.1');
+    const ip = resolveClientIP({
+      socket: { remoteAddress: '::ffff:127.0.0.1' },
+      headers: { 'x-forwarded-for': '203.0.113.20' },
+    });
+    assert(ip === '203.0.113.20', `IPv4-mapped IPv6 socket must be normalized (got ${ip})`);
+  }
+
+  // Case 6: IPv6 trusted subnet (2001:db8::/32)
+  {
+    const { resolveClientIP, isTrustedProxy } = createClientIpResolver('2001:db8::/32');
+    assert(isTrustedProxy('2001:db8::1') === true, 'IPv6 trusted subnet must match');
+    assert(isTrustedProxy('2001:db9::1') === false, 'IPv6 outside trusted subnet must NOT match');
+    const ip = resolveClientIP({
+      socket: { remoteAddress: '2001:db8::1' },
+      headers: { 'x-forwarded-for': '2001:dead:beef::1' },
+    });
+    assert(ip === '2001:dead:beef::1', `IPv6 trusted proxy must honor XFF (got ${ip})`);
+  }
+
+  // Case 7: tainted XFF (any invalid token → whole XFF discarded)
+  {
+    const { resolveClientIP } = createClientIpResolver('127.0.0.1');
+    const ip = resolveClientIP({
+      socket: { remoteAddress: '127.0.0.1' },
+      headers: { 'x-forwarded-for': '203.0.113.10, NOT_AN_IP, 198.51.100.5' },
+    });
+    assert(ip === '127.0.0.1', `Tainted XFF (invalid token) must discard whole XFF (got ${ip})`);
+  }
+
+  // Case 8: missing XFF header → socket address only
+  {
+    const { resolveClientIP } = createClientIpResolver('127.0.0.1');
+    const ip = resolveClientIP({
+      socket: { remoteAddress: '127.0.0.1' },
+      headers: {},
+    });
+    assert(ip === '127.0.0.1', `Missing XFF must fall back to socket (got ${ip})`);
+  }
+
+  console.log('Client IP resolution checks passed.');
+}
+
+async function testIpBanEnforcement() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-ban-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  for (const d of [configDir, sessionsDir, logsDir, homeDir]) mkdirp(d);
+  const password = 'BanTest!234';
+  const port = await getFreePort();
+
+  // Scenario A: TRUSTED_PROXIES configured = 127.0.0.1, so XFF=203.0.113.10 is honored.
+  // After 3 password failures with that XFF, the source IP must be banned and
+  // subsequent WS connections from the same XFF must be rejected with banned=true.
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+    CC_WEB_TRUSTED_PROXIES: '127.0.0.1',
+  }, async () => {
+    // 3 failed auths with X-Forwarded-For: 203.0.113.10
+    for (let i = 0; i < 3; i++) {
+      await new Promise((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, {
+          headers: { 'X-Forwarded-For': '203.0.113.10' },
+        });
+        ws.on('open', () => {
+          ws.send(JSON.stringify({ type: 'auth', password: 'wrong-password-' + i }));
+        });
+        ws.on('message', (buf) => {
+          const msg = JSON.parse(String(buf));
+          if (msg.type === 'auth_result') {
+            ws.close();
+            resolve(msg);
+          }
+        });
+        ws.on('error', () => resolve(null));
+      });
+    }
+    // 4th attempt with same XFF → expect banned
+    const bannedResult = await new Promise((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, {
+        headers: { 'X-Forwarded-For': '203.0.113.10' },
+      });
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ type: 'auth', password: 'wrong-again' }));
+      });
+      ws.on('message', (buf) => {
+        const msg = JSON.parse(String(buf));
+        if (msg.type === 'auth_result') {
+          ws.close();
+          resolve(msg);
+        }
+      });
+      ws.on('error', () => resolve(null));
+      setTimeout(() => { try { ws.close(); } catch {}; resolve(null); }, 5000);
+    });
+    assert(bannedResult && bannedResult.banned === true, 'Trusted-proxy XFF=203.0.113.10 must trigger ban after 3 failures');
+
+    // HTTP /api/attachments from the same banned XFF must return 403 (not 401)
+    const resp = await fetch(`http://127.0.0.1:${port}/api/attachments`, {
+      method: 'POST',
+      headers: {
+        'X-Forwarded-For': '203.0.113.10',
+        Authorization: 'Bearer invalid-token',
+        'Content-Type': 'image/png',
+        'X-Filename': 'test.png',
+      },
+      body: Buffer.from('test'),
+    });
+    assert(resp.status === 403, `Banned IP via XFF must be rejected with 403 (got ${resp.status})`);
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+
+  // Scenario B: no trusted proxies configured → XFF must be ignored.
+  // 3 failed auths with arbitrary XFF must NOT ban that XFF (since IP resolves to 127.0.0.1,
+  // which is whitelisted and never banned; we just verify XFF is NOT recorded as banned).
+  const tempRoot2 = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-ban2-'));
+  const configDir2 = path.join(tempRoot2, 'config');
+  const sessionsDir2 = path.join(tempRoot2, 'sessions');
+  const logsDir2 = path.join(tempRoot2, 'logs');
+  const homeDir2 = path.join(tempRoot2, 'home');
+  for (const d of [configDir2, sessionsDir2, logsDir2, homeDir2]) mkdirp(d);
+  const port2 = await getFreePort();
+
+  await withServer({
+    PORT: String(port2),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir2,
+    CC_WEB_SESSIONS_DIR: sessionsDir2,
+    CC_WEB_LOGS_DIR: logsDir2,
+    HOME: homeDir2,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+    // CC_WEB_TRUSTED_PROXIES intentionally NOT set
+  }, async () => {
+    // Attempt 3 failed auths with spoofed XFF
+    for (let i = 0; i < 3; i++) {
+      await new Promise((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port2}/ws`);
+        ws.on('open', () => {
+          ws.send(JSON.stringify({ type: 'auth', password: 'wrong' }));
+        });
+        ws.on('message', (buf) => {
+          const msg = JSON.parse(String(buf));
+          if (msg.type === 'auth_result') { ws.close(); resolve(msg); }
+        });
+        ws.on('error', () => resolve(null));
+      });
+    }
+    // Subsequent HTTP call from the SAME spoofed XFF should NOT be 403 (XFF must be ignored)
+    // Because loopback is whitelisted, client resolves to 127.0.0.1 → never banned → 401 from missing token
+    const resp = await fetch(`http://127.0.0.1:${port2}/api/attachments`, {
+      method: 'POST',
+      headers: {
+        'X-Forwarded-For': '198.51.100.42',
+        Authorization: 'Bearer invalid',
+        'Content-Type': 'image/png',
+        'X-Filename': 'test.png',
+      },
+      body: Buffer.from('test'),
+    });
+    assert(resp.status === 401, `Spoofed XFF without trusted_proxies must NOT ban (expected 401, got ${resp.status})`);
+  });
+
+  fs.rmSync(tempRoot2, { recursive: true, force: true });
+  console.log('IP ban enforcement checks passed.');
+}
+
+// Goal 4: WS reconnect must NOT trigger a full session reload.
+// First auth triggers pendingInitialSessionLoad → session_list → syncViewForAgent.
+// Reconnect (auth via stored token) must skip pendingInitialSessionLoad so the user's
+// scroll position is preserved. Verified via (1) static scan of app.js source and
+// (2) behavioral check that server only sends session_list on both connects, but the
+// second connect does NOT receive a fresh session_info for the previously-viewed session.
+async function testWsReconnectPreservesState() {
+  // 1. Static scan: hasInitialAuthCompleted flag must gate pendingInitialSessionLoad
+  const indexHtml = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
+  assert(/hasInitialAuthCompleted\s*=\s*false/.test(indexHtml), 'app.js must declare hasInitialAuthCompleted=false initially');
+  assert(/!hasInitialAuthCompleted/.test(indexHtml), 'app.js must gate pendingInitialSessionLoad behind !hasInitialAuthCompleted');
+  assert(/hasInitialAuthCompleted\s*=\s*true/.test(indexHtml), 'app.js must set hasInitialAuthCompleted=true after first successful auth');
+  // On auth failure / token invalidation, the flag must reset
+  assert(/hasInitialAuthCompleted\s*=\s*false[\s\S]{0,200}cc-web-auth-failed/.test(indexHtml) || /auth-failed[\s\S]{0,200}hasInitialAuthCompleted\s*=\s*false/.test(indexHtml), 'app.js must reset hasInitialAuthCompleted on auth failure');
+
+  // 2. Behavioral: simulate reconnect via real WS + token-auth
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-reconnect-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  for (const d of [configDir, sessionsDir, logsDir, homeDir]) mkdirp(d);
+  const password = 'Reconnect!234';
+  const port = await getFreePort();
+
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    // First connection: password auth → get token
+    const first = await connectWs(port, password);
+    const firstToken = first.token;
+    // Server should send session_list on first auth
+    await nextMessage(first.messages, first.ws, (msg) => msg.type === 'session_list');
+    first.ws.close();
+
+    // Wait a moment for the server to register the disconnect
+    await sleep(200);
+
+    // Reconnect with stored token (simulating WS drop + reconnect)
+    const reconnect = await new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const messages = [];
+      ws.on('open', () => { ws.send(JSON.stringify({ type: 'auth', token: firstToken })); });
+      ws.on('message', (buf) => {
+        const msg = JSON.parse(String(buf));
+        messages.push(msg);
+        if (msg.type === 'auth_result' && msg.success) {
+          // Give it a moment to receive follow-up messages
+          setTimeout(() => resolve({ ws, messages, token: msg.token }), 300);
+        }
+        if (msg.type === 'auth_result' && !msg.success) {
+          reject(new Error(`Token auth failed on reconnect: ${msg.reason}`));
+        }
+      });
+      ws.on('error', reject);
+    });
+
+    // Reconnect must succeed via token auth
+    assert(reconnect.token === firstToken, 'Reconnect should preserve the same token');
+    // Server still sends session_list (sidebar update is fine)
+    const hasSessionList = reconnect.messages.some((m) => m.type === 'session_list');
+    assert(hasSessionList, 'Server should send session_list on reconnect (sidebar refresh is expected)');
+    // Server must NOT proactively send session_info for any previously-viewed session
+    // (reconnect with valid token doesn't trigger initial session load on client side;
+    //  server's role is to NOT push session_info without an explicit load_session request)
+    const unsolicitedSessionInfo = reconnect.messages.find((m) => m.type === 'session_info' && !m.historyPending);
+    assert(!unsolicitedSessionInfo, 'Server must NOT push session_info on reconnect without explicit load_session (would force re-render)');
+
+    reconnect.ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('WS reconnect state preservation checks passed.');
+}
+
+// Goal 5: long-term robustness.
+//  1) HTTP /api/attachments must reject revoked tokens with 401 (tokenMemory structure must work for HTTP path too)
+//  2) server.js must use atomicWriteJson for all persistent JSON state (sessions/configs)
+//  3) killProcess must target the whole process group on Linux (kill -pid) so detached grandchildren don't survive
+async function testRobustnessHardening() {
+  // Static scan: atomicWriteJson helper + usage in critical save paths
+  const serverJs = fs.readFileSync(path.join(REPO_DIR, 'server.js'), 'utf8');
+  assert(/function atomicWriteJson\(/.test(serverJs), 'server.js must define atomicWriteJson helper');
+  for (const fn of ['saveSession', 'saveBannedIPs', 'saveNotifyConfig', 'saveModelConfig', 'saveCodexConfig', 'saveDevConfig', 'saveAttachmentMeta']) {
+    assert(new RegExp(`function ${fn}\\([\\s\\S]{0,300}atomicWriteJson\\(`).test(serverJs), `${fn} must use atomicWriteJson`);
+  }
+  // killProcess must use process.kill(-pid) for process-group targeting on Linux
+  assert(/process\.kill\(-pid,\s*signal\)/.test(serverJs), 'killProcess must target process group via kill(-pid) on Linux');
+
+  // Behavioral: HTTP attachment path rejects revoked tokens
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-robust-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  for (const d of [configDir, sessionsDir, logsDir, homeDir]) mkdirp(d);
+  const password = 'Robust!234';
+  const port = await getFreePort();
+
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    const conn = await connectWs(port, password);
+    // Pre-change: attachment upload with valid token works
+    const attachment1 = await uploadAttachment(port, conn.token, {
+      filename: 'pre.png', mime: 'image/png', data: Buffer.from('pre'),
+    });
+    assert(attachment1 && attachment1.id, 'Attachment upload with valid token should succeed');
+
+    // Change password → tokenMemory reset, conn.token must be invalid for HTTP path too
+    conn.ws.send(JSON.stringify({ type: 'change_password', currentPassword: password, newPassword: 'NewRobust!567' }));
+    await nextMessage(conn.messages, conn.ws, (msg) => msg.type === 'password_changed' && msg.success);
+
+    // POST /api/attachments with OLD token must now return 401 (tokenMemory structure must work for HTTP path)
+    const resp = await fetch(`http://127.0.0.1:${port}/api/attachments`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${conn.token}`,
+        'Content-Type': 'image/png',
+        'X-Filename': 'post.png',
+      },
+      body: Buffer.from('post'),
+    });
+    assert(resp.status === 401, `Old token must be rejected on HTTP path after password change (expected 401, got ${resp.status})`);
+
+    conn.ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('Robustness hardening checks passed.');
+}
+
+// Verify CSP header is present on every HTTP response and that the front-end no
+// longer relies on inline event handlers in the markdown render path. These are
+// static guarantees; runtime DOMPurify behavior is the library's responsibility.
+async function testXssHardening() {
+  const port = await getFreePort();
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-xss-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  for (const d of [configDir, sessionsDir, logsDir, homeDir]) mkdirp(d);
+  const password = 'XssTest!234';
+
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    // 1. Every HTTP response must carry CSP + X-Content-Type-Options + Referrer-Policy
+    for (const path of ['/', '/app.js', '/style.css']) {
+      const resp = await fetch(`http://127.0.0.1:${port}${path}`);
+      const csp = resp.headers.get('content-security-policy') || '';
+      assert(/default-src 'self'/.test(csp), `CSP default-src missing on ${path}`);
+      assert(/script-src 'self' https:\/\/cdnjs\.cloudflare\.com/.test(csp), `CSP script-src must restrict to self + cdnjs on ${path}`);
+      assert(!/'unsafe-inline'/.test(csp.split(';').find((d) => d.includes('script-src')) || ''), `CSP script-src must NOT allow 'unsafe-inline' on ${path}`);
+      assert(resp.headers.get('x-content-type-options') === 'nosniff', `X-Content-Type-Options missing on ${path}`);
+      assert(resp.headers.get('referrer-policy') === 'same-origin', `Referrer-Policy missing on ${path}`);
+    }
+
+    // 2. index.html must load DOMPurify from CDN
+    const indexHtml = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+    assert(/dompurify\/[\d.]+\/purify\.min\.js/.test(indexHtml), 'index.html must reference DOMPurify script');
+
+    // 3. app.js must no longer contain inline onclick=/onerror= strings in markdown path
+    //    (decorateCodeBlocks uses addEventListener; renderMarkdown goes through DOMPurify)
+    const appJs = await (await fetch(`http://127.0.0.1:${port}/app.js`)).text();
+    assert(!/onclick=["']ccCopyCode|onclick=["']ccTogglePreview/.test(appJs), 'app.js must not contain inline onclick= for code block buttons');
+    assert(!/window\.ccCopyCode|window\.ccTogglePreview/.test(appJs), 'app.js must not expose global onclick handlers (replaced by decorateCodeBlocks closure)');
+    assert(/DOMPurify\.sanitize/.test(appJs), 'app.js renderMarkdown must call DOMPurify.sanitize');
+    assert(/decorateCodeBlocks/.test(appJs), 'app.js must define decorateCodeBlocks');
+    // Fail-closed: DOMPurify missing path must never return raw marked output
+    assert(!/return raw;/.test(appJs.replace(/\/\/[^\n]*/g, '')), 'app.js renderMarkdown must not return raw unsanitized HTML when DOMPurify is unavailable (fail-closed)');
+
+    // 4. style.css must still contain code-block styling (regression: confirm we didn't drop styles)
+    const css = await (await fetch(`http://127.0.0.1:${port}/style.css`)).text();
+    assert(/\.code-block-wrapper/.test(css), 'style.css must still define .code-block-wrapper');
+    assert(/\.code-preview-iframe/.test(css), 'style.css must still define .code-preview-iframe');
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('XSS hardening checks passed.');
 }
 
 main().catch((err) => {

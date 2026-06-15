@@ -429,22 +429,6 @@ body {
   transition: background 0.2s;
 }
 .login-box button:hover { background: var(--accent-hover); }
-.remember-label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--text-secondary);
-  margin-bottom: 12px;
-  cursor: pointer;
-  user-select: none;
-}
-.remember-label input[type="checkbox"] {
-  width: 16px;
-  height: 16px;
-  accent-color: var(--accent);
-  cursor: pointer;
-}
 .login-error {
   color: var(--danger);
   margin-top: 12px;

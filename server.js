@@ -1,11 +1,38 @@
+/**
+ * cc-web 服务端主应用（约 3965 行）。
+ *
+ * 浏览器 UI → 本地 Claude Code / Codex CLI 会话的网关。文件级持久化（无 DB），
+ * Claude/Codex detached 子进程 + JSONL tail 推回前端。
+ *
+ * 顶层组织（按行号近似）：
+ *   1-44      模块导入 + 路径常量
+ *   46-373    plog 工厂 + 通知系统（pushplus/telegram/serverchan/feishu/qqbot + AI 摘要）
+ *   375-539   鉴权 + IP 封禁 + 白名单
+ *   540-552   运行时 Map：pendingSlashCommands / pendingCompactRetries /
+ *             activeProcesses / wsSessionMap
+ *   553-1046  模型模板 / Codex runtime / Dev 配置 / Claude settings 同步
+ *   1062-1196 附件系统 + TTL 清理 + wsSend
+ *   1198-1311 normalizeSession / loadSession / saveSession
+ *   1313-1799 进程生命周期：FileTailer / handleProcessComplete / recoverProcesses
+ *   1801-1911 HTTP（仅 3 个端点：附件上传/删除/静态）
+ *   1914-2076 WS 握手 + 客户端消息 switch（30 个 type）
+ *   2078-3760 WS handler 函数群（handleSlashCommand 2444 / handleMessage 3024 等）
+ *   3762-3854 shutdown / killPortOccupant / listen
+ *
+ * 详细架构、运行时模型、契约、配置见 docs/。
+ */
+
 const http = require('http');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { createAgentRuntime } = require('./lib/agent-runtime');
+const { createAuthStore } = require('./lib/auth');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
+const { createClientIpResolver } = require('./lib/client-ip');
 
 // Load .env
 const envPath = path.join(__dirname, '.env');
@@ -30,6 +57,7 @@ const MAX_MESSAGE_ATTACHMENTS = 4;
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
 const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
+const TOKENS_PATH = path.join(CONFIG_DIR, 'tokens.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
 const BANNED_IPS_PATH = path.join(CONFIG_DIR, 'banned_ips.json');
@@ -43,6 +71,16 @@ fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
 const LOG_FILE = path.join(LOGS_DIR, 'process.log');
 const LOG_MAX_SIZE = 2 * 1024 * 1024; // 2MB per file
 
+/**
+ * 进程生命周期日志写入器。JSONL 格式，自动轮转（>2MB 重命名为 .old.log）。
+ *
+ * 事件类型：process_spawn / process_complete / ws_connect / ws_disconnect /
+ * recovery_alive / recovery_dead / heartbeat（活跃进程每 60s 一次）。
+ *
+ * @param {'INFO'|'WARN'|'ERROR'} level
+ * @param {string} event - 事件名（如 'process_spawn'）
+ * @param {object} [data={}] - 事件数据
+ */
 function plog(level, event, data = {}) {
   const entry = {
     ts: new Date().toISOString(),
@@ -100,7 +138,8 @@ function loadNotifyConfig() {
 }
 
 function saveNotifyConfig(config) {
-  fs.writeFileSync(NOTIFY_CONFIG_PATH, JSON.stringify(config, null, 2));
+  // notify.json 可能含推送通道 token（pushplus/telegram/serverchan/feishu/qq），强制 0600
+  atomicWriteJson(NOTIFY_CONFIG_PATH, JSON.stringify(config, null, 2), 0o600);
 }
 
 function maskToken(str) {
@@ -382,36 +421,57 @@ function generateRandomPassword(length = 12) {
   return result;
 }
 
+const authStore = createAuthStore({ AUTH_CONFIG_PATH, TOKENS_PATH });
+
+function saveAuthConfigAtomic(config) {
+  // 原子写 auth.json（tmp + fsync + rename, 0600）
+  const tmp = AUTH_CONFIG_PATH + '.tmp.' + process.pid + '.' + crypto.randomBytes(4).toString('hex');
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
+  try {
+    const fd = fs.openSync(tmp, 'r');
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  } catch {}
+  fs.renameSync(tmp, AUTH_CONFIG_PATH);
+  try { fs.chmodSync(AUTH_CONFIG_PATH, 0o600); } catch {}
+}
+
 function loadAuthConfig() {
-  // Priority 1: config/auth.json exists with password
+  // Priority 1: config/auth.json exists
   try {
     if (fs.existsSync(AUTH_CONFIG_PATH)) {
-      const config = JSON.parse(fs.readFileSync(AUTH_CONFIG_PATH, 'utf8'));
-      if (config.password) return config;
+      const raw = JSON.parse(fs.readFileSync(AUTH_CONFIG_PATH, 'utf8'));
+      // 新 schema（alg=scrypt）：直接用
+      if (raw && raw.alg === 'scrypt' && raw.hash) return raw;
+      // 旧 schema（含明文 password）：自动迁移为哈希
+      const migrated = authStore.migrateFromPlaintext(raw);
+      if (migrated) {
+        migrated.mustChange = !!raw.mustChange;
+        saveAuthConfigAtomic(migrated);
+        plog('INFO', 'auth_migrated', { from: 'plaintext', to: 'scrypt' });
+        return migrated;
+      }
     }
-  } catch {}
+  } catch (e) {
+    plog('WARN', 'auth_load_failed', { error: String(e && e.message) });
+  }
 
   // Priority 2: .env has CC_WEB_PASSWORD → migrate
   const envPw = process.env.CC_WEB_PASSWORD;
   if (envPw && envPw !== 'changeme') {
-    const config = { password: envPw, mustChange: false };
-    saveAuthConfig(config);
+    const config = { ...authStore.hashPassword(envPw), mustChange: false, version: 2 };
+    saveAuthConfigAtomic(config);
     return config;
   }
 
   // Priority 3: Generate random password
   const pw = generateRandomPassword(12);
-  const config = { password: pw, mustChange: true };
-  saveAuthConfig(config);
+  const config = { ...authStore.hashPassword(pw), mustChange: true, version: 2 };
+  saveAuthConfigAtomic(config);
   console.log('========================================');
   console.log('  自动生成初始密码: ' + pw);
   console.log('  首次登录后将要求修改密码');
   console.log('========================================');
   return config;
-}
-
-function saveAuthConfig(config) {
-  fs.writeFileSync(AUTH_CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
 function validatePasswordStrength(pw) {
@@ -430,36 +490,85 @@ function validatePasswordStrength(pw) {
 }
 
 let authConfig = null;
-let PASSWORD = '';
 
 function ensureAuthLoaded() {
   if (!authConfig) {
     authConfig = loadAuthConfig();
-    PASSWORD = authConfig.password;
+    // 启动时加载持久化 token（清过期）
+    const { map, dirty } = authStore.loadTokens();
+    // 转换为统一内存结构：digest -> { record, lastActive }
+    tokenMemory = new Map();
+    for (const [digest, rec] of map) {
+      tokenMemory.set(digest, { record: rec, lastActive: Date.now() });
+    }
+    if (dirty) persistTokens();
   }
   return authConfig;
 }
 
-const activeTokens = new Map(); // token -> lastActive timestamp
+// 活跃 token：digest（sha256）-> { record, lastActive }
+// record 含 issuedAt/expiresAt，lastActive 用于内存活跃续期
+let tokenMemory = new Map();
+const TOKEN_TTL = authStore.TOKEN_TTL_MS;
 
-const TOKEN_TTL = 24 * 60 * 60 * 1000; // 24 hours
+function persistTokens() {
+  const records = Array.from(tokenMemory.values()).map((entry) => entry.record);
+  authStore.saveTokens(records);
+}
 
+// 校验 token：内存命中优先（续期 lastActive + expiresAt），否则算 digest 比对磁盘
 function isTokenValid(token) {
-  if (!token || !activeTokens.has(token)) return false;
+  if (!token || typeof token !== 'string') return false;
+  const digest = authStore.digestOf(token);
   const now = Date.now();
-  if (now - activeTokens.get(token) > TOKEN_TTL) {
-    activeTokens.delete(token);
-    return false;
+  const hit = tokenMemory.get(digest);
+  if (hit) {
+    // 绝对过期（7d）：拒绝，不滚动续期
+    const absExp = Date.parse(hit.record.absoluteExpiresAt || '');
+    if (Number.isFinite(absExp) && absExp < now) {
+      tokenMemory.delete(digest);
+      persistTokens();
+      return false;
+    }
+    const exp = Date.parse(hit.record.expiresAt || '');
+    if (Number.isFinite(exp) && exp < now) {
+      tokenMemory.delete(digest);
+      persistTokens();
+      return false;
+    }
+    // 续期：滚动 24h 活跃窗口（不动 absoluteExpiresAt）
+    hit.lastActive = now;
+    hit.record.expiresAt = new Date(now + TOKEN_TTL).toISOString();
+    return true;
   }
-  activeTokens.set(token, now);
+  // 磁盘兜底（服务重启后内存空，但 token 仍可能在有效期内）
+  const { map, dirty } = authStore.loadTokens();
+  if (dirty) {
+    // 重新写一次清理后的磁盘
+    const cleaned = Array.from(map.values());
+    authStore.saveTokens(cleaned);
+  }
+  const rec = map.get(digest);
+  if (!rec) return false;
+  const absExp = Date.parse(rec.absoluteExpiresAt || '');
+  if (Number.isFinite(absExp) && absExp < now) return false;
+  const exp = Date.parse(rec.expiresAt || '');
+  if (Number.isFinite(exp) && exp < now) return false;
+  tokenMemory.set(digest, { record: rec, lastActive: now });
   return true;
 }
 
 setInterval(() => {
   const now = Date.now();
-  for (const [token, ts] of activeTokens) {
-    if (now - ts > TOKEN_TTL) activeTokens.delete(token);
+  let changed = false;
+  for (const [digest, entry] of tokenMemory) {
+    const exp = Date.parse(entry.record.expiresAt || '');
+    if (Number.isFinite(exp) && exp < now) {
+      tokenMemory.delete(digest);
+      changed = true;
+    }
   }
+  if (changed) persistTokens();
 }, 6 * 60 * 60 * 1000).unref();
 
 // === Anti-brute-force ===
@@ -479,6 +588,16 @@ const EXTRA_WHITELIST_IPS = new Set(
     .filter(Boolean)
     .map(s => s.replace(/^::ffff:/, ''))
 );
+
+// 可信代理 CIDR/IP 列表（仅这些来源的 X-Forwarded-For 才被信任）：
+//   CC_WEB_TRUSTED_PROXIES="127.0.0.1,10.0.0.0/8,::1,2001:db8::/32"
+// 默认空 = 不信任任何 XFF（最严格，clientIP = socket.remoteAddress）
+// 文档必须强调：反向代理需主动清洗客户端伪造的 XFF 头
+// （Nginx: proxy_set_header X-Forwarded-For $remote_addr;）
+// 实现与单测见 lib/client-ip.js。
+const clientIpResolver = createClientIpResolver(process.env.CC_WEB_TRUSTED_PROXIES);
+const isTrustedProxy = clientIpResolver.isTrustedProxy;
+const resolveClientIP = clientIpResolver.resolveClientIP;
 
 function isWhitelistedIP(ip) {
   if (!ip) return false;
@@ -504,7 +623,7 @@ function loadBannedIPs() {
 }
 function saveBannedIPs() {
   const obj = Object.fromEntries(bannedIPs);
-  fs.writeFileSync(BANNED_IPS_PATH, JSON.stringify(obj, null, 2));
+  atomicWriteJson(BANNED_IPS_PATH, JSON.stringify(obj, null, 2));
 }
 loadBannedIPs();
 
@@ -667,7 +786,7 @@ function loadModelConfig() {
 }
 
 function saveModelConfig(config) {
-  fs.writeFileSync(MODEL_CONFIG_PATH, JSON.stringify(config, null, 2));
+  atomicWriteJson(MODEL_CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
 function loadCodexConfig() {
@@ -695,7 +814,7 @@ function loadCodexConfig() {
 }
 
 function saveCodexConfig(config) {
-  fs.writeFileSync(CODEX_CONFIG_PATH, JSON.stringify({
+  atomicWriteJson(CODEX_CONFIG_PATH, JSON.stringify({
     mode: config.mode === 'custom' ? 'custom' : 'local',
     activeProfile: config.activeProfile || '',
     profiles: Array.isArray(config.profiles) ? config.profiles.map((profile) => ({
@@ -706,7 +825,7 @@ function saveCodexConfig(config) {
       models: normalizeCodexModelList(profile?.models, profile?.model),
     })).filter((profile) => profile.name) : [],
     enableSearch: false,
-  }, null, 2));
+  }, null, 2), 0o600);
 }
 
 function getCodexConfigMasked() {
@@ -774,7 +893,7 @@ function loadDevConfig() {
 }
 
 function saveDevConfig(config) {
-  fs.writeFileSync(DEV_CONFIG_PATH, JSON.stringify(config, null, 2));
+  atomicWriteJson(DEV_CONFIG_PATH, JSON.stringify(config, null, 2), 0o600);
 }
 
 function getDevConfigMasked() {
@@ -1112,7 +1231,7 @@ function loadAttachmentMeta(id) {
 }
 
 function saveAttachmentMeta(meta) {
-  fs.writeFileSync(attachmentMetaPath(meta.id), JSON.stringify(meta, null, 2));
+  atomicWriteJson(attachmentMetaPath(meta.id), JSON.stringify(meta, null, 2));
 }
 
 function removeAttachmentById(id) {
@@ -1216,6 +1335,25 @@ function normalizeAgent(agent) {
   return VALID_AGENTS.has(agent) ? agent : 'claude';
 }
 
+/**
+ * 会话对象加载时归一化字段默认值（前向兼容）。
+ *
+ * **新增字段必须在此设默认值**，否则旧 session 加载时会是 undefined。
+ *
+ * 当前在此设默认值的字段：agent / claudeSessionId / codexThreadId /
+ * codexHomeDir / codexRuntimeKey / totalCost / totalUsage / taskMode /
+ * sshHostId / remoteCwd / messages。
+ *
+ * 注意：permissionMode / hasUnread / updated **不**在此设默认值：
+ *   - permissionMode 由 handleNewSession / handleMessage 创建时显式赋值（默认 'yolo'）
+ *   - hasUnread 由消息处理路径动态置位
+ *   - updated 由各业务路径写入
+ *
+ * 详见 docs/RUNTIME.md "Session 对象关键字段"。
+ *
+ * @param {object} session - 原始 session 对象
+ * @returns {object} 归一化后的 session（原地修改）
+ */
 function normalizeSession(session) {
   if (!session || typeof session !== 'object') return session;
   session.agent = normalizeAgent(session.agent);
@@ -1279,9 +1417,24 @@ function loadSession(id) {
   }
 }
 
+// 原子写 JSON（tmp + rename）：防止崩溃导致 JSON 文件半写状态损坏。
+// 不 fsync（session 数据非高敏感，重启丢失可接受；敏感数据如 tokens.json 由 auth.js 自己原子写）。
+// mode 可选：含密钥的配置（dev.json/codex.json）必须传 0o600 防止 umask 漏洞让同机用户读到。
+function atomicWriteJson(filePath, data, mode) {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  const tmp = path.join(dir, `.${base}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+  const writeOpts = mode != null ? { mode } : {};
+  fs.writeFileSync(tmp, data, writeOpts);
+  if (mode != null) {
+    try { fs.chmodSync(tmp, mode); } catch {}
+  }
+  fs.renameSync(tmp, filePath);
+}
+
 function saveSession(session) {
   normalizeSession(session);
-  fs.writeFileSync(sessionPath(session.id), JSON.stringify(session, null, 2));
+  atomicWriteJson(sessionPath(session.id), JSON.stringify(session, null, 2));
 }
 
 function modelShortName(fullModel) {
@@ -1322,13 +1475,22 @@ function isProcessRunning(pid) {
 }
 
 function killProcess(pid, force = false) {
+  if (!pid) return;
+  const signal = force ? 'SIGKILL' : 'SIGTERM';
   try {
     if (IS_WIN) {
+      // taskkill /T 递归杀整棵进程树
       const args = ['/T', '/PID', String(pid)];
       if (force) args.unshift('/F');
       spawn('taskkill', args, { windowsHide: true, stdio: 'ignore' });
     } else {
-      process.kill(pid, force ? 'SIGKILL' : 'SIGTERM');
+      // detached spawn 时子进程是 pgid leader，杀整个进程组（避免孙子进程成孤儿继续烧 token）
+      // 先尝试 -pid（进程组），失败回退到单 pid
+      try {
+        process.kill(-pid, signal);
+      } catch {
+        process.kill(pid, signal);
+      }
     }
   } catch {}
 }
@@ -1365,7 +1527,15 @@ function sendSessionList(ws) {
 }
 
 // === File Tailer ===
-// Tails a file and calls onLine for each new complete line.
+/**
+ * 增量 tail 文件，遇到完整行回调 onLine。
+ *
+ * 双保险机制：fs.watch() 监听 + 500ms 备份轮询。按字节偏移只读新内容，
+ * 缓冲半截 JSON 行直到 newline。
+ *
+ * 主要用途：tail sessions/<id>-run/output.jsonl 把 Claude/Codex 流式输出
+ * 推回前端。详见 docs/RUNTIME.md "FileTailer"。
+ */
 class FileTailer {
   constructor(filePath, onLine) {
     this.filePath = filePath;
@@ -1535,6 +1705,22 @@ function isContextLimitError(agent, raw) {
   return /context\s+(window|length)|maximum context length|context limit|token limit|too many tokens|input.*too long|prompt.*too long|request too large|please use\s*\/compact|use\s*\/compact|reduce (the )?(input|prompt|message)|exceed(?:ed|s).*(token|context)/i.test(text);
 }
 
+/**
+ * 子进程退出后的统一处理（约 193 行，server.js 最复杂的函数）。
+ *
+ * 职责混合：
+ *   1. 累计 cost / usage 到 session
+ *   2. 检测 context limit → 自动注入 /compact + 重放原 prompt（pendingCompactRetries）
+ *   3. 驱动 /goal 多轮自治（pendingSlashCommands）
+ *   4. 触发 background_done 通知（仅 WS 断开期间完成时）
+ *   5. 清理 activeProcesses Map
+ *
+ * 详见 docs/RUNTIME.md "Detached 进程生命周期" 与 "自动 compact 重试"。
+ *
+ * @param {string} sessionId
+ * @param {number} exitCode
+ * @param {string|null} signal
+ */
 function handleProcessComplete(sessionId, exitCode, signal) {
   const entry = activeProcesses.get(sessionId);
   if (!entry) return;
@@ -1728,7 +1914,15 @@ setInterval(() => {
 cleanupExpiredAttachments();
 setInterval(cleanupExpiredAttachments, 6 * 60 * 60 * 1000);
 
-// Recover processes that were running before server restart
+/**
+ * 启动时扫描所有残留 sessions/*-run/ 目录，恢复 detached 子进程。
+ *
+ * - PID 仍存活 → 重新 attach（继续 tail output.jsonl），plog recovery_alive
+ * - PID 已死 → finalize 输出到 session JSON，plog recovery_dead
+ *
+ * 关键含义：服务重启不会终止进行中的 Claude/Codex 工作。
+ * 详见 docs/RUNTIME.md "recoverProcesses"。
+ */
 function recoverProcesses() {
   try {
     const entries = fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('-run') && fs.statSync(path.join(SESSIONS_DIR, f)).isDirectory());
@@ -1798,8 +1992,27 @@ function recoverProcesses() {
 }
 
 // === HTTP Static File Server ===
+// CSP 头作为 XSS 纵深防御：renderMarkdown 已用 DOMPurify sanitize 用户/LLM 内容，
+// CSP 在 sanitize 失效或第三方库被污染时兜底拦截内联脚本执行。
+// - script-src 限 'self' + cdnjs.cloudflare.com（marked/highlight.js/DOMPurify CDN）
+// - style-src 加 'unsafe-inline'（marked/highlight.js 输出含 style 属性，应用自身也用内联 style）
+// - frame-src 'self' 允许 sandbox srcdoc iframe 预览
+const CSP_HEADER = "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'";
+
 const server = http.createServer((req, res) => {
+  res.setHeader('Content-Security-Policy', CSP_HEADER);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'same-origin');
   const url = new URL(req.url, `http://${req.headers.host}`);
+
+  // 统一 /api/* 前置封禁检查：IP 被封后任何 API 调用都直接 403
+  if (url.pathname.startsWith('/api/')) {
+    const ip = resolveClientIP(req);
+    if (ip && isBanned(ip)) {
+      plog('WARN', 'banned_ip_rejected_http', { ip, path: url.pathname });
+      return jsonResponse(res, 403, { ok: false, message: 'IP banned', banned: true });
+    }
+  }
 
   if (req.method === 'POST' && url.pathname === '/api/attachments') {
     const token = extractBearerToken(req);
@@ -1914,9 +2127,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
-  const forwarded = req.headers['x-forwarded-for'];
-  const clientIP = forwarded ? forwarded.split(',')[0].trim()
-    : req.socket?.remoteAddress || null;
+  const clientIP = resolveClientIP(req);
 
   // Check if IP is banned
   if (clientIP && isBanned(clientIP)) {
@@ -1948,25 +2159,51 @@ wss.on('connection', (ws, req) => {
         ws.close();
         return;
       }
-      const tokenValid = isTokenValid(msg.token);
-      if (msg.password === PASSWORD || tokenValid) {
-        authToken = tokenValid ? msg.token : crypto.randomBytes(32).toString('hex');
-        activeTokens.set(authToken, Date.now());
+      const tokenValid = msg.token ? isTokenValid(msg.token) : false;
+      const passwordProvided = typeof msg.password === 'string' && msg.password.length > 0;
+      const passwordOk = passwordProvided && authStore.verifyPassword(msg.password, authConfig);
+      if (passwordOk || tokenValid) {
+        // 命中即签发/复用 token：token 命中则复用原值（保持持久），否则签发新 token
+        let token;
+        if (tokenValid) {
+          token = msg.token;
+        } else {
+          const issued = authStore.issueToken();
+          token = issued.token;
+          tokenMemory.set(issued.digest, { record: issued, lastActive: Date.now() });
+          persistTokens();
+        }
+        authToken = token;
         authenticated = true;
+        ws._ccwebAuthed = true;
         wsSend(ws, { type: 'auth_result', success: true, token: authToken, mustChangePassword: !!authConfig.mustChange });
         sendSessionList(ws);
       } else {
-        const justBanned = recordAuthFailure(clientIP);
-        wsSend(ws, { type: 'auth_result', success: false, banned: justBanned });
+        // 失败原因细分：token 提供但无效 → session_expired；密码错 → invalid_password；兜底 auth_failed
+        let reason;
+        if (msg.token && !tokenValid) {
+          reason = 'session_expired';
+        } else if (passwordProvided) {
+          reason = 'invalid_password';
+        } else {
+          reason = 'auth_failed';
+        }
+        const justBanned = passwordProvided ? recordAuthFailure(clientIP) : false;
+        wsSend(ws, { type: 'auth_result', success: false, banned: justBanned, reason });
         if (justBanned) ws.close();
       }
       return;
     }
 
-    if (!authenticated) {
+    if (!authenticated || ws._ccwebAuthed === false) {
+      // _ccwebAuthed=false 拦截 close race：handleChangePassword 已标记 client 失效，
+      // 即使 close 前事件队列里还有业务消息，也拒绝处理
       return wsSend(ws, { type: 'error', message: 'Not authenticated' });
     }
 
+    // WS 客户端→服务端消息分发（auth 单独分支 + 30 个 switch case）。
+    // 完整清单与契约见 docs/PROTOCOL.md "客户端 → 服务端"。
+    // /goal 通过正则排除走 handleMessage 独立路径，详见 docs/RUNTIME.md "/goal 多轮自治"。
     switch (msg.type) {
       case 'message':
         if (msg.text && msg.text.trim().startsWith('/') && !/^\/goal(?:\s|$)/i.test(msg.text.trim())) {
@@ -2126,8 +2363,8 @@ function handleTestNotify(ws) {
 function handleChangePassword(ws, msg, currentToken) {
   const { currentPassword, newPassword } = msg;
 
-  // Validate current password
-  if (currentPassword !== PASSWORD) {
+  // Validate current password（用 verifyPassword 常量时间比较）
+  if (!authStore.verifyPassword(currentPassword || '', authConfig)) {
     return wsSend(ws, { type: 'password_changed', success: false, message: '当前密码错误' });
   }
 
@@ -2137,20 +2374,31 @@ function handleChangePassword(ws, msg, currentToken) {
     return wsSend(ws, { type: 'password_changed', success: false, message: strength.message });
   }
 
-  // Save new password
-  authConfig = { password: newPassword, mustChange: false };
-  saveAuthConfig(authConfig);
-  PASSWORD = newPassword;
+  // 原子封装（revokeAllTokens 内部顺序：先写空 tokens.json → 再写新 hash → 签新 token 落盘）
+  // 任意点崩溃都不会出现"密码已改但旧 token 仍可用"
+  const newHash = { ...authStore.hashPassword(newPassword), mustChange: false, version: 2 };
+  const { tokenMap, newToken } = authStore.revokeAllTokens({
+    newHashConfig: newHash,
+    issueNewForConnection: true,
+  });
+  // revokeAllTokens 返回 Map<digest, tokenRecord>；tokenMemory 期望 Map<digest, { record, lastActive }>
+  tokenMemory = new Map();
+  for (const [digest, rec] of tokenMap) {
+    tokenMemory.set(digest, { record: rec, lastActive: Date.now() });
+  }
+  authConfig = newHash;
+  // 踢掉所有其他已认证连接：已建立的 WS 即使 token 失效，认证位仍开着，必须主动 close
+  // 客户端会自动重连，重连时旧 token 已失效 → session_expired → 跳登录页
+  // 先置 _ccwebAuthed=false 拦截 close race：close 前已入队的事件不再处理
+  for (const client of wss.clients) {
+    if (client !== ws && client._ccwebAuthed && client.readyState === 1) {
+      client._ccwebAuthed = false;
+      try { client.close(); } catch {}
+    }
+  }
   plog('INFO', 'password_changed', {});
 
-  // Clear all tokens (force all sessions to re-login)
-  activeTokens.clear();
-
-  // Generate new token for current connection
-  const newToken = crypto.randomBytes(32).toString('hex');
-  activeTokens.set(newToken, Date.now());
-
-  wsSend(ws, { type: 'password_changed', success: true, token: newToken, message: '密码修改成功' });
+  wsSend(ws, { type: 'password_changed', success: true, token: newToken.token, message: '密码修改成功' });
 }
 
 // === Model Config Handler ===
@@ -2441,6 +2689,17 @@ function handleFetchModels(ws, msg) {
 }
 
 // === Slash Command Handler ===
+/**
+ * 斜杠命令分发器（/clear /mode /model /cost /compact /init /github /ssh /help）。
+ *
+ * 注意：/goal 不走此 switch，由 handleMessage 独立处理。
+ * 各命令行号与行为见 docs/PROTOCOL.md "斜杠命令"。
+ *
+ * @param {object} ws
+ * @param {string} text - 用户输入的完整命令字符串
+ * @param {string} sessionId
+ * @param {'claude'|'codex'} fallbackAgent - session 不存在时的回退 agent
+ */
 function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
@@ -3021,6 +3280,18 @@ function handleAbort(ws) {
 }
 
 // === Runtime Message Handler ===
+/**
+ * 处理用户消息（文本/附件）并 spawn Claude/Codex detached 子进程。
+ *
+ * 特殊路径：/goal 命令在此函数独立处理（绕过 handleSlashCommand），驱动
+ * 多轮自治循环。详见 docs/RUNTIME.md "/goal 多轮自治"。
+ *
+ * 附件校验：解析 msg.attachments，过期则报错返回。
+ *
+ * @param {object} ws
+ * @param {object} msg - { text, sessionId, mode, attachments, agent }
+ * @param {object} [options={}] - { hideInHistory }
+ */
 function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
   const { hideInHistory = false } = options;

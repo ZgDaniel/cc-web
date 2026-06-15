@@ -228,12 +228,24 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
 
+        # 关键：清洗客户端伪造的 XFF（覆盖而不是 append）
+        # 否则攻击者可向 XFF 链注入伪造项绕过 IP 封禁
+        proxy_set_header X-Forwarded-For $remote_addr;
+
         # 长连接超时（Claude 任务可能运行较久）
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }
 }
 ```
+
+**反代后必须配置可信代理**：cc-web 默认完全不信任 `X-Forwarded-For`，直接使用 socket 真实远端地址（防 XFF 伪造绕过 IP 封禁）。通过 Nginx 反代后，所有请求对 cc-web 来说都来自 `127.0.0.1`，需要在 `.env` 或 systemd unit 中告诉 cc-web 信任 Nginx：
+
+```bash
+CC_WEB_TRUSTED_PROXIES="127.0.0.1,::1"
+```
+
+配置后，当 socket 远端在可信列表内时，cc-web 才会从 XFF 链「从右往左跳过可信代理，取第一个非可信 IP」作为真实客户端 IP（用于 IP 封禁计数）。详见 [docs/CONFIG.md "客户端 IP 解析"](./docs/CONFIG.md#客户端-ip-解析防-x-forwarded-for-伪造)。
 
 ### Windows 部署
 
