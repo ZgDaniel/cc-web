@@ -44,7 +44,7 @@ node --check public/app.js   # 前端语法检查
 - WebSocket 消息契约：客户端→服务端 31 个 type（含 auth）、服务端→客户端 30 个 type，与 server.js / public/app.js 双向 switch 完整对称
 - Session JSON 结构持久化在 `sessions/*.json`，字段默认值在 `normalizeSession()`（**新增字段必须设默认值**）
 - 附件 API：`POST /api/attachments` + `DELETE /api/attachments/:id`（HTTP 仅此 2 个非静态端点）
-- 斜杠命令：`/clear` `/mode` `/model` `/cost` `/compact` `/init` `/github` `/ssh` `/help` 走 `handleSlashCommand`；**`/goal` 走 `handleMessage` 独立路径**（绕过分发器）
+- 斜杠命令：`/clear` `/mode` `/model` `/cost` `/compact` `/init` `/loop` `/github` `/ssh` `/help` 走 `handleSlashCommand`；**`/goal` 走 `handleMessage` 独立路径**（绕过分发器；Claude 透传原生命令，Codex 转换为目标创建/清除提示）
 - 完整契约见 [docs/PROTOCOL.md](./docs/PROTOCOL.md)
 
 ## 敏感目录（本地运行时状态，非源码真相源）
@@ -60,7 +60,7 @@ node --check public/app.js   # 前端语法检查
 | 文档 | 作用 |
 |---|---|
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 系统拓扑 + 核心文件职责 + **Claude vs Codex 适配层差异**（权限映射 / resume / 附件注入 / 模型 spec 拆分）+ **安全防御层**（8 层纵深防御）+ **前端渲染管线**（marked → DOMPurify → decorateCodeBlocks） |
-| [docs/RUNTIME.md](./docs/RUNTIME.md) | 会话持久化（normalizeSession + 字段表 + 原子写）+ detached 进程生命周期（含 killProcess 进程组中断）+ FileTailer + 自动 compact 重试 + /goal 多轮 + 懒加载 + plog + **WS 重连与改密踢下线** |
+| [docs/RUNTIME.md](./docs/RUNTIME.md) | 会话持久化（normalizeSession + 字段表 + 原子写）+ detached 进程生命周期（含 killProcess 进程组中断）+ FileTailer + 自动 compact 重试 + /goal 多轮 + /loop 定期执行 + 懒加载 + plog + **WS 重连与改密踢下线** |
 | [docs/PROTOCOL.md](./docs/PROTOCOL.md) | WebSocket 31+30 type 清单（C→S 含 auth）+ HTTP 路由（含响应头 + 前置封禁 + 客户端 IP 解析）+ 附件流程 + 原生会话导入 + 斜杠命令表 |
 | [docs/CONFIG.md](./docs/CONFIG.md) | config/ 文件 schema + 环境变量 + 环境假设 + 鉴权策略（含 XFF 不信任）+ 通知 5 通道 + AI 摘要 |
 
@@ -68,13 +68,13 @@ node --check public/app.js   # 前端语法检查
 
 | 文件 | 行数 | 职责 | 入口锚点（行号会随重构漂移，按函数名定位最稳） |
 |---|---|---|---|
-| `server.js` | ~3965 | 主应用 | `normalizeSession` / `FileTailer` / `handleProcessComplete` / `recoverProcesses` / WS switch / `handleSlashCommand` / `handleMessage`（均按函数名定位最稳） |
-| `public/app.js` | ~5175 | 整个前端 | `handleServerMessage` / `flushRender` / `renderMarkdown` / `sendMessage` |
+| `server.js` | ~4295 | 主应用 | `normalizeSession` / `FileTailer` / `handleProcessComplete` / `recoverProcesses` / WS switch / `handleSlashCommand` / `handleMessage` / `/loop` 调度（`scheduleSessionLoop` / `runSessionLoop` / `restoreSessionLoops`） |
+| `public/app.js` | ~5273 | 整个前端 | `handleServerMessage` / `flushRender` / `renderMarkdown` / `sendMessage`（含断线守卫 `isWsConnected`） / `applySessionSnapshot` |
 | `lib/agent-runtime.js` | ~545 | Claude/Codex 适配器 | `buildClaudeSpawnSpec` / `buildCodexSpawnSpec` / `processClaudeEvent` / `processCodexEvent` / `processRuntimeEvent` |
 | `lib/auth.js` | ~230 | 鉴权存储工厂（scrypt 哈希 + token 指纹 + 原子撤销） | `createAuthStore` / `hashPassword` / `verifyPassword` / `issueToken` / `loadTokens` / `revokeAllTokens` |
 | `lib/client-ip.js` | ~90 | 客户端 IP 解析（防 XFF 伪造，从右往左跳过可信代理） | `createClientIpResolver` / `resolveClientIP` / `isTrustedProxy` |
 | `lib/codex-rollouts.js` | ~242 | Codex 历史 JSONL 解析 | `parseCodexRolloutLines` / `getCodexRolloutFiles` / `parseCodexRolloutFile` |
-| `scripts/regression.js` | ~880 | 端到端隔离测试 | 顶部模块头含完整覆盖矩阵；新增 `testAuthStoreTokenMigration` / `testXssHardening` / `testWsReconnectPreservesState` / `testRobustnessHardening` / `testClientIpResolution` / `testIpBanEnforcement` |
+| `scripts/regression.js` | ~1179 | 端到端隔离测试 | 顶部模块头含完整覆盖矩阵；新增 `testAuthStoreTokenMigration` / `testXssHardening` / `testWsReconnectPreservesState` / `testRobustnessHardening` / `testClientIpResolution` / `testIpBanEnforcement` / Codex /goal 兼容 + /loop 断言 |
 | `scripts/mock-claude.js` | ~88 | mock Claude CLI | — |
 | `scripts/mock-codex.js` | ~109 | mock Codex CLI | — |
 

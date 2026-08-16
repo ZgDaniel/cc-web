@@ -83,6 +83,11 @@
         <button type="button" id="goal-status-stop" class="goal-status-stop" title="停止 Goal">停止</button>
       </div>
 
+      <div id="conn-banner" class="conn-banner" hidden role="status" aria-live="polite">
+        <span class="conn-banner-icon" aria-hidden="true">⚠</span>
+        <span class="conn-banner-text">连接已断开，正在自动重连……期间发送的内容会保留在输入框</span>
+      </div>
+
       <div class="messages-wrap">
         <div id="messages" class="messages">
           <div class="welcome-msg">

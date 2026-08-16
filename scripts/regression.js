@@ -16,10 +16,15 @@
  * 覆盖场景：
  *   - Codex/Claude config 保存/回读 + API key 掩码
  *   - /init /model /compact（含自动 compact 重试）
+ *   - Claude token 超限 → 自动 /compact + 重放（P0 正则补全，mock stderr 报 Prompt is too long）
+ *   - Claude 预防性水位压缩：高水位 resume 会话先压缩再重放（P2）+ compact_boundary
+ *     事件透传为含 token 数的 system_message（P1）
+ *   - lib/context-usage 单元：jsonl 尾扫求和 / 无 usage / 文件缺失 / 1m-普通窗口四组合
  *   - 附件上传 → 带图消息 → session JSON 持久化
  *   - 模式切换保 thread id（Codex + Claude 双侧）
  *   - Codex Profile 切换 → 隔离 runtime config.toml
- *   - /goal 多轮自治（TURN_1 → goal_feedback → TURN_2 顺序断言）
+ *   - Claude /goal 多轮自治（TURN_1 → goal_feedback → TURN_2 顺序断言）
+ *   - Codex /goal 兼容提示 + /loop 持久化调度与取消
  *   - Native session 导入（Claude .jsonl + Codex rollout + SQLite）
  *   - Codex 导入删除（JSON + rollout + SQLite thread 三处清理）
  *
@@ -28,6 +33,7 @@
  *   - tokens.json 绝对过期/缺失字段迁移（testAuthStoreTokenMigration）
  *   - XSS：CSP 头 + DOMPurify sanitize + 无内联 onclick（testXssHardening）
  *   - WS 重连不重渲染聊天区（testWsReconnectPreservesState）
+ *   - WS 心跳协议级 ping + 运行中任务 activeOutput 断线补齐（testWsHeartbeatAndActiveOutput）
  *   - atomicWriteJson + kill 进程组 + HTTP 旧 token 拒绝（testRobustnessHardening）
  *   - XFF 解析纯函数单测（testClientIpResolution）
  *   - 可信代理 + IP 封禁端到端（testIpBanEnforcement）
@@ -178,26 +184,33 @@ function nextMessage(messages, ws, predicate, timeoutMs = 15000) {
   });
 }
 
-function createFakeClaudeHistory(homeDir) {
-  const projectDir = path.join(homeDir, '.claude', 'projects', 'tmp-project');
+// opts: { sessionId, projectDirName, prompt, answer, cwd, usage }。
+// usage 会挂到 assistant 行的 message.usage 上（P2 水位估算读取的就是这个位置）。
+function createFakeClaudeHistory(homeDir, opts = {}) {
+  const sessionId = opts.sessionId || 'claude-import-test';
+  const prompt = opts.prompt || 'Claude import prompt';
+  const answer = opts.answer || 'Claude import answer';
+  const projectDirName = opts.projectDirName || 'tmp-project';
+  const projectDir = path.join(homeDir, '.claude', 'projects', projectDirName);
   mkdirp(projectDir);
-  const sessionId = 'claude-import-test';
   const filePath = path.join(projectDir, `${sessionId}.jsonl`);
+  const assistantMessage = { content: [{ type: 'text', text: answer }] };
+  if (opts.usage) assistantMessage.usage = opts.usage;
   const lines = [
     JSON.stringify({
       type: 'user',
-      cwd: '/tmp/project-a',
+      cwd: opts.cwd || '/tmp/project-a',
       timestamp: '2026-03-12T00:00:00.000Z',
-      message: { content: 'Claude import prompt' },
+      message: { content: prompt },
     }),
     JSON.stringify({
       type: 'assistant',
       timestamp: '2026-03-12T00:00:02.000Z',
-      message: { content: [{ type: 'text', text: 'Claude import answer' }] },
+      message: assistantMessage,
     }),
   ];
   fs.writeFileSync(filePath, `${lines.join('\n')}\n`);
-  return { sessionId, projectDir: 'tmp-project', filePath };
+  return { sessionId, projectDir: projectDirName, filePath, title: prompt };
 }
 
 function createFakeCodexHistory(homeDir) {
@@ -378,6 +391,48 @@ async function testAuthStoreTokenMigration() {
   console.log('Auth-store token migration checks passed.');
 }
 
+// Unit coverage for lib/context-usage.js (P2 预防性水位压缩核心)：
+//   - estimateClaudeContextUsage 从文件末尾向前找最后一条含 usage 的 assistant 行，
+//     返回 input + cache_read + cache_creation 三项之和（更早的 usage 行、坏行不参与）
+//   - 无 usage / 文件不存在 → null（调用方必须跳过预防逻辑）
+//   - shouldPreemptiveCompact：[1m] 与普通窗口 × 高低水位四组合
+async function testContextUsage() {
+  const { estimateClaudeContextUsage, shouldPreemptiveCompact } = require('../lib/context-usage');
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-usage-'));
+
+  const usageLine = (usage) => JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'text', text: 'ok' }], usage },
+  });
+
+  const jsonlPath = path.join(tempDir, 'session.jsonl');
+  fs.writeFileSync(jsonlPath, [
+    JSON.stringify({ type: 'user', message: { content: 'q' } }),
+    usageLine({ input_tokens: 100, cache_read_input_tokens: 40, cache_creation_input_tokens: 10, output_tokens: 5 }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'no usage here' }] } }),
+    'this-line-is-not-json',
+    usageLine({ input_tokens: 900, cache_read_input_tokens: 90, cache_creation_input_tokens: 10, output_tokens: 5 }),
+    '',
+  ].join('\n'));
+
+  assert(estimateClaudeContextUsage(jsonlPath) === 1000, 'estimate should sum the LAST usage-bearing assistant line (900+90+10)');
+
+  const noUsagePath = path.join(tempDir, 'no-usage.jsonl');
+  fs.writeFileSync(noUsagePath, `${JSON.stringify({ type: 'assistant', message: { content: [] } })}\n`);
+  assert(estimateClaudeContextUsage(noUsagePath) === null, 'jsonl without usage must return null');
+  assert(estimateClaudeContextUsage(path.join(tempDir, 'missing.jsonl')) === null, 'missing file must return null');
+
+  // 4 combos: window size from model label × water level (threshold 80%)
+  assert(shouldPreemptiveCompact(200000, 'claude-opus-4-6[1m]', 80) === false, '1M window: 200k is below 80% threshold');
+  assert(shouldPreemptiveCompact(800000, 'claude-opus-4-6[1m]', 80) === true, '1M window: 800k reaches 80% threshold');
+  assert(shouldPreemptiveCompact(160000, 'claude-sonnet-4-6', 80) === true, '200k window: 160k reaches 80% threshold');
+  assert(shouldPreemptiveCompact(159999, 'claude-sonnet-4-6', 80) === false, '200k window: 159,999 is below 80% threshold');
+  assert(shouldPreemptiveCompact(null, 'claude-opus-4-6[1m]', 80) === false, 'null usage must never preempt');
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+  console.log('Context usage estimation checks passed.');
+}
+
 async function main() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
   const configDir = path.join(tempRoot, 'config');
@@ -398,7 +453,23 @@ async function main() {
     qqbot: { qmsgKey: '' },
   }, null, 2));
 
-  createFakeClaudeHistory(homeDir);
+  // fixture 的 cwd 必须是真实目录：导入后的会话以该 cwd spawn CLI，
+  // 不存在的 cwd 会让 spawn 异步 ENOENT 且不触发 exit 事件（会话卡死）
+  const claudeFixtureCwd = path.join(tempRoot, 'project-a');
+  const claudeUsageFixtureCwd = path.join(tempRoot, 'project-usage');
+  mkdirp(claudeFixtureCwd);
+  mkdirp(claudeUsageFixtureCwd);
+  createFakeClaudeHistory(homeDir, { cwd: claudeFixtureCwd });
+  // P2 预防压缩 fixture：assistant 行带高水位 usage（150k input + 40k cache_read + 10k
+  // cache_creation = 200k tokens ≥ 默认 200k 窗口的 80%），导入后发消息应先 /compact 再重放
+  createFakeClaudeHistory(homeDir, {
+    sessionId: 'claude-usage-import-test',
+    projectDirName: 'tmp-project-usage',
+    prompt: 'Claude usage import prompt',
+    answer: 'Claude usage import answer',
+    cwd: claudeUsageFixtureCwd,
+    usage: { input_tokens: 150000, cache_read_input_tokens: 40000, cache_creation_input_tokens: 10000, output_tokens: 500 },
+  });
   const codexFixture = createFakeCodexHistory(homeDir);
 
   const port = await getFreePort();
@@ -413,6 +484,8 @@ async function main() {
     HOME: homeDir,
     CLAUDE_PATH: MOCK_CLAUDE,
     CODEX_PATH: MOCK_CODEX,
+    // 心跳间隔压到 400ms：主链路全程覆盖多轮 ping/pong，验证心跳不干扰正常消息流
+    CC_WEB_WS_PING_INTERVAL_MS: '400',
   }, async () => {
     const { ws, messages, token } = await connectWs(port, password);
 
@@ -502,6 +575,23 @@ async function main() {
 	    assert(lastSpawn.includes('resume') && lastSpawn.includes(threadIdBeforeMode), 'Codex mode switch should keep resume thread id');
 	    assert(lastSpawn.includes('-s read-only'), 'Codex plan mode should set sandbox read-only');
 	    assert(lastSpawn.includes('-s read-only resume'), 'Codex resume in plan mode must place -s before resume subcommand');
+
+    ws.send(JSON.stringify({ type: 'message', text: '/goal finish regression verification', sessionId: firstMessageSession.sessionId, mode: 'plan', agent: 'codex' }));
+    const codexGoalText = await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /Create and persist a durable goal/.test(msg.text || ''));
+    assert(/finish regression verification/.test(codexGoalText.text || ''), 'Codex /goal should pass the declared condition to its compatible prompt');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
+
+    ws.send(JSON.stringify({ type: 'message', text: '/loop 1s verify scheduled Codex follow-up', sessionId: firstMessageSession.sessionId, mode: 'plan', agent: 'codex' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /已设置 \/loop/.test(msg.message || ''));
+    const loopStart = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /◎ Loop · 正在执行周期提示/.test(msg.message || ''));
+    assert(/verify scheduled Codex follow-up/.test(loopStart.message || ''), '/loop should preserve its scheduled prompt');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
+    const loopSession = JSON.parse(fs.readFileSync(codexSessionPath, 'utf8'));
+    assert(loopSession.loop?.intervalMs === 1000, '/loop should persist its interval on the session');
+    ws.send(JSON.stringify({ type: 'message', text: '/loop off', sessionId: firstMessageSession.sessionId, mode: 'plan', agent: 'codex' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /已停止当前会话的 \/loop/.test(msg.message || ''));
+    const loopStoppedSession = JSON.parse(fs.readFileSync(codexSessionPath, 'utf8'));
+    assert(loopStoppedSession.loop === null, '/loop off should clear persisted loop state');
 
     ws.send(JSON.stringify({
       type: 'save_codex_config',
@@ -600,7 +690,7 @@ async function main() {
     assert(lastClaudeSpawn.includes(`--resume ${claudeSessionIdBeforeMode}`), 'Claude mode switch should keep --resume session id');
     assert(lastClaudeSpawn.includes('--permission-mode plan'), 'Claude plan mode should set --permission-mode plan');
 
-    // /goal multi-turn coverage: ensure cc-web does not intercept /goal, surfaces synthetic
+    // /goal multi-turn coverage: ensure cc-web does not intercept Claude /goal, surfaces synthetic
     // Stop hook feedback as a goal_feedback system_message, never persists it to session.messages,
     // AND preserves the strict event order TURN_1 -> feedback -> TURN_2.
     const goalEvents = [];
@@ -624,13 +714,71 @@ async function main() {
     const goalSessionJson = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
     assert(!JSON.stringify(goalSessionJson.messages || []).includes('Stop hook feedback'), '/goal Stop hook feedback must not be persisted to session.messages');
 
+    // P0 行为级：Claude token 超限识别。mock 首次运行 stderr 报
+    // "API Error: Prompt is too long: 1048576 tokens > 1000000 maximum" 并非零退出
+    // （旧 isContextLimitError Claude 分支只认 Request too large (max 20MB)，识别不到这种错误）。
+    // 期望链路：失败 → 自动注入 /compact → 原消息重放，共 3 次 spawn。
+    const claudeSpawnsBeforeLimit = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+      .trim()
+      .split('\n')
+      .filter((line) => line.includes('"event":"process_spawn"') && line.includes(claudeImageSession.sessionId.slice(0, 8))).length;
+    ws.send(JSON.stringify({ type: 'message', text: 'trigger claude context limit', sessionId: claudeImageSession.sessionId, mode: 'plan', agent: 'claude' }));
+    const claudeLimitStart = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /自动执行 \/compact/.test(msg.message || ''));
+    assert(/Claude Code 原版策略/.test(claudeLimitStart.message || ''), 'Claude "Prompt is too long" failure should trigger auto compact');
+    await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /Claude compact finished/.test(msg.text || ''));
+    const claudeBoundaryMsg = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /上下文已压缩（前 93,158 → 后 5,762 tokens）/.test(msg.message || ''));
+    assert(claudeBoundaryMsg.kind === 'compact', 'compact_boundary should surface as kind=compact system_message with token counts');
+    await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /已自动按压缩计划继续执行/.test(msg.message || ''));
+    const claudeLimitReplay = await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /trigger claude context limit/.test(msg.text || ''));
+    assert(/trigger claude context limit/.test(claudeLimitReplay.text || ''), 'Original prompt must be replayed after auto compact');
+    const claudeSpawnsAfterLimit = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+      .trim()
+      .split('\n')
+      .filter((line) => line.includes('"event":"process_spawn"') && line.includes(claudeImageSession.sessionId.slice(0, 8))).length;
+    assert(claudeSpawnsAfterLimit - claudeSpawnsBeforeLimit === 3, `Auto compact chain should spawn fail+compact+replay = 3 processes (got ${claudeSpawnsAfterLimit - claudeSpawnsBeforeLimit})`);
+    // compact 注入的消息本身不得写入历史（hideInHistory）
+    const claudeLimitSessionJson = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
+    assert(!JSON.stringify(claudeLimitSessionJson.messages || []).includes('"content":"/compact"'), 'Injected /compact must stay out of session history');
+
     ws.send(JSON.stringify({ type: 'list_native_sessions' }));
     const nativeSessions = await nextMessage(messages, ws, (msg) => msg.type === 'native_sessions');
     assert(nativeSessions.groups?.length > 0, 'Claude native session listing failed');
-    const firstClaude = nativeSessions.groups[0].sessions[0];
-    ws.send(JSON.stringify({ type: 'import_native_session', sessionId: firstClaude.sessionId, projectDir: nativeSessions.groups[0].dir }));
+    const flatNative = nativeSessions.groups.flatMap((g) => g.sessions.map((s) => ({ ...s, dir: g.dir })));
+    const firstClaude = flatNative.find((s) => s.title === 'Claude import prompt');
+    assert(firstClaude, 'Claude import fixture should be listed');
+    ws.send(JSON.stringify({ type: 'import_native_session', sessionId: firstClaude.sessionId, projectDir: firstClaude.dir }));
     const importedClaude = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && msg.title === 'Claude import prompt');
     assert(importedClaude.messages?.[0]?.content === 'Claude import prompt', 'Claude import parsed wrong first message');
+
+    // P2 行为级：预防性水位压缩。导入一个 transcript 带高水位 usage（200k tokens ≥ 200k
+    // 窗口 × 80%）的会话，再发消息：期望 通知 → /compact 运行（含 P1 boundary 透传）→
+    // 原消息重放，共 2 次 spawn；原消息仅经重放记录一次。
+    const usageImportItem = flatNative.find((s) => s.title === 'Claude usage import prompt');
+    assert(usageImportItem, 'Claude high-usage fixture should be listed');
+    ws.send(JSON.stringify({ type: 'import_native_session', sessionId: usageImportItem.sessionId, projectDir: usageImportItem.dir }));
+    const usageSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && msg.title === 'Claude usage import prompt');
+    ws.send(JSON.stringify({ type: 'message', text: 'preempt usage replay prompt', sessionId: usageSession.sessionId, mode: 'yolo', agent: 'claude' }));
+    const preemptNotice = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /◎ 检测到上下文接近上限，先执行压缩再发送您的消息/.test(msg.message || ''));
+    assert(preemptNotice.kind === 'compact', 'Preemptive compact notice should be a kind=compact system_message');
+    await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /Claude compact finished/.test(msg.text || ''));
+    await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /上下文已压缩（前 93,158 → 后 5,762 tokens）/.test(msg.message || ''));
+    await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /已自动按压缩计划继续执行/.test(msg.message || ''));
+    const preemptReplay = await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /preempt usage replay prompt/.test(msg.text || ''));
+    assert(/preempt usage replay prompt/.test(preemptReplay.text || ''), 'Original prompt must be replayed after preemptive compact');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === usageSession.sessionId);
+    const preemptSpawns = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+      .trim()
+      .split('\n')
+      .filter((line) => line.includes('"event":"process_spawn"') && line.includes(usageSession.sessionId.slice(0, 8)));
+    assert(preemptSpawns.length === 2, `Preemptive compact should spawn compact+replay = 2 processes (got ${preemptSpawns.length})`);
+    const usageSessionJson = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${usageSession.sessionId}.json`), 'utf8'));
+    const replayedUserCount = (usageSessionJson.messages || []).filter((m) => m.role === 'user' && m.content === 'preempt usage replay prompt').length;
+    assert(replayedUserCount === 1, `Preempted message should be recorded exactly once via replay (got ${replayedUserCount})`);
+    // 低水位对照：导入的普通会话（fixture 无 usage 字段 → 水位不可确凿读取）不得触发预防压缩
+    ws.send(JSON.stringify({ type: 'message', text: 'low water prompt', sessionId: importedClaude.sessionId, mode: 'yolo', agent: 'claude' }));
+    const lowWaterDelta = await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /low water prompt/.test(msg.text || ''));
+    assert(/low water prompt/.test(lowWaterDelta.text || ''), 'Session without readable watermark must go through the normal path');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === importedClaude.sessionId);
 
     ws.send(JSON.stringify({ type: 'list_codex_sessions' }));
     const codexSessions = await nextMessage(messages, ws, (msg) => msg.type === 'codex_sessions');
@@ -710,11 +858,17 @@ async function main() {
   // Standalone auth-store unit tests: absoluteExpiresAt migration paths
   await testAuthStoreTokenMigration();
 
+  // P2 unit tests: lib/context-usage.js (watermark estimation + preempt threshold)
+  await testContextUsage();
+
   // Static + HTTP-header checks for XSS hardening (Goal 2)
   await testXssHardening();
 
   // WS reconnect must not re-render the chat area (Goal 4: 症状 1)
   await testWsReconnectPreservesState();
+
+  // WS 心跳 + 运行中任务断线内容补齐（Goal 6）
+  await testWsHeartbeatAndActiveOutput();
 
   // Goal 5: long-term robustness (atomic writes + killProcess process-group + HTTP token revocation)
   await testRobustnessHardening();
@@ -1031,6 +1185,112 @@ async function testWsReconnectPreservesState() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('WS reconnect state preservation checks passed.');
+}
+
+// Goal 6: WS 心跳 + 断线内容补齐。
+//  1) 服务端按 CC_WEB_WS_PING_INTERVAL_MS 周期发协议级 ping；客户端正常回 pong 时
+//     连接必须保持 OPEN（心跳不得误杀活跃连接）
+//  2) 运行中任务的 session_info 必须附带 activeOutput（内存 fullText 快照），
+//     且包含已流出的文本片段；任务结束后 activeOutput 必须消失（键省略）
+//  3) 双客户端 load_session 抢占 entry.ws 后，原客户端再次 load_session 能拿回
+//     补齐数据并继续收到 done（模拟断线重连补齐全链路）
+async function testWsHeartbeatAndActiveOutput() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-heartbeat-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  for (const d of [configDir, sessionsDir, logsDir, homeDir]) mkdirp(d);
+  const password = 'Heartbeat!234';
+  const port = await getFreePort();
+
+  // 慢速 mock：分段输出（0s / 1.5s / 3s）+ 4.5s 收尾，保证采样窗口内任务持续运行
+  const slowClaudePath = path.join(tempRoot, 'slow-claude.js');
+  fs.writeFileSync(slowClaudePath, `#!/usr/bin/env node
+const crypto = require('crypto');
+let data = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => { data += chunk; });
+process.stdin.on('end', () => {
+  const args = process.argv.slice(2);
+  const resumeIndex = args.indexOf('--resume');
+  const sessionId = resumeIndex >= 0 && args[resumeIndex + 1] ? args[resumeIndex + 1] : crypto.randomUUID();
+  const write = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
+  const assistant = (text) => write({ type: 'assistant', session_id: sessionId, message: { content: [{ type: 'text', text }] } });
+  write({ type: 'system', session_id: sessionId });
+  assistant('SLOW_CHUNK_1');
+  setTimeout(() => assistant('SLOW_CHUNK_2'), 1500);
+  setTimeout(() => assistant('SLOW_CHUNK_3'), 3000);
+  setTimeout(() => write({ type: 'result', session_id: sessionId, total_cost_usd: 0 }), 4500);
+});
+`);
+  fs.chmodSync(slowClaudePath, 0o755);
+
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: slowClaudePath,
+    CODEX_PATH: MOCK_CODEX,
+    CC_WEB_WS_PING_INTERVAL_MS: '400',
+  }, async () => {
+    const conn1 = await connectWs(port, password);
+    await nextMessage(conn1.messages, conn1.ws, (msg) => msg.type === 'session_list');
+
+    // 协议级 ping 计数（Node ws 客户端自动回 pong，服务端不应 terminate 该连接）
+    let pingCount = 0;
+    conn1.ws.on('ping', () => { pingCount += 1; });
+
+    conn1.ws.send(JSON.stringify({ type: 'message', text: 'slow output prompt', mode: 'yolo', agent: 'claude' }));
+    const runningSession = await nextMessage(conn1.messages, conn1.ws, (msg) => msg.type === 'session_info' && msg.title === 'slow output prompt');
+    const sessionId = runningSession.sessionId;
+
+    // 任务已在输出（第一段已流出）
+    const firstDelta = await nextMessage(conn1.messages, conn1.ws, (msg) => msg.type === 'text_delta' && /SLOW_CHUNK_1/.test(msg.text || ''));
+    assert(/SLOW_CHUNK_1/.test(firstDelta.text || ''), '慢速任务应先流出 SLOW_CHUNK_1');
+
+    // 第二个客户端（模拟断线后重连/他端查看）load_session：session_info 必须附带运行中实时输出
+    const conn2 = await connectWs(port, password);
+    await nextMessage(conn2.messages, conn2.ws, (msg) => msg.type === 'session_list');
+    conn2.ws.send(JSON.stringify({ type: 'load_session', sessionId }));
+    const midRunInfo = await nextMessage(conn2.messages, conn2.ws, (msg) => msg.type === 'session_info' && msg.sessionId === sessionId);
+    assert(midRunInfo.isRunning === true, '运行中任务的 session_info 应标记 isRunning=true');
+    assert(typeof midRunInfo.activeOutput === 'string' && midRunInfo.activeOutput.length > 0, '运行中任务的 session_info 应附带非空 activeOutput');
+    assert(midRunInfo.activeOutput.includes('SLOW_CHUNK_1'), 'activeOutput 应包含已流出的 SLOW_CHUNK_1 片段');
+
+    // conn2 的 load_session 抢占了 entry.ws（此后 text_delta 只发给 conn2）。
+    // 原客户端再 load_session 切回——这正是断线重连补齐路径：拿回全量 activeOutput + 恢复 done 送达
+    conn1.ws.send(JSON.stringify({ type: 'load_session', sessionId }));
+    const reconnectInfo = await nextMessage(conn1.messages, conn1.ws, (msg) => msg.type === 'session_info' && msg.sessionId === sessionId);
+    assert(reconnectInfo.isRunning === true, '原客户端重连式 load_session 应看到 isRunning=true');
+    assert(typeof reconnectInfo.activeOutput === 'string' && reconnectInfo.activeOutput.includes('SLOW_CHUNK_1'), '原客户端补齐 load_session 应拿到含已输出片段的 activeOutput');
+
+    // 心跳：等最多 3 秒，应收到至少 1 个协议级 ping；且回 pong 的连接保持 OPEN
+    const heartbeatDeadline = Date.now() + 3000;
+    while (Date.now() < heartbeatDeadline && pingCount === 0) {
+      await sleep(100);
+    }
+    assert(pingCount >= 1, `3 秒内应收到至少 1 个协议级 ping（间隔 400ms，实际收到 ${pingCount} 个）`);
+    assert(conn1.ws.readyState === WebSocket.OPEN, '正常回 pong 的连接不应被心跳 terminate');
+
+    // 原客户端（entry.ws 持有者）必须正常收到 done：心跳未误杀连接、补齐未破坏完成链路
+    await nextMessage(conn1.messages, conn1.ws, (msg) => msg.type === 'done' && msg.sessionId === sessionId, 20000);
+
+    // 任务结束后再 load_session：activeOutput 必须省略（仅运行中会话携带），isRunning=false
+    conn2.ws.send(JSON.stringify({ type: 'load_session', sessionId }));
+    const finishedInfo = await nextMessage(conn2.messages, conn2.ws, (msg) => msg.type === 'session_info' && msg.sessionId === sessionId);
+    assert(finishedInfo.isRunning === false, '任务结束后 session_info 应标记 isRunning=false');
+    assert(!('activeOutput' in finishedInfo), '任务结束后 session_info 不应携带 activeOutput 键');
+
+    conn2.ws.close();
+    conn1.ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('WS heartbeat + active output backfill checks passed.');
 }
 
 // Goal 5: long-term robustness.

@@ -44,6 +44,10 @@
   --loading-badge-text: var(--accent);
   --loading-bar-bg: rgba(221, 208, 192, 0.85);
   --loading-bar-fill: linear-gradient(90deg, #c0553a, #d98666, #c0553a);
+  --conn-banner-bg: rgba(198, 124, 44, 0.12);
+  --conn-banner-border: rgba(198, 124, 44, 0.3);
+  --conn-banner-fg: #8a5a1e;
+  --conn-banner-accent: #b96f24;
 }
 
 html[data-theme='coolvibe'] {
@@ -89,6 +93,10 @@ html[data-theme='coolvibe'] {
   --loading-badge-text: #0a6d83;
   --loading-bar-bg: rgba(191, 220, 228, 0.92);
   --loading-bar-fill: linear-gradient(90deg, #0891b2, #34c4de, #0891b2);
+  --conn-banner-bg: rgba(217, 119, 6, 0.1);
+  --conn-banner-border: rgba(217, 119, 6, 0.28);
+  --conn-banner-fg: #8a5210;
+  --conn-banner-accent: #d97706;
 }
 
 html[data-theme='coolvibe'] body {
@@ -337,6 +345,10 @@ html[data-theme='editorial'] {
   --loading-badge-text: #8b5e3c;
   --loading-bar-bg: rgba(216, 204, 186, 0.92);
   --loading-bar-fill: linear-gradient(90deg, #8b5e3c, #c59470, #8b5e3c);
+  --conn-banner-bg: rgba(176, 118, 48, 0.1);
+  --conn-banner-border: rgba(176, 118, 48, 0.28);
+  --conn-banner-fg: #7a5322;
+  --conn-banner-accent: #a06a24;
 }
 
 /* === Reset === */
@@ -907,6 +919,32 @@ body.session-loading-active {
 @media (max-width: 480px) {
   .goal-status-bar { padding: 5px 10px; gap: 6px; font-size: 11px; }
   .goal-status-label { display: none; }
+}
+
+/* Connection banner (WS 断线提示；配合 sendMessage 的发送守卫保留输入内容) */
+.conn-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  background: var(--conn-banner-bg, rgba(198, 124, 44, 0.12));
+  border-bottom: 1px solid var(--conn-banner-border, rgba(198, 124, 44, 0.3));
+  font-size: 12px;
+  color: var(--conn-banner-fg, #8a5a1e);
+  flex-shrink: 0;
+}
+.conn-banner-icon {
+  font-size: 13px;
+  color: var(--conn-banner-accent, #b96f24);
+  animation: pulse 1.4s infinite;
+  flex-shrink: 0;
+}
+.conn-banner-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+@media (max-width: 480px) {
+  .conn-banner { padding: 5px 10px; gap: 6px; font-size: 11px; }
 }
 
 /* Mode selector */

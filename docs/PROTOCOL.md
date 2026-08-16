@@ -41,9 +41,9 @@
 |---|---|
 | `auth_result` | 鉴权结果。失败时含 `reason`（`invalid_password` / `session_expired` / `auth_failed`，3 类收敛值）+ 可选 `banned: true` |
 | `error` | 错误 |
-| `system_message` | 系统消息（含 `kind: 'goal_feedback'` 等） |
+| `system_message` | 系统消息（含 `kind: 'goal_feedback'` / `'compact'` 等，未知 kind 走默认渲染，见下方示例） |
 | `session_list` | 会话列表 |
-| `session_info` | 会话元信息 |
+| `session_info` | 会话元信息。运行中会话额外附带 `activeOutput`（string，内存实时全量输出，用于断线补齐，见 [RUNTIME.md](./RUNTIME.md#ws-心跳与断线内容补齐)）；任务结束后该键省略 |
 | `session_history_chunk` | 历史分块（懒加载，详见 [RUNTIME.md](./RUNTIME.md#懒加载历史)） |
 | `resume_generating` | 恢复生成态 |
 | `session_renamed` | 重命名通知 |
@@ -94,6 +94,21 @@ server: done | background_done
 ```
 
 事件归一化在 `lib/agent-runtime.js`（`processClaudeEvent` / `processCodexEvent`），统一为上表 6 类。
+
+### `system_message` 压缩提示示例
+
+compact 相关提示（`kind: 'compact'`，走已有 system_message 默认渲染，前端无需新 case）：
+
+```json
+{ "type": "system_message", "kind": "compact", "message": "◎ 检测到上下文接近上限，先执行压缩再发送您的消息" }
+{ "type": "system_message", "kind": "compact", "message": "◎ 上下文已压缩（前 93,158 → 后 5,762 tokens）" }
+```
+
+第一条在预防性水位压缩触发时（发送前）下发；第二条由 CLI 的 compact 边界事件透传（token 数取不到时为 `◎ 上下文已压缩`）。详见 [RUNTIME.md "自动 compact 重试"](./RUNTIME.md#自动-compact-重试)。
+
+### WS 心跳
+
+服务端每 `CC_WEB_WS_PING_INTERVAL_MS`（默认 25s）向所有客户端发协议级 ping；连续两轮未收到 pong 即 `terminate` 死连接。客户端无需处理（浏览器自动回 pong）。详见 [RUNTIME.md](./RUNTIME.md#ws-心跳与断线内容补齐)。
 
 ## HTTP 路由（仅 3 个）
 
@@ -162,15 +177,23 @@ server: done | background_done
 | `/model` | 查看/切换 Claude 模型 |
 | `/cost` | 显示累计成本 |
 | `/compact` | 执行原生上下文压缩 |
-| `/init` | 分析项目并生成/更新 `CLAUDE.md`（Claude Code 原生命令） |
+| `/init` | 分析项目并生成/更新 Agent 指南文件 |
+| `/loop <间隔> <提示>` | 定期执行提示；支持 `s`、`m`、`h`（1 秒–24 小时） |
 | `/github` | 注入 GitHub repos 上下文（来自 dev.json） |
 | `/ssh` | 注入 SSH hosts 上下文（来自 dev.json） |
 | `/help` | 显示帮助 |
 
 ### `/goal`（特殊路径，不在 switch 中）
 
-`/goal` 多轮自治命令**绕过 slash 分发器**：
+`/goal` **绕过 slash 分发器**：
 
 - 在 `handleMessage` 独立处理
+- Claude 原样接收原生命令；Codex `exec` 会被转换为“创建、持久化并推进目标”的兼容提示，`/goal`（无条件）则请求清除目标
 - 双重正则排除 `/^\/goal(?:\s|$)/i`（WS switch 前一处、`handleMessage` 内一处）防误走 switch
 - 详见 [RUNTIME.md "/goal 多轮自治"](./RUNTIME.md#goal-多轮自治)
+
+### `/loop <间隔> <提示>`
+
+- 由 cc-web 调度，不依赖 Claude 或 Codex 的 TUI；每个会话只能保留一个循环
+- 任务仍在运行时跳过本轮，不并发启动第二个 agent
+- 配置持久化在 session 的 `loop` 字段，服务重启后恢复；`/loop off` 或 `/clear` 会停止并清除配置

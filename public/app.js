@@ -38,7 +38,8 @@
     { cmd: '/cost', desc: '查看会话费用' },
     { cmd: '/compact', desc: '压缩上下文' },
     { cmd: '/init', desc: '生成/更新 Agent 指南文件' },
-    { cmd: '/goal', desc: 'Claude 自治多轮工作直到条件达成' },
+    { cmd: '/goal', desc: '建立并持续维护目标' },
+    { cmd: '/loop', desc: '定期执行提示（如 /loop 10m 检查状态）' },
     { cmd: '/github', desc: 'GitHub 操作（读取开发者配置后执行）' },
     { cmd: '/ssh', desc: 'SSH 远程操作（读取开发者配置后执行）' },
     { cmd: '/help', desc: '显示帮助' },
@@ -723,6 +724,8 @@
       totalUsage: payload.totalUsage ? deepClone(payload.totalUsage) : null,
       updated: payload.updated || null,
       isRunning: !!payload.isRunning,
+      // 运行中会话的实时全量输出（仅服务端 session_info 携带；断线补齐守卫消费，见 case 'session_info'）
+      activeOutput: typeof payload.activeOutput === 'string' ? payload.activeOutput : undefined,
       historyPending: !!payload.historyPending,
       complete: options.complete !== undefined ? !!options.complete : !payload.historyPending,
     };
@@ -1534,12 +1537,29 @@
     ws.onclose = () => {
       clearSessionLoading();
       scheduleReconnect();
+      showConnBanner();
     };
     ws.onerror = () => {};
   }
 
   function send(data) {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
+  }
+
+  // 仅 OPEN 状态视为已连接（send() 对非 OPEN 静默丢弃，调用方需先守卫）
+  function isWsConnected() {
+    return !!(ws && ws.readyState === 1);
+  }
+
+  // 断线状态条（#conn-banner）：DOM 缺失时安全返回
+  function showConnBanner() {
+    const banner = document.getElementById('conn-banner');
+    if (banner) banner.hidden = false;
+  }
+
+  function hideConnBanner() {
+    const banner = document.getElementById('conn-banner');
+    if (banner) banner.hidden = true;
   }
 
   function scheduleReconnect() {
@@ -1565,6 +1585,7 @@
     switch (msg.type) {
       case 'auth_result':
         if (msg.success) {
+          hideConnBanner();  // 认证成功 = 连接可用
           authToken = msg.token;
           localStorage.setItem('cc-web-token', msg.token);
           document.dispatchEvent(new CustomEvent('cc-web-auth-restored'));
@@ -1578,8 +1599,13 @@
             // 仅首次 auth 成功才触发整区会话加载；WS 重连不触发，保留用户滚动位置
             hasInitialAuthCompleted = true;
             pendingInitialSessionLoad = true;
+          } else if (currentSessionId && (isGenerating || currentSessionRunning || document.getElementById('streaming-msg'))) {
+            // WS 重连兜底：若当前会话仍有流式状态，主动 load_session 重新 attach entry.ws，
+            // 确保后续 done/background_done 能正确送达（避免 entry.ws=null 导致状态卡死）
+            send({ type: 'load_session', sessionId: currentSessionId });
           }
         } else {
+          hideConnBanner();  // 认证失败：登录遮罩出现，状态条无意义
           authToken = null;
           localStorage.removeItem('cc-web-token');
           hasInitialAuthCompleted = false;  // auth 失败：重置首次加载状态，下次登录重新触发
@@ -1605,7 +1631,11 @@
         }
         break;
 
-      case 'session_list':
+      case 'session_list': {
+        // 检测当前会话 isRunning 从 true→false 的转换（任务完成的兜底信号）
+        const previousMeta = currentSessionId ? getSessionMeta(currentSessionId) : null;
+        const wasServerRunning = !!previousMeta?.isRunning;
+        const hadStreamingUi = !!(isGenerating || currentSessionRunning || document.getElementById('streaming-msg'));
         sessions = msg.sessions || [];
         reconcileSessionCacheWithSessions();
         renderSessionList();
@@ -1622,7 +1652,15 @@
           else if (!gs.optimistic) gs.active = false;
         }
         if (currentSessionId) {
-          setCurrentSessionRunningState(!!getSessionMeta(currentSessionId)?.isRunning);
+          const currentMeta = getSessionMeta(currentSessionId);
+          const isServerRunning = !!currentMeta?.isRunning;
+          setCurrentSessionRunningState(isServerRunning);
+          // 兜底：服务端确认 isRunning 从 true→false 且前端仍在生成态，
+          // 说明 done/background_done 因 WS detach 漏掉了。清除生成态并重新加载会话拿到完整输出。
+          if (currentMeta && wasServerRunning && !isServerRunning && hadStreamingUi) {
+            finishGenerating(currentSessionId);
+            beginSessionSwitch(currentSessionId, { blocking: false, force: true });
+          }
         }
         updateGoalBar();
         if (pendingInitialSessionLoad) {
@@ -1632,9 +1670,13 @@
           resetChatView(currentAgent);
         }
         break;
+      }
 
       case 'session_info':
         const snapshot = normalizeSessionSnapshot(msg);
+        // 断线补齐前置判定：applySessionSnapshot 会改写 currentSessionId / isGenerating / pendingText，
+        // 先按调用前状态捕获「本次快照是否保留流式」（条件与 applySessionSnapshot 内 preserveStreaming 同源）
+        const snapshotKeepsStreaming = !!(msg.sessionId === currentSessionId && msg.isRunning && isGenerating);
         if (activeSessionLoad?.sessionId === msg.sessionId) {
           activeSessionLoad.snapshot = snapshot;
         }
@@ -1643,6 +1685,16 @@
           suppressUnreadToast: false,
           preserveStreaming: msg.sessionId === currentSessionId && msg.isRunning,
         });
+        // 断线补齐：断线期间 text_delta 丢失会让流式气泡停留在残缺状态（黑洞）。
+        // 服务端对运行中会话在 session_info 附带实时全量输出（activeOutput），
+        // 仅当服务端内容比前端流式缓冲更长时整体覆盖（text_delta 为追加语义，
+        // 覆盖后后续 delta 继续追加），绝不倒退前端已渲染内容。
+        // 只在保留流式（重连/兜底补齐）场景生效，切会话等路径由 resume_generating 负责
+        if (snapshotKeepsStreaming && typeof snapshot.activeOutput === 'string'
+            && snapshot.activeOutput.length > (pendingText || '').length) {
+          pendingText = snapshot.activeOutput;
+          scheduleRender();
+        }
         if (!msg.historyPending) {
           if (activeSessionLoad?.sessionId === msg.sessionId) {
             finalizeLoadedSession(msg.sessionId);
@@ -1884,9 +1936,12 @@
           if (gs) { gs.active = false; gs.optimistic = false; }
         }
         if (msg.sessionId === currentSessionId) {
-          // Reload current session to show completed response
-          openSession(msg.sessionId, { forceSync: true, blocking: false });
+          // Task completed for current session — clear generating state without reloading
+          // (reloading would trigger scrollToBottom and interrupt user reading)
+          finishGenerating(msg.sessionId);
         } else {
+          // Task completed for background session — update cache + refresh session list
+          updateCachedSession(msg.sessionId, (snapshot) => { snapshot.isRunning = false; });
           send({ type: 'list_sessions' });
         }
         updateGoalBar();
@@ -3206,11 +3261,17 @@
   }
 
   // --- Send Message ---
-  // 不变量：空文本+无附件、生成中、会话加载阻塞时立即返回。
-  // /goal 在此走普通消息路径，由服务端 handleMessage 识别。
+  // 不变量：空文本+无附件、生成中、会话加载阻塞时立即返回；
+  // 未连接时立即返回并显示断线状态条（不清空输入框、不渲染气泡、不进入生成态，
+  // 避免 WS 断线窗口内发送被静默丢弃、重连快照又冲掉本地气泡）。
+  // /goal 在此走普通消息路径；Codex 会由服务端转换为目标提示。
   function sendMessage() {
     const text = msgInput.value.trim();
     if ((!text && pendingAttachments.length === 0) || isGenerating || isBlockingSessionLoad()) return;
+    if (!isWsConnected()) {
+      showConnBanner();
+      return;
+    }
     hideCmdMenu();
     hideOptionPicker();
 
@@ -3238,8 +3299,8 @@
     }
 
     // Slash commands: don't show as user bubble.
-    // /goal is special: it carries the user's real intent for Claude, so it falls through
-    // to the normal message path (renders user bubble, starts streaming UI).
+    // /goal carries the user's real intent and falls through to the normal message path.
+    // Claude receives its native command; Codex receives a compatible goal-creation prompt.
     if (text.startsWith('/') && !/^\/goal(?:\s|$)/i.test(text)) {
       if (pendingAttachments.length > 0) {
         appendError('命令消息暂不支持附带图片，请先移除图片或发送普通消息。');
@@ -5207,11 +5268,12 @@
       // WS is dead, force reconnect
       connect();
     } else if (ws.readyState === 1 && currentSessionId) {
-      // Preserve active streaming UI when returning to foreground.
-      if (isGenerating || currentSessionRunning) {
+      // 仅在有流式状态时才主动 load_session 重新 attach；
+      // 无任务时只刷新会话列表，避免触发 applySessionSnapshot → scrollToBottom 打断阅读
+      if (isGenerating || currentSessionRunning || document.getElementById('streaming-msg')) {
         send({ type: 'load_session', sessionId: currentSessionId });
       } else {
-        beginSessionSwitch(currentSessionId, { blocking: false, force: true });
+        send({ type: 'list_sessions' });
       }
     }
   });

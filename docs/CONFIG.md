@@ -27,6 +27,8 @@
 | `CC_WEB_SESSIONS_DIR` | `./sessions` | 会话目录覆盖 |
 | `CC_WEB_PUBLIC_DIR` | `./public` | 静态目录覆盖 |
 | `CC_WEB_LOGS_DIR` | `./logs` | 日志目录覆盖 |
+| `CC_WEB_WS_PING_INTERVAL_MS` | `25000` | WebSocket 心跳间隔（毫秒）。每轮 ping 全部客户端，连续两轮无 pong terminate 死连接 |
+| `CC_WEB_AUTOCOMPACT_PCT` | `80` | Claude 预防性水位压缩阈值（%，收敛到 10-99）。resume 前读 transcript jsonl 水位，达到 窗口（`[1m]` 模型 1M / 其他 200K）× 该比例 时先自动 `/compact` 再重放原消息。详见 [RUNTIME.md "自动 compact 重试"](./RUNTIME.md#自动-compact-重试) |
 | `CC_WEB_IP_WHITELIST` | — | 暴力破解豁免 IP 列表 |
 | `CC_WEB_TRUSTED_PROXIES` | — | 可信反向代理 CIDR/IP 列表（仅这些来源的 X-Forwarded-For 才被信任），默认空 = 最严格 |
 | `PUSHPLUS_TOKEN` | — | 遗留：首次运行迁移到 `config/notify.json` |

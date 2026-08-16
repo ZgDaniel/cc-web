@@ -30,6 +30,7 @@ const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { createAgentRuntime } = require('./lib/agent-runtime');
+const { estimateClaudeContextUsage, shouldPreemptiveCompact } = require('./lib/context-usage');
 const { createAuthStore } = require('./lib/auth');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
 const { createClientIpResolver } = require('./lib/client-ip');
@@ -61,6 +62,8 @@ const TOKENS_PATH = path.join(CONFIG_DIR, 'tokens.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
 const BANNED_IPS_PATH = path.join(CONFIG_DIR, 'banned_ips.json');
+// WS 心跳间隔（毫秒）：每轮 ping 全部客户端，连续两轮无 pong 判定死连接 terminate
+const WS_PING_INTERVAL_MS = parseInt(process.env.CC_WEB_WS_PING_INTERVAL_MS, 10) || 25000;
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -660,6 +663,19 @@ const pendingSlashCommands = new Map();
 
 // Pending compact retry metadata: sessionId -> { text: string, mode: string, reason: string }
 const pendingCompactRetries = new Map();
+
+// P2 预防性水位压缩阈值（%）：Claude resume 前读 transcript jsonl 水位，
+// 达到 窗口大小 × 该比例 则先自动 /compact 再重放原消息（CC_WEB_AUTOCOMPACT_PCT 可调，收敛到 10-99）
+const AUTOCOMPACT_PCT = Math.min(99, Math.max(10, parseInt(process.env.CC_WEB_AUTOCOMPACT_PCT, 10) || 80));
+
+// P2 防循环护栏：已对本会话做过预防压缩、且尚未观察到一次正常完成前，不再重复预防压缩。
+// 非压缩进程正常退出 / 手动 /compact / 删除会话 时解除。
+const preemptCompactGuard = new Set();
+
+// Per-session loop timers. Schedule data itself is persisted on session.loop.
+const activeLoops = new Map();
+const LOOP_MIN_INTERVAL_MS = 1000;
+const LOOP_MAX_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 // Active processes: sessionId -> { pid, ws, fullText, toolCalls, lastCost, tailer }
 const activeProcesses = new Map();
@@ -1368,6 +1384,20 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'taskMode')) session.taskMode = 'local';
   if (!Object.prototype.hasOwnProperty.call(session, 'sshHostId')) session.sshHostId = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'remoteCwd')) session.remoteCwd = '';
+  if (!Object.prototype.hasOwnProperty.call(session, 'loop')) session.loop = null;
+  if (session.loop) {
+    const intervalMs = Number(session.loop.intervalMs);
+    const prompt = typeof session.loop.prompt === 'string' ? session.loop.prompt.trim() : '';
+    if (!Number.isFinite(intervalMs) || intervalMs < LOOP_MIN_INTERVAL_MS || intervalMs > LOOP_MAX_INTERVAL_MS || !prompt) {
+      session.loop = null;
+    } else {
+      session.loop = {
+        intervalMs,
+        prompt,
+        nextRunAt: typeof session.loop.nextRunAt === 'string' ? session.loop.nextRunAt : new Date().toISOString(),
+      };
+    }
+  }
   if (!Object.prototype.hasOwnProperty.call(session, 'messages')) session.messages = [];
   if (Array.isArray(session.messages)) {
     session.messages = session.messages.map((message) => {
@@ -1523,6 +1553,83 @@ function sendSessionList(ws) {
     wsSend(ws, { type: 'session_list', sessions });
   } catch {
     wsSend(ws, { type: 'session_list', sessions: [] });
+  }
+}
+
+function parseLoopInterval(value) {
+  const match = String(value || '').trim().match(/^(\d+)(s|m|h)$/i);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const unit = match[2].toLowerCase();
+  const multiplier = unit === 'h' ? 60 * 60 * 1000 : unit === 'm' ? 60 * 1000 : 1000;
+  const intervalMs = amount * multiplier;
+  if (!Number.isSafeInteger(intervalMs) || intervalMs < LOOP_MIN_INTERVAL_MS || intervalMs > LOOP_MAX_INTERVAL_MS) return null;
+  return intervalMs;
+}
+
+function formatLoopInterval(intervalMs) {
+  if (intervalMs % (60 * 60 * 1000) === 0) return `${intervalMs / (60 * 60 * 1000)}h`;
+  if (intervalMs % (60 * 1000) === 0) return `${intervalMs / (60 * 1000)}m`;
+  return `${intervalMs / 1000}s`;
+}
+
+function getSessionSocket(sessionId) {
+  for (const [ws, viewedSessionId] of wsSessionMap) {
+    if (viewedSessionId === sessionId && ws.readyState === 1) return ws;
+  }
+  return null;
+}
+
+function stopSessionLoop(sessionId) {
+  const timer = activeLoops.get(sessionId);
+  if (timer) clearTimeout(timer);
+  activeLoops.delete(sessionId);
+}
+
+function scheduleSessionLoop(sessionId) {
+  stopSessionLoop(sessionId);
+  const session = loadSession(sessionId);
+  if (!session?.loop) return;
+  const dueAt = Date.parse(session.loop.nextRunAt);
+  const delay = Math.max(0, (Number.isFinite(dueAt) ? dueAt : Date.now()) - Date.now());
+  activeLoops.set(sessionId, setTimeout(() => runSessionLoop(sessionId), delay));
+}
+
+function runSessionLoop(sessionId) {
+  activeLoops.delete(sessionId);
+  const session = loadSession(sessionId);
+  if (!session?.loop) return;
+
+  const { intervalMs, prompt } = session.loop;
+  session.loop.nextRunAt = new Date(Date.now() + intervalMs).toISOString();
+  session.updated = new Date().toISOString();
+  saveSession(session);
+  scheduleSessionLoop(sessionId);
+
+  const ws = getSessionSocket(sessionId);
+  if (activeProcesses.has(sessionId)) {
+    wsSend(ws, { type: 'system_message', message: `◎ Loop · 当前任务仍在运行，已跳过本轮；下次 ${formatLoopInterval(intervalMs)} 后重试。` });
+    return;
+  }
+
+  wsSend(ws, { type: 'system_message', message: `◎ Loop · 正在执行周期提示：${prompt}` });
+  handleMessage(ws, {
+    text: prompt,
+    sessionId,
+    mode: session.permissionMode || 'yolo',
+    agent: getSessionAgent(session),
+  }, { hideInHistory: true });
+}
+
+function restoreSessionLoops() {
+  try {
+    for (const file of fs.readdirSync(SESSIONS_DIR)) {
+      if (!file.endsWith('.json')) continue;
+      const session = loadSession(path.basename(file, '.json'));
+      if (session?.loop) scheduleSessionLoop(session.id);
+    }
+  } catch (err) {
+    plog('WARN', 'loop_restore_failed', { error: err.message });
   }
 }
 
@@ -1700,7 +1807,14 @@ function isContextLimitError(agent, raw) {
   const text = String(raw || '');
   if (!text) return false;
   if (agent === 'claude') {
-    return /Request too large \(max 20MB\)/i.test(text);
+    // P0：Claude 超限识别。原版只匹配 `Request too large (max 20MB)`（请求体大小限制，
+    // 不是 token 超限），导致 Claude 侧自动 compact 兜底长期失效。
+    // 现补全 token 超限短语（均短语级匹配，禁止裸词宽匹配避免误判模型正文）：
+    //   - "prompt is too long"           ← API Error: Prompt is too long: N tokens > M maximum
+    //   - "context window / length"
+    //   - "exceed(s|ed) the maximum/context/token (limit/length)"
+    //   - "token limit" / "too many input tokens" / "maximum context length"
+    return /Request too large \(max 20MB\)|prompt is too long|context (window|length)|exceed(?:ed|s)?\s*(?:the\s*)?(?:maximum|context|token)|token limit|too many (?:input\s+)?tokens|maximum(?:\s+context)?\s+length/i.test(text);
   }
   return /context\s+(window|length)|maximum context length|context limit|token limit|too many tokens|input.*too long|prompt.*too long|request too large|please use\s*\/compact|use\s*\/compact|reduce (the )?(input|prompt|message)|exceed(?:ed|s).*(token|context)/i.test(text);
 }
@@ -1750,7 +1864,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       : null
   );
   contextLimitExceeded = isContextLimitError(entry.agent || 'claude', `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}`);
-  const completionError = rawCompletionError ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal }) : null;
+  let completionError = rawCompletionError ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal }) : null;
   if (!entry.lastError && rawCompletionError) entry.lastError = rawCompletionError;
 
   plog(exitCode === 0 || exitCode === null ? 'INFO' : 'WARN', 'process_complete', {
@@ -1779,9 +1893,25 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 
   const pendingSlash = pendingSlashCommands.get(sessionId) || null;
   if (pendingSlash) pendingSlashCommands.delete(sessionId);
+  // P2 护栏解除：一次正常（非 slash 注入）运行完成 = 预防压缩 → 重放 的完整闭环走通，
+  // 后续消息可再次按水位触发预防压缩；压缩运行本身不清除（防 compact→重放→再预防死循环）
+  else preemptCompactGuard.delete(sessionId);
 
   // Save result to session
   const session = loadSession(sessionId);
+  const retryCodexWithoutResume = !!(
+    session
+    && entry.agent === 'codex'
+    && entry.codexResumed
+    && !entry.codexResumeFallbackAttempted
+    && /custom tool call output is missing/i.test(`${stderrSnippet}\n${rawCompletionError || ''}`)
+  );
+  if (retryCodexWithoutResume) {
+    clearRuntimeSessionId(session);
+    session.updated = new Date().toISOString();
+    saveSession(session);
+    completionError = null;
+  }
   if (session && entry.fullText) {
     const msg = {
       role: 'assistant',
@@ -1873,6 +2003,17 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     buildNotifyContent(entry, sess, completionError, contextLimitExceeded).then(({ title: ntitle, content }) => {
       sendNotification(ntitle, content);
     });
+  }
+
+  if (retryCodexWithoutResume && entry.ws && entry.ws.readyState === 1 && session) {
+    wsSend(entry.ws, { type: 'system_message', message: '当前 Codex 线程包含无法由 cc-web 回放的宿主工具调用，已自动新建上下文并重试本次请求。' });
+    handleMessage(entry.ws, {
+      text: entry.inputText,
+      sessionId,
+      mode: entry.mode || session.permissionMode || 'yolo',
+      agent: 'codex',
+    }, { hideInHistory: true, codexResumeFallbackAttempted: true });
+    return;
   }
 
   if (!shouldReturnForFollowup && !shouldAutoCompact && !contextLimitExceeded && pendingRetry && pendingRetry.text === (entry.fullText || '').trim()) {
@@ -2127,6 +2268,10 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
+  // WS 心跳状态初始化：pong 回应会刷新 isAlive；连续两轮无 pong 由启动区定时器 terminate
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   const clientIP = resolveClientIP(req);
 
   // Check if IP is banned
@@ -2709,6 +2854,8 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
   switch (cmd) {
     case '/clear': {
       if (session) {
+        stopSessionLoop(session.id);
+        session.loop = null;
         if (activeProcesses.has(sessionId)) {
           const entry = activeProcesses.get(sessionId);
           killProcess(entry.pid);
@@ -2737,6 +2884,39 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         });
       }
       wsSend(ws, { type: 'system_message', message: '会话已清除，上下文已重置。' });
+      break;
+    }
+
+    case '/loop': {
+      if (!sessionId || !session) {
+        wsSend(ws, { type: 'system_message', message: '请先创建或进入一个会话，再设置 /loop。' });
+        break;
+      }
+      const loopArgument = String(parts[1] || '').toLowerCase();
+      if (loopArgument === 'off' || loopArgument === 'clear') {
+        const wasActive = !!session.loop;
+        stopSessionLoop(session.id);
+        session.loop = null;
+        session.updated = new Date().toISOString();
+        saveSession(session);
+        wsSend(ws, { type: 'system_message', message: wasActive ? '已停止当前会话的 /loop。' : '当前会话没有运行中的 /loop。' });
+        break;
+      }
+      const intervalMs = parseLoopInterval(parts[1]);
+      const prompt = text.replace(/^\/loop\s+\S+\s*/i, '').trim();
+      if (!intervalMs || !prompt) {
+        wsSend(ws, { type: 'system_message', message: '用法: /loop <间隔> <提示>，间隔支持 s、m、h（1s–24h）。例如: /loop 10m 检查测试状态并继续完成剩余工作。\n用 /loop off 停止。' });
+        break;
+      }
+      session.loop = {
+        intervalMs,
+        prompt,
+        nextRunAt: new Date(Date.now() + intervalMs).toISOString(),
+      };
+      session.updated = new Date().toISOString();
+      saveSession(session);
+      scheduleSessionLoop(session.id);
+      wsSend(ws, { type: 'system_message', message: `已设置 /loop：每 ${formatLoopInterval(intervalMs)} 执行一次“${prompt}”。任务运行中时会跳过本轮；用 /loop off 停止。` });
       break;
     }
 
@@ -2811,6 +2991,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       }
 
       wsSend(ws, { type: 'system_message', message: compactStartMessage(agent) });
+      preemptCompactGuard.delete(session.id); // 手动 /compact 会重置水位，解除预防压缩护栏
       pendingSlashCommands.set(session.id, { kind: 'compact' });
       handleMessage(ws, { text: '/compact', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
       break;
@@ -2925,7 +3106,9 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         '/clear — 清除当前会话（含上下文）\n' +
         '/mode [模式] — 查看/切换权限模式（default, plan, yolo）\n' +
         '/cost — 查看当前会话累计统计\n' +
-        '/goal <条件> — Claude 自治多轮工作直到条件达成\n' +
+        '/goal <条件> — 建立并持续维护目标（Claude 原生；Codex 兼容提示）\n' +
+        '/loop <间隔> <提示> — 定期执行提示（如 /loop 10m 检查测试）\n' +
+        '/loop off — 停止当前会话的定期执行\n' +
         '/github [指令] — GitHub 操作（读取开发者配置后执行）\n' +
         '/ssh [指令] — SSH 远程操作（读取开发者配置后执行）\n' +
         '/help — 显示本帮助';
@@ -3083,6 +3266,9 @@ function handleLoadSession(ws, sessionId) {
     historyPending: olderChunks.length > 0,
     updated: session.updated,
     isRunning: activeProcesses.has(sessionId),
+    // 断线补齐数据源：运行中任务的实时全量输出（内存 fullText，尚未落盘）。
+    // undefined 时 JSON.stringify 自动省略该键，无任务的 load_session 行为与旧版完全一致
+    activeOutput: activeProcesses.has(sessionId) ? (activeProcesses.get(sessionId).fullText || '') : undefined,
     taskMode: session.taskMode || 'local',
     sshHostId: session.sshHostId || '',
     remoteCwd: session.remoteCwd || '',
@@ -3182,6 +3368,7 @@ function deleteCodexLocalSession(session) {
 function handleDeleteSession(ws, sessionId) {
   pendingSlashCommands.delete(sessionId);
   pendingCompactRetries.delete(sessionId);
+  preemptCompactGuard.delete(sessionId);
   if (activeProcesses.has(sessionId)) {
     const entry = activeProcesses.get(sessionId);
     try { killProcess(entry.pid); } catch {}
@@ -3355,6 +3542,46 @@ function handleMessage(ws, msg, options = {}) {
     session.permissionMode = mode;
   }
 
+  // === P2 预防性水位压缩（仅 Claude resume 场景）===
+  // 发送前读 transcript jsonl 水位，接近上限（默认 80%）则先 /compact 再重放原消息，
+  // 复用 P0 自动 compact 注入链路（pendingCompactRetries + pendingSlashCommands + 重放）。
+  // 约束：定位/估算/判定任何一步不确定（无 jsonl、无 usage、解析失败、带附件无法重放、
+  // 处于自动压缩重试循环等）一律不触发，直接走原流程——正常路径零改变。
+  if (
+    isClaudeSession(session)
+    && session.claudeSessionId
+    && normalizedText
+    && normalizedText !== '/compact'
+    && !hideInHistory
+    && resolvedAttachments.length === 0
+    && !preemptCompactGuard.has(session.id)
+    && pendingCompactRetries.get(session.id)?.reason !== 'auto'
+  ) {
+    try {
+      const jsonlPath = locateClaudeSessionJsonl(session.claudeSessionId);
+      const usageTokens = jsonlPath ? estimateClaudeContextUsage(jsonlPath) : null;
+      if (usageTokens !== null && shouldPreemptiveCompact(usageTokens, session.model, AUTOCOMPACT_PCT)) {
+        preemptCompactGuard.add(session.id);
+        session.updated = new Date().toISOString();
+        saveSession(session);
+        plog('INFO', 'preemptive_compact', {
+          sessionId: session.id.slice(0, 8),
+          usageTokens,
+          windowTokens: /1m/i.test(String(session.model || '')) ? 1_000_000 : 200_000,
+          pct: AUTOCOMPACT_PCT,
+          model: session.model || 'default',
+        });
+        wsSend(ws, { type: 'system_message', kind: 'compact', message: '◎ 检测到上下文接近上限，先执行压缩再发送您的消息' });
+        // 与 handleProcessComplete 的 auto 分支完全一致的注入方式：
+        // reason:'auto' 的重试条目 + kind:'compact' 的 slash 标记 + /compact 走 handleMessage spawn
+        pendingCompactRetries.set(session.id, { text: normalizedText, mode: session.permissionMode || 'yolo', reason: 'auto' });
+        pendingSlashCommands.set(session.id, { kind: 'compact' });
+        handleMessage(ws, { text: '/compact', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
+        return;
+      }
+    } catch {}
+  }
+
   if (!hideInHistory && normalizedText !== '/compact' && getRuntimeSessionId(session)) {
     pendingCompactRetries.set(session.id, { text: normalizedText, mode: session.permissionMode || 'yolo', reason: 'normal' });
   }
@@ -3404,6 +3631,14 @@ function handleMessage(ws, msg, options = {}) {
   }
   sendSessionList(ws);
 
+  const codexGoalMatch = getSessionAgent(session) === 'codex'
+    ? normalizedText.match(/^\/goal(?:\s+(.+))?$/i)
+    : null;
+  const spawnText = codexGoalMatch
+    ? (codexGoalMatch[1]
+      ? `Create and persist a durable goal for this thread: ${codexGoalMatch[1].trim()}\n\nWork autonomously toward this goal now. Keep the goal updated with meaningful progress, and only mark it complete when the stated condition is satisfied.`
+      : 'Clear the durable goal for this thread. Confirm that it has been removed.')
+    : textValue;
   const spawnSpec = isClaudeSession(session)
     ? buildClaudeSpawnSpec(session, { attachments: resolvedAttachments })
     : buildCodexSpawnSpec(session, { attachments: resolvedAttachments });
@@ -3424,7 +3659,7 @@ function handleMessage(ws, msg, options = {}) {
 
   if (useStreamJson) {
     const content = [];
-    if (textValue) content.push({ type: 'text', text: textValue });
+    if (spawnText) content.push({ type: 'text', text: spawnText });
     for (const attachment of resolvedAttachments) {
       const data = fs.readFileSync(attachment.path).toString('base64');
       content.push({
@@ -3444,7 +3679,7 @@ function handleMessage(ws, msg, options = {}) {
       },
     })}\n`);
   } else {
-    fs.writeFileSync(inputPath, textValue);
+    fs.writeFileSync(inputPath, spawnText);
   }
 
   const outputFd = fs.openSync(outputPath, 'w');
@@ -3517,6 +3752,10 @@ function handleMessage(ws, msg, options = {}) {
     ws,
     agent: getSessionAgent(session),
     cwd: spawnSpec.cwd,
+    inputText: spawnText,
+    mode: session.permissionMode || 'yolo',
+    codexResumed: !!spawnSpec.resume,
+    codexResumeFallbackAttempted: !!options.codexResumeFallbackAttempted,
     fullText: '',
     attachments: resolvedAttachments,
     toolCalls: [],
@@ -3653,7 +3892,9 @@ const CODEX_SESSIONS_DIR = path.join(process.env.HOME || process.env.USERPROFILE
 const CODEX_STATE_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'state_5.sqlite');
 const CODEX_LOG_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'logs_1.sqlite');
 
-function resolveClaudeSessionLocalMeta(claudeSessionId) {
+// 从 ~/.claude/projects/<dir>/<sanitized-id>.jsonl 定位 Claude 原生 transcript 文件。
+// 找不到（含 HOME 缺失/目录不可读）返回 null；调用方必须容忍 null。
+function locateClaudeSessionJsonl(claudeSessionId) {
   if (!claudeSessionId) return null;
   try {
     const dirs = fs.readdirSync(CLAUDE_PROJECTS_DIR).filter((dir) => {
@@ -3661,25 +3902,32 @@ function resolveClaudeSessionLocalMeta(claudeSessionId) {
     });
     for (const dir of dirs) {
       const filePath = path.join(CLAUDE_PROJECTS_DIR, dir, `${sanitizeId(claudeSessionId)}.jsonl`);
-      if (!fs.existsSync(filePath)) continue;
+      if (fs.existsSync(filePath)) return filePath;
+    }
+  } catch {}
+  return null;
+}
+
+function resolveClaudeSessionLocalMeta(claudeSessionId) {
+  if (!claudeSessionId) return null;
+  const filePath = locateClaudeSessionJsonl(claudeSessionId);
+  if (!filePath) return null;
+  try {
+    const content = fs.readFileSync(filePath, 'utf8');
+    const lines = content.split('\n');
+    let cwd = null;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
       try {
-        const content = fs.readFileSync(filePath, 'utf8');
-        const lines = content.split('\n');
-        let cwd = null;
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          try {
-            const entry = JSON.parse(trimmed);
-            if (entry.type === 'user' && entry.cwd) {
-              cwd = entry.cwd;
-              break;
-            }
-          } catch {}
+        const entry = JSON.parse(trimmed);
+        if (entry.type === 'user' && entry.cwd) {
+          cwd = entry.cwd;
+          break;
         }
-        return { cwd, projectDir: dir, filePath };
       } catch {}
     }
+    return { cwd, projectDir: path.basename(path.dirname(filePath)), filePath };
   } catch {}
   return null;
 }
@@ -4009,6 +4257,18 @@ function handleListCwdSuggestions(ws) {
 
 // === Startup ===
 recoverProcesses();
+restoreSessionLoops();
+
+// WS 心跳（ws 库官方 heartbeat 模式）：每轮先把客户端标记为待验证并发 ping；
+// 下一轮仍见 isAlive===false（无 pong 回应）判定为死连接，terminate 释放。
+// 网络闪断后无需等 TCP 超时即可发现死连接。定时器不 unref（服务常驻）
+setInterval(() => {
+  for (const client of wss.clients) {
+    if (client.isAlive === false) { client.terminate(); continue; }
+    client.isAlive = false;
+    try { client.ping(); } catch {}
+  }
+}, WS_PING_INTERVAL_MS);
 
 // Periodic heartbeat: log active processes status every 60s
 setInterval(() => {

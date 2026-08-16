@@ -127,14 +127,47 @@ handleProcessComplete                  ← server.js
 
 核心位置：`server.js` 中 `handleProcessComplete` 函数（按函数名定位最稳）。
 
+#### 超限错误识别（双正则）
+
+`isContextLimitError(agent, raw)` 对 stderr / fullText / completion error 做联合匹配，双 Agent 各一套短语级正则（禁止裸词宽匹配，避免把模型正文里的普通词误判为超限）：
+
+- **Claude 分支**：`Request too large (max 20MB)`（请求体大小限制）+ token 超限短语族——`prompt is too long`（真实 CLI 报错形态：`API Error: Prompt is too long: N tokens > M maximum`）、`context window/length`、`exceed(s|ed) the maximum/context/token`、`token limit`、`too many (input) tokens`、`maximum (context) length`。
+  历史缺陷：旧版只匹配 `Request too large (max 20MB)`，那不是 token 超限，导致 Claude 侧自动 compact 兜底长期失效（超限必报错、只能手动 `/compact`）。
+- **Codex 分支**：`context window/length`、`token limit`、`please use /compact`、`reduce the input/prompt/message` 等（自始完整）。
+
+#### compact 事件透传（stream-json）
+
+CLI 执行压缩时 cc-web 把 compact 边界事件转成 `system_message`（`kind: 'compact'`）推给前端（`lib/agent-runtime.js`）：
+
+- **Claude**：stream-json stdout 事件形态（CLI 2.1.145 实测）为 `{ type:'system', subtype:'compact_boundary', compact_metadata:{ trigger:'manual'|'auto', pre_tokens, post_tokens, duration_ms }, session_id }`（注意 stdout 为 snake_case；落盘 transcript jsonl 为 camelCase `compactMetadata.preTokens/postTokens`，两种都兼容）。文案：`◎ 上下文已压缩（前 93,158 → 后 5,762 tokens）`，token 数取不到时退化为 `◎ 上下文已压缩`。
+- **Codex**：压缩产物是 `compaction` / `context_compaction` 类型的 item（`item.started` / `item.completed`，不带 pre/post token 数），completed 时发 `◎ 上下文已压缩`，且不当工具调用渲染。
+
+#### 预防性水位压缩（P2，事前预防）
+
+与事后兜底（上面 P0）叠加成双保险，互不依赖。仅 Claude resume 场景（`session.claudeSessionId` 存在）生效：
+
+1. `handleMessage` 在构造 spawn 之前，用 `locateClaudeSessionJsonl`（复用原生导入的定位方式）找 `~/.claude/projects/<dir>/<sessionId>.jsonl`
+2. `lib/context-usage.js` 的 `estimateClaudeContextUsage` 从文件**末尾向前**找最后一条带 usage 的 assistant 记录，取 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`（≈ 下一次请求的上下文规模）
+3. `shouldPreemptiveCompact(usage, model, CC_WEB_AUTOCOMPACT_PCT)`：窗口 = 模型标签含 `[1m]` → 1,000,000，否则 200,000；水位 ≥ 窗口 × 阈值%（默认 80%）即触发
+4. 触发时发 `◎ 检测到上下文接近上限，先执行压缩再发送您的消息`，然后**复用 P0 注入链路**：写 `pendingCompactRetries`（`reason:'auto'`，text=原消息）+ `pendingSlashCommands`（`kind:'compact'`）+ 以 `/compact` 为输入走 `handleMessage` spawn；compact 完成后原消息由现有 `handleProcessComplete` 重放链路发送
+
+**零改变约束**：定位不到 jsonl / 无 usage / 解析异常 / 带附件（无法重放）/ 文本为空——一律静默走原流程。防循环护栏 `preemptCompactGuard`：预防压缩后直到观察到一次正常（非 slash 注入）运行完成、或用户手动 `/compact`、或删除会话之前，不再对同一会话重复预防压缩。
+
 ### `/goal` 多轮自治
 
 `/goal` 是绕过 slash 分发器的特殊路径：
 
 - 在 `handleMessage`（`server.js`）独立处理
+- Claude 原样执行原生命令；Codex `exec` 会被改写为目标创建/清除提示，使同一 Web UI 可用
 - 双重正则排除 `/^\/goal(?:\s|$)/i`（一处 WS switch 前、一处 `handleMessage` 内）防止走 `handleSlashCommand` switch
 - 把"继续追问条件"塞入 `pendingCompactRetries`，靠 `handleProcessComplete` 循环驱动下一轮
 - 前端 per-session LRU（cap 100）+ 三态分类 + optimistic flag 抗竞态
+
+### `/loop` 定期执行
+
+- session 的 `loop` 字段保存 `intervalMs`、`prompt` 和 `nextRunAt`；`normalizeSession()` 校验其范围
+- `activeLoops` 仅保存内存定时器，启动时 `restoreSessionLoops()` 按 session 中的计划恢复
+- 到点时若该会话有 agent 运行，发送状态消息并跳过；否则以隐藏的用户历史消息触发同一条 `handleMessage()` 链路
 
 ### 懒加载历史
 
@@ -180,3 +213,15 @@ WS 连接掉线（网络抖动 / 临时断开）时前端自动重连，体验�
 3. 旧 WS 收到 close 后重连，但 token 已失效，被踢回登录页
 
 **关键不变量**：改密完成的瞬间，没有任何旧 token 能继续操作 WS，也没有任何旧 WS 连接能继续 send。
+
+### WS 心跳与断线内容补齐
+
+**心跳**（服务端 `wss` 连接入口 + 启动区定时器，按 `WS_PING_INTERVAL_MS` 定位）：每 `CC_WEB_WS_PING_INTERVAL_MS`（默认 25s）ping 全部客户端，连接收到 pong 会刷新 `isAlive`；连续两轮无 pong 判定死连接并 `terminate`。网络闪断后无需等 TCP 超时即可释放死连接，避免半开连接长期占用与僵尸 attach。
+
+**断线内容补齐**：运行中任务的流式文本只存在 `activeProcesses` entry 的内存 `fullText` 中（落盘要等任务结束）。断线期间丢失的 `text_delta` 通过以下链路补齐：
+
+1. 前端重连后（保留流式气泡时）发送 `load_session`
+2. 服务端 `handleLoadSession` 在 `session_info` 中附带 `activeOutput`（entry.fullText 快照，仅运行中会话携带）
+3. 前端在 `case 'session_info'` 中守卫补齐：**仅当 `activeOutput` 比本地流式缓冲 `pendingText` 更长时整体覆盖**，绝不倒退已渲染内容；`text_delta` 为追加语义，覆盖后后续增量继续拼接
+
+`resume_generating`（紧随 `session_info` 之后发送）仍按替换语义恢复完整生成态，两者共同覆盖"重连补齐"与"切回运行中会话"两条路径。
