@@ -628,6 +628,62 @@ async function main() {
     assert(runtimeToml.includes('base_url = "https://example.org/v1"'), 'Codex custom profile should write isolated runtime base_url');
     assert(runtimeToml.includes('model = "gpt-5.4"'), 'Codex custom profile should write isolated runtime model');
 
+    // 保存模型配置触发全量模型重映射时，会话 updated 不得被刷新（时间戳批量污染回归）
+    const remapSessionId = 'regression-remap-claude-session';
+    const remapSessionPath = path.join(sessionsDir, `${remapSessionId}.json`);
+    const remapUpdatedBefore = '2026-01-01T00:00:00.000Z';
+    // 第一步：先保存旧模板 v1，建立 current 配置基线（真实场景：会话先在旧模板下创建）
+    ws.send(JSON.stringify({
+      type: 'save_model_config',
+      config: {
+        mode: 'custom',
+        activeTemplate: 'Regression Template',
+        templates: [{
+          name: 'Regression Template',
+          apiKey: 'sk-regression-model',
+          apiBase: 'https://example.org/v1',
+          opusModel: 'regression-opus-v1',
+        }],
+      },
+    }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'model_config' && msg.config?.templates?.[0]?.opusModel === 'regression-opus-v1');
+    // 写入旧模板模型名的会话
+    fs.writeFileSync(remapSessionPath, JSON.stringify({
+      id: remapSessionId,
+      title: 'Regression Remap Session',
+      created: remapUpdatedBefore,
+      updated: remapUpdatedBefore,
+      agent: 'claude',
+      model: 'regression-opus-v1[1m]',
+      messages: [],
+    }, null, 2));
+    // 第二步：模板模型名改为 v2，触发全量模型重映射（旧名 v1 与新名 v2 都在查找表中）
+    ws.send(JSON.stringify({
+      type: 'save_model_config',
+      config: {
+        mode: 'custom',
+        activeTemplate: 'Regression Template',
+        templates: [{
+          name: 'Regression Template',
+          apiKey: 'sk-regression-model',
+          apiBase: 'https://example.org/v1',
+          opusModel: 'regression-opus-v2',
+        }],
+      },
+    }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'model_config' && msg.config?.templates?.[0]?.opusModel === 'regression-opus-v2');
+    await waitForFile(remapSessionPath, 15000);
+    const remapStored = JSON.parse(fs.readFileSync(remapSessionPath, 'utf8'));
+    assert(remapStored.model === 'regression-opus-v2[1m]', '保存模型配置后旧模型名会话应被重映射为新模板模型名');
+    assert(remapStored.updated === remapUpdatedBefore, '模型重映射不得刷新会话 updated 时间戳（时间戳批量污染回归）');
+    // 恢复 local 模式，避免影响后续测试的模型配置状态
+    ws.send(JSON.stringify({
+      type: 'save_model_config',
+      config: { mode: 'local', activeTemplate: '', templates: [] },
+    }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'model_config' && msg.config?.mode === 'local');
+    try { fs.rmSync(remapSessionPath); } catch {}
+
     ws.send(JSON.stringify({ type: 'message', text: '/compact', sessionId: firstMessageSession.sessionId, mode: 'yolo', agent: 'codex' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /正在执行/.test(msg.message || '') && /Codex \/compact/.test(msg.message || ''));
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
@@ -711,6 +767,56 @@ async function main() {
     assert(/keep going/.test(goalEvents[idxFeedback].message || ''), '/goal feedback must contain evaluator hint');
     const goalUnknownCmd = goalEvents.find((e) => e.type === 'system_message' && /未知指令/.test(e.message || ''));
     assert(!goalUnknownCmd, '/goal must bypass cc-web slash command interceptor (no "未知指令")');
+
+    // Cloudflare dev config: save with token + 2 zones, verify masked echo & disk merge.
+    const cfTokenValue = 'cf-regression-token-1234567890';
+    ws.send(JSON.stringify({
+      type: 'save_dev_config',
+      config: {
+        github: { token: '', repos: [] },
+        ssh: { hosts: [] },
+        cloudflare: {
+          apiToken: cfTokenValue,
+          zones: [
+            { name: 'example.com', notes: '主站' },
+            { name: 'example.org', notes: '' },
+          ],
+        },
+      },
+    }));
+    const cfConfigMsg = await nextMessage(messages, ws, (msg) => msg.type === 'dev_config');
+    assert(cfConfigMsg.config.cloudflare?.apiToken?.includes('****') && !cfConfigMsg.config.cloudflare.apiToken.includes(cfTokenValue), 'Cloudflare API token must be masked in dev_config echo');
+    assert(cfConfigMsg.config.cloudflare?.zones?.length === 2 && cfConfigMsg.config.cloudflare.zones[0]?.name === 'example.com', 'Cloudflare zones must round-trip completely');
+    assert(cfConfigMsg.config.cloudflare.zones.every(z => /^z_[0-9a-f]{8}$/.test(z.id || '')), 'Cloudflare zones should auto-generate z_ + 8-hex ids');
+
+    // Re-save with masked token -> original token must survive on disk.
+    ws.send(JSON.stringify({
+      type: 'save_dev_config',
+      config: {
+        github: { token: '', repos: [] },
+        ssh: { hosts: [] },
+        cloudflare: { apiToken: cfConfigMsg.config.cloudflare.apiToken, zones: cfConfigMsg.config.cloudflare.zones },
+      },
+    }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'dev_config' && msg.config.cloudflare?.apiToken === cfConfigMsg.config.cloudflare.apiToken);
+    const devJsonOnDisk = JSON.parse(fs.readFileSync(path.join(configDir, 'dev.json'), 'utf8'));
+    assert(devJsonOnDisk.cloudflare?.apiToken === cfTokenValue, 'Masked Cloudflare token save must keep the original token on disk');
+
+    // /cf with args: prompt injected to CLI must contain the raw token, endpoint, zone name and user instruction.
+    ws.send(JSON.stringify({ type: 'message', text: '/cf 检查 DNS', sessionId: claudeImageSession.sessionId, mode: 'plan', agent: 'claude' }));
+    const cfPromptDelta = await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /api\.cloudflare\.com/.test(msg.text || ''));
+    assert(cfPromptDelta.text.includes(cfTokenValue), '/cf prompt must inject the raw Cloudflare API token to the CLI');
+    assert(/Bearer/.test(cfPromptDelta.text || '') && /api\.cloudflare\.com\/client\/v4/.test(cfPromptDelta.text || ''), '/cf prompt must include endpoint and Bearer auth instructions');
+    assert(/example\.com/.test(cfPromptDelta.text || ''), '/cf prompt must list configured zone names');
+    assert(/检查 DNS/.test(cfPromptDelta.text || ''), '/cf prompt must carry the user instruction');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === claudeImageSession.sessionId);
+    const cfSessionOnDisk = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
+    assert(!(cfSessionOnDisk.messages || []).some(m => m.role === 'user' && String(m.content || '').includes(cfTokenValue)), '/cf prompt with raw token must not be persisted as a user message');
+
+    // /cf without args: usage hint via system_message.
+    ws.send(JSON.stringify({ type: 'message', text: '/cf', sessionId: claudeImageSession.sessionId, mode: 'plan', agent: 'claude' }));
+    const cfUsage = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /用法: \/cf/.test(msg.message || ''));
+    assert(/cf/.test(cfUsage.message || ''), '/cf without args should emit a usage system_message');
     const goalSessionJson = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
     assert(!JSON.stringify(goalSessionJson.messages || []).includes('Stop hook feedback'), '/goal Stop hook feedback must not be persisted to session.messages');
 
@@ -876,6 +982,9 @@ async function main() {
   // Client IP resolution + IP ban enforcement (Goal 3)
   await testClientIpResolution();
   await testIpBanEnforcement();
+
+  // 会话分组协议（group_create/rename/delete + session_move）
+  await testSessionGroups();
 }
 
 // Pure-function tests for client IP resolution (Goal 3).
@@ -1413,6 +1522,100 @@ async function testXssHardening() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('XSS hardening checks passed.');
+}
+
+// 会话分组（groups.json + session.group + group_* 协议）。
+//  1) group_create → 广播 group_list 含新组；重名 → error
+//  2) session_move → session json 的 group 字段 + session_list 的 group 字段，
+//     且 updated 时间戳不被污染（归组不算会话活动）
+//  3) group_rename → group_list 断言新名
+//  4) group_delete → 组内 2 个会话的 json 文件消失 + group_list 不含该组 +
+//     session_list 不含这 2 个会话
+async function testSessionGroups() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-groups-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  for (const d of [configDir, sessionsDir, logsDir, homeDir]) mkdirp(d);
+  const password = 'Groups!234';
+  const port = await getFreePort();
+
+  // 直接落盘两个最小会话（不走 CLI spawn，纯数据层验证）
+  const sessionIds = ['group-sess-a', 'group-sess-b'];
+  const fixedUpdated = '2026-01-01T00:00:00.000Z';
+  for (const sid of sessionIds) {
+    fs.writeFileSync(path.join(sessionsDir, `${sid}.json`), JSON.stringify({
+      id: sid,
+      title: `分组测试 ${sid}`,
+      agent: 'claude',
+      updated: fixedUpdated,
+      messages: [],
+    }, null, 2));
+  }
+
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    const { ws, messages } = await connectWs(port, password);
+    // auth 成功后服务端先推 group_list 再推 session_list
+    const initialGroups = await nextMessage(messages, ws, (msg) => msg.type === 'group_list');
+    assert(Array.isArray(initialGroups.groups) && initialGroups.groups.length === 0, 'auth should push empty group_list initially');
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.length === 2);
+
+    // 1) 建组：广播 group_list 含新组
+    ws.send(JSON.stringify({ type: 'group_create', name: '测试分组' }));
+    const created = await nextMessage(messages, ws, (msg) => msg.type === 'group_list' && msg.groups.some((g) => g.name === '测试分组'));
+    const groupId = created.groups.find((g) => g.name === '测试分组').id;
+    assert(/^g_[0-9a-f]{8}$/.test(groupId), 'group id should be g_ + 8 hex chars');
+    const groupsJson = JSON.parse(fs.readFileSync(path.join(configDir, 'groups.json'), 'utf8'));
+    assert(groupsJson.groups.some((g) => g.id === groupId && g.created), 'groups.json should persist the new group with created');
+
+    // 1b) 重名拒绝
+    ws.send(JSON.stringify({ type: 'group_create', name: '测试分组' }));
+    const dupError = await nextMessage(messages, ws, (msg) => msg.type === 'error');
+    assert(/已存在/.test(dupError.message || ''), 'duplicate group name should be rejected with error');
+
+    // 2) session_move：json group 字段 + session_list group 字段 + updated 不变
+    ws.send(JSON.stringify({ type: 'session_move', sessionId: sessionIds[0], groupId }));
+    const movedList = await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.find((s) => s.id === sessionIds[0])?.group === groupId);
+    assert(movedList.sessions.find((s) => s.id === sessionIds[0]).group === groupId, 'session_list should carry group field after move');
+    const movedJson = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${sessionIds[0]}.json`), 'utf8'));
+    assert(movedJson.group === groupId, 'session json should persist group field');
+    assert(movedJson.updated === fixedUpdated, 'session_move must NOT touch session.updated (归组不算会话活动)');
+
+    // 2b) 非法 groupId 拒绝
+    ws.send(JSON.stringify({ type: 'session_move', sessionId: sessionIds[1], groupId: 'g_nope1234' }));
+    const badMove = await nextMessage(messages, ws, (msg) => msg.type === 'error');
+    assert(/分组不存在/.test(badMove.message || ''), 'session_move to unknown group should be rejected');
+
+    // 3) 改名
+    ws.send(JSON.stringify({ type: 'group_rename', groupId, name: '改名后的组' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'group_list' && msg.groups.some((g) => g.id === groupId && g.name === '改名后的组'));
+
+    // 4) 第二个会话也移入 → 删组连带删 2 个会话
+    ws.send(JSON.stringify({ type: 'session_move', sessionId: sessionIds[1], groupId }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.find((s) => s.id === sessionIds[1])?.group === groupId);
+    ws.send(JSON.stringify({ type: 'group_delete', groupId }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'group_list' && !msg.groups.some((g) => g.id === groupId));
+    assert(!fs.existsSync(path.join(sessionsDir, `${sessionIds[0]}.json`)), 'group_delete should delete member session json (a)');
+    assert(!fs.existsSync(path.join(sessionsDir, `${sessionIds[1]}.json`)), 'group_delete should delete member session json (b)');
+    // 等待"成员已消失"的 session_list（跳过队列中残留的更早广播，如 rename 触发的）
+    const afterDelete = await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && !msg.sessions.some((s) => sessionIds.includes(s.id)));
+    assert(!afterDelete.sessions.some((s) => sessionIds.includes(s.id)), 'session_list after group_delete must not contain member sessions');
+
+    ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('Session group checks passed.');
 }
 
 main().catch((err) => {

@@ -6,7 +6,7 @@
 
 ### 客户端 → 服务端
 
-`server.js` 客户端消息入口：`auth` 单独分支 + switch 共 30 个 case = **31 个 type**（按符号名 `ws.on('message')` 与 switch 定位最稳）。
+`server.js` 客户端消息入口：`auth` 单独分支 + switch 共 34 个 case = **35 个 type**（按符号名 `ws.on('message')` 与 switch 定位最稳）。
 
 | 类型 | 用途 |
 |---|---|
@@ -32,17 +32,22 @@
 | `list_native_sessions` / `import_native_session` | Claude 原生会话 |
 | `list_codex_sessions` / `import_codex_session` | Codex 原生会话 |
 | `list_cwd_suggestions` | cwd 建议列表 |
+| `group_create { name }` | 新建分组（trim 非空、重名拒绝） |
+| `group_rename { groupId, name }` | 重命名分组（同名校验排除自身） |
+| `group_delete { groupId }` | 删除分组（**连带删除组内全部会话**，复用单删清理逻辑） |
+| `session_move { sessionId, groupId }` | 会话归组/移出分组（`groupId` 为 `''`/null = 移出；**不改 `session.updated`**） |
 
 ### 服务端 → 客户端
 
-`public/app.js` 中 `handleServerMessage` 函数，共 **30 个 case**：
+`public/app.js` 中 `handleServerMessage` 函数，共 **31 个 case**：
 
 | 类型 | 用途 |
 |---|---|
 | `auth_result` | 鉴权结果。失败时含 `reason`（`invalid_password` / `session_expired` / `auth_failed`，3 类收敛值）+ 可选 `banned: true` |
 | `error` | 错误 |
 | `system_message` | 系统消息（含 `kind: 'goal_feedback'` / `'compact'` 等，未知 kind 走默认渲染，见下方示例） |
-| `session_list` | 会话列表 |
+| `session_list` | 会话列表。每个会话对象含 `group` 字段（所属分组 id，`''`=未分组） |
+| `group_list` | 分组列表 `[{ id, name }]`。①每个客户端 auth 成功后推一次 ②任何分组增删改名/归组后向**所有已认证连接**广播（随发 `group_list` + `session_list`，多设备同步） |
 | `session_info` | 会话元信息。运行中会话额外附带 `activeOutput`（string，内存实时全量输出，用于断线补齐，见 [RUNTIME.md](./RUNTIME.md#ws-心跳与断线内容补齐)）；任务结束后该键省略 |
 | `session_history_chunk` | 历史分块（懒加载，详见 [RUNTIME.md](./RUNTIME.md#懒加载历史)） |
 | `resume_generating` | 恢复生成态 |
@@ -181,6 +186,7 @@ compact 相关提示（`kind: 'compact'`，走已有 system_message 默认渲染
 | `/loop <间隔> <提示>` | 定期执行提示；支持 `s`、`m`、`h`（1 秒–24 小时） |
 | `/github` | 注入 GitHub repos 上下文（来自 dev.json） |
 | `/ssh` | 注入 SSH hosts 上下文（来自 dev.json） |
+| `/cf [指令]` | 注入 Cloudflare API 上下文（endpoint + Bearer token + zones，来自 dev.json），交给 CLI 执行 DNS/缓存等操作 |
 | `/help` | 显示帮助 |
 
 ### `/goal`（特殊路径，不在 switch 中）

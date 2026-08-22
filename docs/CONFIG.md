@@ -13,7 +13,18 @@
 | `notify.json` | 推送通道配置 + AI 摘要设置 |
 | `model.json` | Claude 模型模板 + 当前活动模板 |
 | `codex.json` | Codex profiles（API key、模型、自定义 CODEX_HOME） |
-| `dev.json` | GitHub token/repos + SSH hosts（供 `/github`、`/ssh` 使用） |
+| `dev.json` | GitHub token/repos + SSH hosts + Cloudflare API token/zones（供 `/github`、`/ssh`、`/cf` 使用） |
+
+`dev.json` schema（cloudflare 块，token 下发前端时经 `maskSecret` 掩码，保存时 `****` 值保留旧 token；zones 整体替换、`name` 必填、`id` 自动生成 `z_` + 8 位 hex）：
+
+```json
+{
+  "cloudflare": {
+    "apiToken": "<明文 API Token，仅 /cf 注入 CLI prompt 时使用>",
+    "zones": [{ "id": "z_1a2b3c4d", "name": "example.com", "notes": "" }]
+  }
+}
+```
 | `banned_ips.json` | 被封 IP + 过期时间戳 |
 
 ## 环境变量

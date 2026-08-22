@@ -15,7 +15,7 @@
 
 `server.js` 中 `normalizeSession()` 在加载时统一字段默认值。**新增字段必须在 `normalizeSession` 设默认值**，保证前向兼容。
 
-当前在该函数设默认值的字段：`agent` / `claudeSessionId` / `codexThreadId` / `codexHomeDir` / `codexRuntimeKey` / `totalCost` / `totalUsage` / `taskMode` / `sshHostId` / `remoteCwd` / `messages`。
+当前在该函数设默认值的字段：`agent` / `claudeSessionId` / `codexThreadId` / `codexHomeDir` / `codexRuntimeKey` / `totalCost` / `totalUsage` / `taskMode` / `sshHostId` / `remoteCwd` / `group` / `messages`。
 
 **不在该函数设默认值**（由创建/业务路径显式赋值）：
 - `permissionMode` — 由 `handleNewSession` / `handleMessage` 创建时赋值，默认 `'yolo'`
@@ -51,6 +51,15 @@
 | `totalUsage` | 累计 token 用量（`inputTokens` / `cachedInputTokens` / `outputTokens`） |
 | `hasUnread` | 是否有未读消息（侧栏高亮） |
 | `updated` | 最后更新时间戳（ISO） |
+| `group` | 所属分组 id（`''`=未分组，`normalizeSession` 设默认值） |
+
+### 会话分组持久化
+
+- `config/groups.json` — `{ "groups": [{ "id": "g_8位hex", "name", "created" }] }`，`saveGroups()` 走 `atomicWriteJson`；加载对损坏文件容错（回退空分组，仅丢归组信息不阻塞启动）
+- 会话归属存于 `session.group` 字段（分组 id，`''`=未分组）
+- **删除分组连带删除组内全部会话**：`handleGroupDelete` 先对组内每个会话调用 `deleteSessionCleanup`（与单删 `handleDeleteSession` 同一清理路径：杀运行中进程 + done 推送 + run 目录 + json/附件 + 本地 CLI 历史），再移除分组本身
+- **归组不算会话活动**：`session_move` 不改 `session.updated`（避免列表时间戳跳动）
+- **广播同步**：分组增删改名/归组后向所有已认证 WS 连接广播 `group_list` + `session_list`（多设备侧栏一致）；每个客户端 auth 成功后单独推一次 `group_list`
 
 ## Detached 进程生命周期
 

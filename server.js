@@ -62,6 +62,7 @@ const TOKENS_PATH = path.join(CONFIG_DIR, 'tokens.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
 const BANNED_IPS_PATH = path.join(CONFIG_DIR, 'banned_ips.json');
+const GROUPS_CONFIG_PATH = path.join(CONFIG_DIR, 'groups.json');
 // WS 心跳间隔（毫秒）：每轮 ping 全部客户端，连续两轮无 pong 判定死连接 terminate
 const WS_PING_INTERVAL_MS = parseInt(process.env.CC_WEB_WS_PING_INTERVAL_MS, 10) || 25000;
 
@@ -888,7 +889,7 @@ function getModelConfigMasked() {
 
 // === Dev Config (GitHub / SSH) ===
 const DEV_CONFIG_PATH = path.join(CONFIG_DIR, 'dev.json');
-const DEFAULT_DEV_CONFIG = { github: { token: '', repos: [] }, ssh: { hosts: [] } };
+const DEFAULT_DEV_CONFIG = { github: { token: '', repos: [] }, ssh: { hosts: [] }, cloudflare: { apiToken: '', zones: [] } };
 
 function loadDevConfig() {
   try {
@@ -901,6 +902,10 @@ function loadDevConfig() {
         },
         ssh: {
           hosts: Array.isArray(raw.ssh?.hosts) ? raw.ssh.hosts : [],
+        },
+        cloudflare: {
+          apiToken: raw.cloudflare?.apiToken || '',
+          zones: Array.isArray(raw.cloudflare?.zones) ? raw.cloudflare.zones : [],
         },
       };
     }
@@ -930,6 +935,14 @@ function getDevConfigMasked() {
         identityFile: h.identityFile || '',
         password: maskSecret(h.password || ''),
         description: h.description || '',
+      })),
+    },
+    cloudflare: {
+      apiToken: maskSecret(config.cloudflare.apiToken),
+      zones: (config.cloudflare.zones || []).map(z => ({
+        id: z.id || '',
+        name: z.name || '',
+        notes: z.notes || '',
       })),
     },
   };
@@ -968,9 +981,17 @@ function handleSaveDevConfig(ws, msg) {
       description: String(h.description || '').trim(),
     };
   }).filter(h => h.name && h.host) : [];
-  const merged = { github: { token, repos }, ssh: { hosts } };
+  const cfToken = String(msg.config.cloudflare?.apiToken || '');
+  // Mask merge: keep existing if masked (aligned with github token)
+  const resolvedCfToken = cfToken.includes('****') ? (current.cloudflare?.apiToken || '') : cfToken;
+  const zones = Array.isArray(msg.config.cloudflare?.zones) ? msg.config.cloudflare.zones.map(z => ({
+    id: z.id || ('z_' + crypto.randomBytes(4).toString('hex')),
+    name: String(z.name || '').trim(),
+    notes: String(z.notes || '').trim(),
+  })).filter(z => z.name) : [];
+  const merged = { github: { token, repos }, ssh: { hosts }, cloudflare: { apiToken: resolvedCfToken, zones } };
   saveDevConfig(merged);
-  plog('INFO', 'dev_config_saved', { repoCount: repos.length, hostCount: hosts.length });
+  plog('INFO', 'dev_config_saved', { repoCount: repos.length, hostCount: hosts.length, zoneCount: zones.length });
   wsSend(ws, { type: 'dev_config', config: getDevConfigMasked() });
   wsSend(ws, { type: 'system_message', message: '开发者配置已保存' });
 }
@@ -1384,6 +1405,7 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'taskMode')) session.taskMode = 'local';
   if (!Object.prototype.hasOwnProperty.call(session, 'sshHostId')) session.sshHostId = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'remoteCwd')) session.remoteCwd = '';
+  if (!Object.prototype.hasOwnProperty.call(session, 'group')) session.group = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'loop')) session.loop = null;
   if (session.loop) {
     const intervalMs = Number(session.loop.intervalMs);
@@ -1546,6 +1568,7 @@ function sendSessionList(ws) {
           hasUnread: !!s.hasUnread,
           agent: getSessionAgent(s),
           isRunning: activeProcesses.has(s.id),
+          group: s.group || '',
         });
       } catch {}
     }
@@ -1554,6 +1577,111 @@ function sendSessionList(ws) {
   } catch {
     wsSend(ws, { type: 'session_list', sessions: [] });
   }
+}
+
+// === 会话分组（groups.json） ===
+// 损坏文件容错：解析失败回退空分组（会话侧仅丢失归组信息，不阻塞启动）
+function loadGroups() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(GROUPS_CONFIG_PATH, 'utf8'));
+    if (!raw || !Array.isArray(raw.groups)) return [];
+    return raw.groups
+      .filter((g) => g && typeof g.id === 'string' && typeof g.name === 'string' && g.id && g.name)
+      .map((g) => ({ id: g.id, name: g.name, created: typeof g.created === 'string' ? g.created : new Date().toISOString() }));
+  } catch {
+    return [];
+  }
+}
+
+const groups = loadGroups();
+
+function saveGroups() {
+  atomicWriteJson(GROUPS_CONFIG_PATH, JSON.stringify({ groups }, null, 2));
+}
+
+function sendGroupList(ws) {
+  wsSend(ws, { type: 'group_list', groups: groups.map((g) => ({ id: g.id, name: g.name })) });
+}
+
+// 分组/归组变更后向所有已认证连接广播 group_list + session_list（多设备同步，
+// 遍历写法对齐 handleChangePassword 的踢人遍历，但不 close 连接）
+function broadcastGroupUpdate() {
+  for (const client of wss.clients) {
+    if (client._ccwebAuthed && client.readyState === 1) {
+      sendGroupList(client);
+      sendSessionList(client);
+    }
+  }
+}
+
+function getSessionIdsInGroup(groupId) {
+  const ids = [];
+  try {
+    for (const f of fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'))) {
+      try {
+        const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
+        if ((s.group || '') === groupId) ids.push(s.id);
+      } catch {}
+    }
+  } catch {}
+  return ids;
+}
+
+function handleGroupCreate(ws, msg) {
+  const name = typeof msg?.name === 'string' ? msg.name.trim() : '';
+  if (!name) return wsSend(ws, { type: 'error', message: '分组名不能为空' });
+  if (groups.some((g) => g.name === name)) {
+    return wsSend(ws, { type: 'error', message: `分组「${name}」已存在` });
+  }
+  groups.push({ id: 'g_' + crypto.randomBytes(4).toString('hex'), name: name.slice(0, 50), created: new Date().toISOString() });
+  saveGroups();
+  plog('INFO', 'group_create', {});
+  broadcastGroupUpdate();
+}
+
+function handleGroupRename(ws, msg) {
+  const group = groups.find((g) => g.id === msg?.groupId);
+  if (!group) return wsSend(ws, { type: 'error', message: '分组不存在' });
+  const name = typeof msg?.name === 'string' ? msg.name.trim() : '';
+  if (!name) return wsSend(ws, { type: 'error', message: '分组名不能为空' });
+  if (groups.some((g) => g.name === name && g.id !== group.id)) {
+    return wsSend(ws, { type: 'error', message: `分组「${name}」已存在` });
+  }
+  group.name = name.slice(0, 50);
+  saveGroups();
+  plog('INFO', 'group_rename', {});
+  broadcastGroupUpdate();
+}
+
+function handleGroupDelete(ws, msg) {
+  const group = groups.find((g) => g.id === msg?.groupId);
+  if (!group) return wsSend(ws, { type: 'error', message: '分组不存在' });
+  // 语义：先删组内全部会话（复用单删清理逻辑），再移除分组
+  const sessionIds = getSessionIdsInGroup(group.id);
+  groups.splice(groups.indexOf(group), 1);
+  saveGroups();
+  for (const sessionId of sessionIds) {
+    try { deleteSessionCleanup(sessionId); } catch {}
+  }
+  plog('INFO', 'group_delete', { deletedSessions: sessionIds.length });
+  broadcastGroupUpdate();
+}
+
+function handleSessionMove(ws, msg) {
+  const sessionId = msg?.sessionId;
+  const groupId = msg?.groupId == null ? '' : String(msg.groupId);
+  if (!sessionId) return wsSend(ws, { type: 'error', message: '缺少 sessionId' });
+  if (groupId && !groups.some((g) => g.id === groupId)) {
+    return wsSend(ws, { type: 'error', message: '分组不存在' });
+  }
+  const session = loadSession(sessionId);
+  if (!session) return wsSend(ws, { type: 'error', message: '会话不存在' });
+  if ((session.group || '') === groupId) return; // no-op：归组未变化直接忽略
+  session.group = groupId;
+  // 注意：不改 session.updated —— 归组不算会话活动，避免列表时间戳跳动
+  saveSession(session);
+  plog('INFO', 'session_move', { sessionId: sessionId.slice(0, 8) });
+  broadcastGroupUpdate();
 }
 
 function parseLoopInterval(value) {
@@ -2322,6 +2450,7 @@ wss.on('connection', (ws, req) => {
         authenticated = true;
         ws._ccwebAuthed = true;
         wsSend(ws, { type: 'auth_result', success: true, token: authToken, mustChangePassword: !!authConfig.mustChange });
+        sendGroupList(ws);
         sendSessionList(ws);
       } else {
         // 失败原因细分：token 提供但无效 → session_expired；密码错 → invalid_password；兜底 auth_failed
@@ -2346,7 +2475,7 @@ wss.on('connection', (ws, req) => {
       return wsSend(ws, { type: 'error', message: 'Not authenticated' });
     }
 
-    // WS 客户端→服务端消息分发（auth 单独分支 + 30 个 switch case）。
+    // WS 客户端→服务端消息分发（auth 单独分支 + 34 个 switch case）。
     // 完整清单与契约见 docs/PROTOCOL.md "客户端 → 服务端"。
     // /goal 通过正则排除走 handleMessage 独立路径，详见 docs/RUNTIME.md "/goal 多轮自治"。
     switch (msg.type) {
@@ -2443,6 +2572,18 @@ wss.on('connection', (ws, req) => {
         break;
       case 'list_cwd_suggestions':
         handleListCwdSuggestions(ws);
+        break;
+      case 'group_create':
+        handleGroupCreate(ws, msg);
+        break;
+      case 'group_rename':
+        handleGroupRename(ws, msg);
+        break;
+      case 'group_delete':
+        handleGroupDelete(ws, msg);
+        break;
+      case 'session_move':
+        handleSessionMove(ws, msg);
         break;
       default:
         wsSend(ws, { type: 'error', message: `Unknown type: ${msg.type}` });
@@ -2621,7 +2762,7 @@ function handleSaveModelConfig(ws, newConfig) {
         const tier = modelToTier.get(session.model);
         if (tier && MODEL_MAP[tier] !== session.model) {
           session.model = MODEL_MAP[tier];
-          session.updated = new Date().toISOString();
+          // 不刷新 updated：模型配置变更不应改变会话"最后活跃"时间（避免批量污染会话列表时间戳）
           saveSession(session);
         }
       } catch {}
@@ -2685,7 +2826,7 @@ function handleSaveCodexConfig(ws, newConfig) {
           const session = loadSession(sessionId);
           if (!session || getSessionAgent(session) !== 'codex') continue;
           session.model = nextDefaultModel;
-          session.updated = new Date().toISOString();
+          // 模型重映射不改 updated（保存配置不应刷新会话"最后活跃时间"，与 Claude 侧重映射一致）
           saveSession(session);
         } catch {}
       }
@@ -3078,6 +3219,54 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       break;
     }
 
+    case '/cf': {
+      if (!sessionId || !session) {
+        wsSend(ws, { type: 'system_message', message: '请先进入一个会话后再执行 /cf。' });
+        break;
+      }
+      if (activeProcesses.has(sessionId)) {
+        wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止。' });
+        break;
+      }
+      const cfArgs = parts.slice(1).join(' ').trim();
+      if (!cfArgs) {
+        wsSend(ws, {
+          type: 'system_message',
+          message: '用法: /cf [指令]\n例如: /cf 查看 example.com 的 DNS 记录\n不带指令时将列出所有已配置的 Cloudflare 域名。',
+        });
+        break;
+      }
+      const devConfig = loadDevConfig();
+      const cfToken = devConfig.cloudflare?.apiToken || '';
+      if (!cfToken) {
+        wsSend(ws, { type: 'system_message', message: '尚未配置 Cloudflare API Token，请先在 设置 > 开发者设置 中填写。' });
+        break;
+      }
+      const zoneList = (devConfig.cloudflare?.zones || []).map(z => `- ${z.name}${z.notes ? `（${z.notes}）` : ''}`).join('\n') || '（未配置域名）';
+      const cfPrompt = [
+        '[系统指令]',
+        '用户请求执行 Cloudflare 相关操作。请按以下配置与说明执行：',
+        '1. API 端点: https://api.cloudflare.com/client/v4',
+        `2. 认证方式: HTTP Header "Authorization: Bearer ${cfToken}"（可用 curl 调用）`,
+        '3. 常用能力: zones 列表查询（GET /zones）、DNS 记录查询与增改（GET/POST/PUT /zones/{zone_id}/dns_records）、缓存清理、WAF/规则等',
+        '4. 根据用户的自然语言指令匹配对应的域名（zones 配置见下方，可用 GET /zones 查询 zone_id）',
+        '5. 严格禁止在回复中打印、回显或引用 API Token 的完整内容',
+        '6. 操作完成后简要报告结果',
+        '',
+        '已配置域名:',
+        zoneList,
+        '',
+        `用户指令：${cfArgs}`,
+      ].join('\n');
+      pendingSlashCommands.set(session.id, { kind: 'cf' });
+      handleMessage(ws, {
+        text: cfPrompt,
+        sessionId: session.id,
+        mode: session.permissionMode || 'yolo',
+      }, { hideInHistory: true });
+      break;
+    }
+
 		    case '/mode': {
 		      const modeInput = parts[1];
 		      const VALID_MODES = ['default', 'plan', 'yolo'];
@@ -3111,6 +3300,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         '/loop off — 停止当前会话的定期执行\n' +
         '/github [指令] — GitHub 操作（读取开发者配置后执行）\n' +
         '/ssh [指令] — SSH 远程操作（读取开发者配置后执行）\n' +
+        '/cf [指令] — Cloudflare API 操作（如 /cf 查看 example.com 的 DNS 记录）\n' +
         '/help — 显示本帮助';
       wsSend(ws, {
         type: 'system_message',
@@ -3365,7 +3555,9 @@ function deleteCodexLocalSession(session) {
   return { removedFiles, removedDbRows };
 }
 
-function handleDeleteSession(ws, sessionId) {
+// 单会话删除的完整清理逻辑（handleDeleteSession 与 group_delete 共用，语义必须保持一致）：
+// 清 pending 状态 → 杀运行中进程并给查看端发 done → 清 run 目录 → 删 json/附件 → 删本地 CLI 历史
+function deleteSessionCleanup(sessionId) {
   pendingSlashCommands.delete(sessionId);
   pendingCompactRetries.delete(sessionId);
   preemptCompactGuard.delete(sessionId);
@@ -3377,25 +3569,29 @@ function handleDeleteSession(ws, sessionId) {
     if (entry.ws) wsSend(entry.ws, { type: 'done', sessionId });
   }
   cleanRunDir(sessionId);
+  const p = sessionPath(sessionId);
+  const session = loadSession(sessionId);
+  const sessionAgent = getSessionAgent(session);
+  for (const attachmentId of collectSessionAttachmentIds(session)) {
+    removeAttachmentById(attachmentId);
+  }
+  if (fs.existsSync(p)) fs.unlinkSync(p);
+  if (sessionAgent === 'codex') {
+    const result = deleteCodexLocalSession(session);
+    plog('INFO', 'codex_local_session_deleted', {
+      sessionId: sessionId.slice(0, 8),
+      threadId: session?.codexThreadId || null,
+      removedFiles: result.removedFiles,
+      removedDbRows: result.removedDbRows,
+    });
+  } else {
+    deleteClaudeLocalSession(session?.claudeSessionId || null);
+  }
+}
+
+function handleDeleteSession(ws, sessionId) {
   try {
-    const p = sessionPath(sessionId);
-    const session = loadSession(sessionId);
-    const sessionAgent = getSessionAgent(session);
-    for (const attachmentId of collectSessionAttachmentIds(session)) {
-      removeAttachmentById(attachmentId);
-    }
-    if (fs.existsSync(p)) fs.unlinkSync(p);
-    if (sessionAgent === 'codex') {
-      const result = deleteCodexLocalSession(session);
-      plog('INFO', 'codex_local_session_deleted', {
-        sessionId: sessionId.slice(0, 8),
-        threadId: session?.codexThreadId || null,
-        removedFiles: result.removedFiles,
-        removedDbRows: result.removedDbRows,
-      });
-    } else {
-      deleteClaudeLocalSession(session?.claudeSessionId || null);
-    }
+    deleteSessionCleanup(sessionId);
     sendSessionList(ws);
   } catch {
     wsSend(ws, { type: 'error', message: 'Failed to delete session' });
@@ -3744,7 +3940,15 @@ function handleMessage(ws, msg, options = {}) {
       signal: signal,
     });
     // Small delay to ensure file is fully flushed
-    setTimeout(() => handleProcessComplete(currentSessionId, code, signal), 300);
+    setTimeout(() => {
+      // pid 一致性守卫：300ms 窗口内若收尾已被 pid monitor 等通道执行（entry 已删），
+      // 或该会话已 spawn 新进程，此处必须跳过——否则会错杀新进程的 entry
+      // （吞掉其输出、提前推送 done，表现为任务"瞬间完成且无回复"）
+      const current = activeProcesses.get(currentSessionId);
+      if (current && current.pid === proc.pid) {
+        handleProcessComplete(currentSessionId, code, signal);
+      }
+    }, 300);
   });
 
   const entry = {

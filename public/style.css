@@ -703,6 +703,111 @@ body.session-loading-active {
 }
 .session-item-btn:hover { color: var(--text-primary); background: var(--bg-tertiary); }
 .session-item-btn.delete:hover { color: var(--danger); background: var(--accent-light); }
+/* --- Session groups (sidebar) --- */
+.add-group-btn {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 7px 10px;
+  border: 1px dashed var(--border-color);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+}
+.add-group-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+.session-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 10px 4px;
+  border-radius: 8px;
+  cursor: pointer; /* 点击组头 = 收起/展开（编辑走 ✎ 按钮） */
+  user-select: none;
+}
+.session-group-toggle {
+  font-size: 10px;
+  width: 12px;
+  flex-shrink: 0;
+  color: var(--text-secondary, #999);
+  transition: transform 0.15s ease;
+}
+.session-group-header:hover .session-group-toggle {
+  color: var(--accent, inherit);
+}
+.session-group-header.drop-target {
+  background: var(--accent-light);
+  outline: 1px dashed var(--accent);
+  outline-offset: -1px;
+}
+.session-group-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.session-group-count {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+.session-group-actions {
+  display: none;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.session-group-header:hover .session-group-actions { display: flex; }
+.session-group-edit-input {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: #fff;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: inherit;
+}
+.session-item.dragging { opacity: 0.45; }
+/* Group picker (mobile fallback for drag-to-group) */
+.group-picker-panel { min-width: 240px; }
+.group-picker-title {
+  font-size: 0.95em;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 14px;
+}
+.group-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.group-picker-option {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: 0.9em;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+}
+.group-picker-option:hover { border-color: var(--accent); }
+.group-picker-option.current { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.group-picker-option.group-picker-remove { color: var(--text-secondary); }
 /* Inline edit in sidebar */
 .session-item-edit-input {
   flex: 1;

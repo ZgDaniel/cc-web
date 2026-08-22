@@ -42,6 +42,7 @@
     { cmd: '/loop', desc: '定期执行提示（如 /loop 10m 检查状态）' },
     { cmd: '/github', desc: 'GitHub 操作（读取开发者配置后执行）' },
     { cmd: '/ssh', desc: 'SSH 远程操作（读取开发者配置后执行）' },
+    { cmd: '/cf', desc: 'Cloudflare API 操作（读取开发者配置后执行）' },
     { cmd: '/help', desc: '显示帮助' },
   ];
 
@@ -100,6 +101,16 @@
   let authToken = localStorage.getItem('cc-web-token');
   let currentSessionId = null;
   let sessions = [];
+  let groups = []; // [{ id, name }] 分组列表（服务端 group_list 同步）
+  // 收起的分组（含 ''=未分组）：localStorage 记忆，点击组头切换
+  const COLLAPSED_GROUPS_KEY = 'cc-web-collapsed-groups';
+  let collapsedGroups = new Set(JSON.parse(localStorage.getItem(COLLAPSED_GROUPS_KEY) || '[]'));
+  function toggleGroupCollapse(groupKey) {
+    if (collapsedGroups.has(groupKey)) collapsedGroups.delete(groupKey);
+    else collapsedGroups.add(groupKey);
+    localStorage.setItem(COLLAPSED_GROUPS_KEY, JSON.stringify([...collapsedGroups]));
+    renderSessionList();
+  }
   let sessionCache = new Map();
   let isGenerating = false;
   let reconnectAttempts = 0;
@@ -152,6 +163,7 @@
   const newChatDropdown = $('#new-chat-dropdown');
   const importSessionBtn = $('#import-session-btn');
   const sessionList = $('#session-list');
+  const addGroupBtn = $('#add-group-btn');
   const chatTitle = $('#chat-title');
   const chatAgentBtn = $('#chat-agent-btn');
   const chatAgentMenu = $('#chat-agent-menu');
@@ -404,6 +416,16 @@
         <button class="btn-test" id="dev-host-add" style="padding:4px 12px">+ 添加主机</button>
       </div>
       <div class="settings-divider"></div>
+      <div class="settings-section-title">Cloudflare</div>
+      <div class="settings-field">
+        <label>API Token</label>
+        <input type="password" id="dev-cf-token" placeholder="已保存的 Token（输入新值以覆盖）" value="">
+      </div>
+      <div id="dev-cf-zones"></div>
+      <div class="settings-actions" style="margin-top:0;gap:8px">
+        <button class="btn-test" id="dev-zone-add" style="padding:4px 12px">+ 添加域名</button>
+      </div>
+      <div class="settings-divider"></div>
       <div class="settings-actions">
         <button class="btn-save" id="dev-save-btn">保存开发者配置</button>
       </div>
@@ -417,6 +439,7 @@
 
     let editingRepos = [];
     let editingHosts = [];
+    let editingZones = [];
 
     function renderRepos() {
       const container = panel.querySelector('#dev-github-repos');
@@ -602,16 +625,90 @@
       });
     }
 
+    function renderZones() {
+      const container = panel.querySelector('#dev-cf-zones');
+      if (editingZones.length === 0) {
+        container.innerHTML = '<div class="settings-inline-note">暂无域名</div>';
+        return;
+      }
+      container.innerHTML = editingZones.map((zone, i) => `
+        <div class="settings-field" style="padding:8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <strong>${escapeHtml(zone.name || '未命名')}</strong>
+            <div style="display:flex;gap:4px">
+              <button class="btn-test" data-zone-edit="${i}" style="padding:2px 8px">编辑</button>
+              <button class="btn-test" data-zone-del="${i}" style="padding:2px 8px">删除</button>
+            </div>
+          </div>
+          ${zone.notes ? `<div style="font-size:0.85em;color:var(--text-secondary);margin-top:4px">${escapeHtml(zone.notes)}</div>` : ''}
+        </div>
+      `).join('');
+      container.querySelectorAll('[data-zone-edit]').forEach(btn => {
+        btn.addEventListener('click', () => openZoneEditModal(parseInt(btn.dataset.zoneEdit)));
+      });
+      container.querySelectorAll('[data-zone-del]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const idx = parseInt(btn.dataset.zoneDel);
+          editingZones.splice(idx, 1);
+          renderZones();
+        });
+      });
+    }
+
+    function openZoneEditModal(index = -1) {
+      const existing = index >= 0 ? editingZones[index] : null;
+      const draft = existing || { id: '', name: '', notes: '' };
+      const modalOverlay = document.createElement('div');
+      modalOverlay.className = 'settings-overlay';
+      modalOverlay.style.zIndex = '10002';
+      const modal = document.createElement('div');
+      modal.className = 'settings-panel';
+      modal.style.maxWidth = '440px';
+      modal.innerHTML = `
+        <div class="settings-header">
+          <h3>${existing ? '编辑域名' : '添加域名'}</h3>
+          <button class="settings-close" id="zone-modal-close">&times;</button>
+        </div>
+        <div class="settings-field"><label>域名</label><input type="text" id="zone-name" placeholder="example.com" value="${escapeHtml(draft.name)}"></div>
+        <div class="settings-field"><label>备注</label><input type="text" id="zone-notes" placeholder="说明" value="${escapeHtml(draft.notes || '')}"></div>
+        <div class="settings-actions"><button class="btn-save" id="zone-modal-ok">确定</button></div>
+      `;
+      modalOverlay.appendChild(modal);
+      document.body.appendChild(modalOverlay);
+      const closeModal = () => document.body.removeChild(modalOverlay);
+      modal.querySelector('#zone-modal-close').addEventListener('click', closeModal);
+      modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
+      modal.querySelector('#zone-modal-ok').addEventListener('click', () => {
+        const name = modal.querySelector('#zone-name').value.trim();
+        if (!name) { alert('请填写域名'); return; }
+        const data = {
+          id: draft.id || '',
+          name,
+          notes: modal.querySelector('#zone-notes').value.trim(),
+        };
+        if (existing) {
+          editingZones[index] = data;
+        } else {
+          editingZones.push(data);
+        }
+        closeModal();
+        renderZones();
+      });
+    }
+
     panel.querySelector('#dev-repo-add').addEventListener('click', () => openRepoEditModal());
     panel.querySelector('#dev-host-add').addEventListener('click', () => openHostEditModal());
+    panel.querySelector('#dev-zone-add').addEventListener('click', () => openZoneEditModal());
 
     panel.querySelector('#dev-save-btn').addEventListener('click', () => {
       const token = panel.querySelector('#dev-github-token').value.trim();
+      const cfToken = panel.querySelector('#dev-cf-token').value.trim();
       send({
         type: 'save_dev_config',
         config: {
           github: { token, repos: editingRepos },
           ssh: { hosts: editingHosts },
+          cloudflare: { apiToken: cfToken, zones: editingZones },
         },
       });
       panel.querySelector('#dev-status').textContent = '已保存';
@@ -620,10 +717,15 @@
 
     _onDevConfig = (config) => {
       panel.querySelector('#dev-github-token').value = config.github?.token || '';
+      const cfTokenInput = panel.querySelector('#dev-cf-token');
+      cfTokenInput.value = config.cloudflare?.apiToken || '';
+      cfTokenInput.placeholder = config.cloudflare?.apiToken ? `已保存: ${config.cloudflare.apiToken}（保持不变请勿修改）` : '填写 Cloudflare API Token';
       editingRepos = (config.github?.repos || []).map(r => ({ ...r }));
       editingHosts = (config.ssh?.hosts || []).map(h => ({ ...h }));
+      editingZones = (config.cloudflare?.zones || []).map(z => ({ ...z }));
       renderRepos();
       renderHosts();
+      renderZones();
     };
   }
 
@@ -1739,6 +1841,11 @@
         }
         break;
 
+      case 'group_list':
+        groups = Array.isArray(msg.groups) ? msg.groups.filter((g) => g && g.id && g.name) : [];
+        renderSessionList();
+        break;
+
       case 'session_renamed':
         sessions = sessions.map((session) => session.id === msg.sessionId ? { ...session, title: msg.title } : session);
         updateCachedSession(msg.sessionId, (snapshot) => { snapshot.title = msg.title; });
@@ -2841,6 +2948,230 @@
   updateScrollbar();
 
 
+  function buildSessionItem(s) {
+    const item = document.createElement('div');
+    item.className = `session-item${s.id === currentSessionId ? ' active' : ''}`;
+    item.dataset.id = s.id;
+    item.draggable = true;
+    item.innerHTML = `
+      <div class="session-item-main">
+        <span class="session-item-title">${escapeHtml(s.title || 'Untitled')}</span>
+        ${s.isRunning ? '<span class="session-item-status">运行中</span>' : ''}
+      </div>
+      ${s.hasUnread ? '<span class="session-unread-dot"></span>' : ''}
+      <span class="session-item-time">${timeAgo(s.updated)}</span>
+      <div class="session-item-actions">
+        <button class="session-item-btn edit" title="重命名">✎</button>
+        <button class="session-item-btn group" title="归组">⧉</button>
+        <button class="session-item-btn delete" title="删除">×</button>
+      </div>
+    `;
+
+    item.addEventListener('click', (e) => {
+      const target = e.target;
+      if (target.classList.contains('delete')) {
+        e.stopPropagation();
+        const doDelete = () => {
+          if (getLastSessionForAgent(currentAgent) === s.id) {
+            localStorage.removeItem(getAgentSessionStorageKey(currentAgent));
+          }
+          invalidateSessionCache(s.id);
+          sessionGoalState.delete(s.id);
+          send({ type: 'delete_session', sessionId: s.id });
+          if (s.id === currentSessionId) {
+            resetChatView(currentAgent);
+          }
+          updateGoalBar();
+        };
+        if (skipDeleteConfirm) {
+          doDelete();
+        } else {
+          showDeleteConfirm(s.agent, doDelete);
+        }
+        return;
+      }
+      if (target.classList.contains('edit')) {
+        e.stopPropagation();
+        startEditSessionTitle(item, s);
+        return;
+      }
+      if (target.classList.contains('group')) {
+        e.stopPropagation();
+        showGroupPicker(s);
+        return;
+      }
+      openSession(s.id);
+    });
+
+    // 桌面拖拽归组：dragstart 携带 sessionId，drop 目标为分组头
+    item.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('text/plain', s.id);
+      e.dataTransfer.effectAllowed = 'move';
+      item.classList.add('dragging');
+    });
+    item.addEventListener('dragend', () => item.classList.remove('dragging'));
+
+    return item;
+  }
+
+  function buildGroupHeader(group, count) {
+    const header = document.createElement('div');
+    header.className = 'session-group-header';
+    const groupId = group ? group.id : '';
+    const groupKey = groupId || '';
+    const collapsed = collapsedGroups.has(groupKey);
+    if (groupId) header.dataset.groupId = groupId;
+    header.innerHTML = `
+      <span class="session-group-toggle" aria-hidden="true">${collapsed ? '▸' : '▾'}</span>
+      <span class="session-group-name">${escapeHtml(group ? group.name : '未分组')}</span>
+      <span class="session-group-count">${count}</span>
+      ${group ? `
+      <div class="session-group-actions">
+        <button class="session-item-btn edit" title="重命名分组">✎</button>
+        <button class="session-item-btn delete" title="删除分组">×</button>
+      </div>` : ''}
+    `;
+    header.addEventListener('click', (e) => {
+      const target = e.target;
+      if (group && target.classList.contains('delete')) {
+        e.stopPropagation();
+        showGroupDeleteConfirm(group, count);
+        return;
+      }
+      if (group && target.classList.contains('edit')) {
+        e.stopPropagation();
+        startEditGroupName(header, group);
+        return;
+      }
+      // 点击组头其余区域（名称/箭头/空白）：收起/展开（编辑仅走 ✎ 按钮）
+      toggleGroupCollapse(groupKey);
+    });
+    // 未分组段头也接受拖入（groupId='' 即移出分组）
+    header.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      header.classList.add('drop-target');
+    });
+    header.addEventListener('dragleave', () => header.classList.remove('drop-target'));
+    header.addEventListener('drop', (e) => {
+      e.preventDefault();
+      header.classList.remove('drop-target');
+      const sessionId = e.dataTransfer.getData('text/plain');
+      if (sessionId) moveSessionToGroup(sessionId, groupId);
+    });
+    return header;
+  }
+
+  function moveSessionToGroup(sessionId, groupId) {
+    const current = sessions.find((s) => s.id === sessionId);
+    if (!current || (current.group || '') === groupId) return;
+    // 乐观更新本地缓存，等 session_list 到达后由服务端数据校正
+    sessions = sessions.map((s) => s.id === sessionId ? { ...s, group: groupId } : s);
+    renderSessionList();
+    send({ type: 'session_move', sessionId, groupId });
+  }
+
+  function startEditGroupName(headerEl, group) {
+    const nameEl = headerEl.querySelector('.session-group-name');
+    const currentName = group.name || '';
+    const input = document.createElement('input');
+    input.className = 'session-group-edit-input';
+    input.value = currentName;
+    input.maxLength = 50;
+
+    nameEl.replaceWith(input);
+    input.focus();
+    input.select();
+
+    const actions = headerEl.querySelector('.session-group-actions');
+    if (actions) actions.style.display = 'none';
+
+    function save() {
+      const newName = input.value.trim() || currentName;
+      if (newName !== currentName) {
+        send({ type: 'group_rename', groupId: group.id, name: newName });
+        group.name = newName; // 乐观更新，group_list 到达后校正
+      }
+      renderSessionList();
+    }
+
+    input.addEventListener('blur', save);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+      if (e.key === 'Escape') { input.value = currentName; input.blur(); }
+    });
+  }
+
+  function showGroupPicker(session) {
+    if (groups.length === 0 && !session.group) {
+      showToast('暂无分组，请先点击左侧「+ 分组」新建');
+      return;
+    }
+    const overlay = document.createElement('div');
+    overlay.className = 'settings-overlay';
+    overlay.style.zIndex = '10002';
+
+    const box = document.createElement('div');
+    box.className = 'settings-panel group-picker-panel';
+    const optionsHtml = groups.map((g) => `
+      <button class="group-picker-option${(session.group || '') === g.id ? ' current' : ''}" data-group-id="${escapeHtml(g.id)}">${escapeHtml(g.name)}</button>
+    `).join('');
+    box.innerHTML = `
+      <div class="group-picker-title">将会话移入分组</div>
+      <div class="group-picker-list">
+        ${optionsHtml}
+        ${session.group ? '<button class="group-picker-option group-picker-remove" data-group-id="">移出分组</button>' : ''}
+      </div>
+    `;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    const close = () => document.body.removeChild(overlay);
+    box.querySelectorAll('.group-picker-option').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const groupId = btn.dataset.groupId || '';
+        close();
+        moveSessionToGroup(session.id, groupId);
+      });
+    });
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  }
+
+  function showGroupDeleteConfirm(group, count) {
+    const overlay = document.createElement('div');
+    overlay.className = 'settings-overlay';
+    overlay.style.zIndex = '10002';
+
+    const box = document.createElement('div');
+    box.className = 'settings-panel';
+    box.innerHTML = `
+      <div style="font-size:0.9em;color:var(--text-primary);margin-bottom:20px;line-height:1.7">删除分组“${escapeHtml(group.name)}”将同时删除组内 ${count} 个会话且不可恢复，确定？</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button id="group-del-confirm-ok" style="width:100%;padding:10px;border:none;border-radius:10px;background:var(--danger);color:#fff;font-size:0.95em;font-weight:600;cursor:pointer;font-family:inherit">确认删除</button>
+        <button id="group-del-confirm-cancel" style="width:100%;padding:9px;border:none;border-radius:10px;background:transparent;color:var(--text-muted);font-size:0.85em;cursor:pointer;font-family:inherit">取消</button>
+      </div>
+    `;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    const close = () => document.body.removeChild(overlay);
+    box.querySelector('#group-del-confirm-ok').addEventListener('click', () => {
+      close();
+      send({ type: 'group_delete', groupId: group.id });
+    });
+    box.querySelector('#group-del-confirm-cancel').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  }
+
+  if (addGroupBtn) {
+    addGroupBtn.addEventListener('click', () => {
+      // 直接以 分组1/分组2… 默认命名创建（跳过浏览器原生 prompt）；名称可点击组头修改
+      let n = groups.length + 1;
+      while (groups.some((g) => g.name === `分组${n}`)) n++;
+      send({ type: 'group_create', name: `分组${n}` });
+    });
+  }
+
   function renderSessionList() {
     sessionList.innerHTML = '';
     const visibleSessions = getVisibleSessions();
@@ -2852,55 +3183,29 @@
       return;
     }
 
+    // 按 groups 顺序归桶（组内只含当前 agent 的会话，agent 过滤在 getVisibleSessions 完成）
+    const buckets = new Map();
+    for (const g of groups) buckets.set(g.id, []);
+    const ungrouped = [];
     for (const s of visibleSessions) {
-      const item = document.createElement('div');
-      item.className = `session-item${s.id === currentSessionId ? ' active' : ''}`;
-      item.dataset.id = s.id;
-      item.innerHTML = `
-        <div class="session-item-main">
-          <span class="session-item-title">${escapeHtml(s.title || 'Untitled')}</span>
-          ${s.isRunning ? '<span class="session-item-status">运行中</span>' : ''}
-        </div>
-        ${s.hasUnread ? '<span class="session-unread-dot"></span>' : ''}
-        <span class="session-item-time">${timeAgo(s.updated)}</span>
-        <div class="session-item-actions">
-          <button class="session-item-btn edit" title="重命名">✎</button>
-          <button class="session-item-btn delete" title="删除">×</button>
-        </div>
-      `;
+      const gid = s.group || '';
+      if (gid && buckets.has(gid)) buckets.get(gid).push(s);
+      else ungrouped.push(s);
+    }
 
-      item.addEventListener('click', (e) => {
-        const target = e.target;
-        if (target.classList.contains('delete')) {
-          e.stopPropagation();
-          const doDelete = () => {
-            if (getLastSessionForAgent(currentAgent) === s.id) {
-              localStorage.removeItem(getAgentSessionStorageKey(currentAgent));
-            }
-            invalidateSessionCache(s.id);
-            sessionGoalState.delete(s.id);
-            send({ type: 'delete_session', sessionId: s.id });
-            if (s.id === currentSessionId) {
-              resetChatView(currentAgent);
-            }
-            updateGoalBar();
-          };
-          if (skipDeleteConfirm) {
-            doDelete();
-          } else {
-            showDeleteConfirm(s.agent, doDelete);
-          }
-          return;
-        }
-        if (target.classList.contains('edit')) {
-          e.stopPropagation();
-          startEditSessionTitle(item, s);
-          return;
-        }
-        openSession(s.id);
-      });
-
-      sessionList.appendChild(item);
+    for (const g of groups) {
+      const list = buckets.get(g.id);
+      // 空分组也渲染组头：新建组必然为空，组头既是建组反馈也是拖拽/归组目标（隐藏会死锁）
+      sessionList.appendChild(buildGroupHeader(g, list.length));
+      if (!collapsedGroups.has(g.id)) {
+        for (const s of list) sessionList.appendChild(buildSessionItem(s));
+      }
+    }
+    if (ungrouped.length > 0) {
+      sessionList.appendChild(buildGroupHeader(null, ungrouped.length));
+      if (!collapsedGroups.has('')) {
+        for (const s of ungrouped) sessionList.appendChild(buildSessionItem(s));
+      }
     }
   }
 
@@ -3892,7 +4197,7 @@
       <button class="settings-nav-card" type="button" data-open-dev-page>
         <span class="settings-nav-card-main">
           <span class="settings-nav-card-title">开发者设置</span>
-          <span class="settings-nav-card-meta">GitHub / SSH 配置</span>
+          <span class="settings-nav-card-meta">GitHub / SSH / Cloudflare 配置</span>
         </span>
         <span class="settings-nav-card-arrow" aria-hidden="true">›</span>
       </button>
@@ -3959,12 +4264,12 @@
         `;
         panel.querySelector('#claude-tpl-select').addEventListener('change', (e) => {
           if (e.target.value === '__new__') {
-            const newName = prompt('输入新模板名称:');
-            if (!newName || !newName.trim()) { e.target.value = '__local__'; return; }
-            const n = newName.trim();
-            if (modelEditingTemplates.find(t => t.name === n)) { alert('模板名称已存在'); e.target.value = '__local__'; return; }
-            modelEditingTemplates.push({ name: n, apiKey: '', apiBase: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
-            modelActiveTemplate = n;
+            // 对齐 Codex Profile：跳过浏览器原生 prompt，默认命名直接打开编辑模态框（首字段即模板名称，可改）
+            let n = 1;
+            while (modelEditingTemplates.find(t => t.name === `模板${n}`)) n++;
+            const newName = `模板${n}`;
+            modelEditingTemplates.push({ name: newName, apiKey: '', apiBase: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
+            modelActiveTemplate = newName;
             renderClaudeConfigArea();
             openTplEditModal();
           } else {
@@ -4000,12 +4305,12 @@
 
       panel.querySelector('#claude-tpl-select').addEventListener('change', (e) => {
         if (e.target.value === '__new__') {
-          const newName = prompt('输入新模板名称:');
-          if (!newName || !newName.trim()) { e.target.value = escapeHtml(modelActiveTemplate); return; }
-          const n = newName.trim();
-          if (modelEditingTemplates.find(t => t.name === n)) { alert('模板名称已存在'); e.target.value = escapeHtml(modelActiveTemplate); return; }
-          modelEditingTemplates.push({ name: n, apiKey: '', apiBase: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
-          modelActiveTemplate = n;
+          // 对齐 Codex Profile：跳过浏览器原生 prompt，默认命名直接打开编辑模态框（首字段即模板名称，可改）
+          let n = 1;
+          while (modelEditingTemplates.find(t => t.name === `模板${n}`)) n++;
+          const newName = `模板${n}`;
+          modelEditingTemplates.push({ name: newName, apiKey: '', apiBase: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
+          modelActiveTemplate = newName;
           renderClaudeConfigArea();
           openTplEditModal();
         } else if (e.target.value === '__local__') {
