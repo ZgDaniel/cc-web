@@ -703,22 +703,8 @@ body.session-loading-active {
 }
 .session-item-btn:hover { color: var(--text-primary); background: var(--bg-tertiary); }
 .session-item-btn.delete:hover { color: var(--danger); background: var(--accent-light); }
-/* --- Session groups (sidebar) --- */
-.add-group-btn {
-  display: block;
-  width: 100%;
-  margin-top: 6px;
-  padding: 7px 10px;
-  border: 1px dashed var(--border-color);
-  border-radius: 10px;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12.5px;
-  cursor: pointer;
-  font-family: inherit;
-  transition: background 0.15s, color 0.15s;
-}
-.add-group-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+/* --- Session groups (sidebar) ---
+   新建分入口在「+ 新会话 ▾」下拉菜单（#add-group-btn 复用 .new-chat-dropdown button 通用样式） */
 .session-group-header {
   display: flex;
   align-items: center;
