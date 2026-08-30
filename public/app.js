@@ -3625,6 +3625,14 @@
         autoResize();
         return;
       }
+      // 带任务指令的命令（/github /cf /ssh /loop）渲染用户气泡留痕（与 /goal 一致）；
+      // 命令后跟用户具体任务，不显示会造成回看时理解困难。纯命令（/clear /compact 等）保持不显示。
+      if (/^\/(?:github|cf|ssh|loop)(?:\s|$)/i.test(text)) {
+        const cmdWelcome = messagesDiv.querySelector('.welcome-msg');
+        if (cmdWelcome) cmdWelcome.remove();
+        messagesDiv.appendChild(createMsgElement('user', text));
+        scrollToBottom();
+      }
       send({ type: 'message', text, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
       msgInput.value = '';
       autoResize();

@@ -592,6 +592,7 @@ async function main() {
     await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /已停止当前会话的 \/loop/.test(msg.message || ''));
     const loopStoppedSession = JSON.parse(fs.readFileSync(codexSessionPath, 'utf8'));
     assert(loopStoppedSession.loop === null, '/loop off should clear persisted loop state');
+    assert((loopStoppedSession.messages || []).some((m) => m.role === 'user' && String(m.content || '').startsWith('/loop')), '/loop 命令原文应留痕到会话历史（带任务指令的命令需显示）');
 
     ws.send(JSON.stringify({
       type: 'save_codex_config',
@@ -812,6 +813,7 @@ async function main() {
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === claudeImageSession.sessionId);
     const cfSessionOnDisk = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
     assert(!(cfSessionOnDisk.messages || []).some(m => m.role === 'user' && String(m.content || '').includes(cfTokenValue)), '/cf prompt with raw token must not be persisted as a user message');
+    assert((cfSessionOnDisk.messages || []).some(m => m.role === 'user' && String(m.content || '').trim() === '/cf 检查 DNS'), '/cf 命令原文应留痕到会话历史（带任务指令的命令需显示）');
 
     // /cf without args: usage hint via system_message.
     ws.send(JSON.stringify({ type: 'message', text: '/cf', sessionId: claudeImageSession.sessionId, mode: 'plan', agent: 'claude' }));

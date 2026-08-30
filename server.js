@@ -2992,6 +2992,14 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
   let session = sessionId ? loadSession(sessionId) : null;
   const agent = session ? getSessionAgent(session) : normalizeAgent(fallbackAgent);
 
+  // 带任务指令的命令（/github /cf /ssh /loop）留痕到会话历史：命令后跟用户的具体任务，
+  // 不显示会造成回看时无法理解。/goal 走普通消息路径已留痕；纯命令（/clear /compact 等）不留。
+  if (session && /^(?:\/github|\/cf|\/ssh|\/loop)$/.test(cmd)) {
+    session.messages.push({ role: 'user', content: text, timestamp: new Date().toISOString() });
+    session.updated = new Date().toISOString();
+    saveSession(session);
+  }
+
   switch (cmd) {
     case '/clear': {
       if (session) {
