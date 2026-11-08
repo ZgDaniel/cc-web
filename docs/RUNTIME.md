@@ -15,7 +15,7 @@
 
 `server.js` 中 `normalizeSession()` 在加载时统一字段默认值。**新增字段必须在 `normalizeSession` 设默认值**，保证前向兼容。
 
-当前在该函数设默认值的字段：`agent` / `claudeSessionId` / `codexThreadId` / `codexHomeDir` / `codexRuntimeKey` / `totalCost` / `totalUsage` / `taskMode` / `sshHostId` / `remoteCwd` / `group` / `messages`。
+当前在该函数设默认值的字段：`agent` / `claudeSessionId` / `codexThreadId` / `codexHomeDir` / `codexRuntimeKey` / `totalCost` / `contextUsage` / `taskMode` / `sshHostId` / `remoteCwd` / `group` / `messages`。
 
 **不在该函数设默认值**（由创建/业务路径显式赋值）：
 - `permissionMode` — 由 `handleNewSession` / `handleMessage` 创建时赋值，默认 `'yolo'`
@@ -47,8 +47,8 @@
 | `model` | 当前会话使用的模型（Codex 创建时设默认，Claude 从模板解析） |
 | `cwd` | 工作目录 |
 | `taskMode` | `'local'` 或 `'remote'`（remote 携带 `sshHostId` + `remoteCwd`） |
-| `totalCost` | 累计美元成本 |
-| `totalUsage` | 累计 token 用量（`inputTokens` / `cachedInputTokens` / `outputTokens`） |
+| `totalCost` | 累计美元成本（v1.6.1 起前端不展示，仅内部累计） |
+| `contextUsage` | 上下文窗口水位快照 `{ contextTokens, windowTokens }`（最近一次任务完成点，不累计；窗口按 CC/Codex 各自配置解析，缺省 200K/272K，见 `lib/context-usage.js`） |
 | `hasUnread` | 是否有未读消息（侧栏高亮） |
 | `updated` | 最后更新时间戳（ISO） |
 | `group` | 所属分组 id（`''`=未分组，`normalizeSession` 设默认值） |
@@ -87,7 +87,7 @@ spawn claude/codex (detached)         ← lib/agent-runtime.js 构建命令
     ▼
 handleProcessComplete                  ← server.js
     │
-    ├─→ 累计 cost / usage 到 session
+    ├─→ 累计 cost、写入 usage 水位快照到 session
     ├─→ 检测 context limit → 自动 compact 重试
     ├─→ 驱动 /goal 多轮自治
     └─→ 触发 background_done 通知
@@ -157,7 +157,7 @@ CLI 执行压缩时 cc-web 把 compact 边界事件转成 `system_message`（`ki
 
 1. `handleMessage` 在构造 spawn 之前，用 `locateClaudeSessionJsonl`（复用原生导入的定位方式）找 `~/.claude/projects/<dir>/<sessionId>.jsonl`
 2. `lib/context-usage.js` 的 `estimateClaudeContextUsage` 从文件**末尾向前**找最后一条带 usage 的 assistant 记录，取 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`（≈ 下一次请求的上下文规模）
-3. `shouldPreemptiveCompact(usage, model, CC_WEB_AUTOCOMPACT_PCT)`：窗口 = 模型标签含 `[1m]` → 1,000,000，否则 200,000；水位 ≥ 窗口 × 阈值%（默认 80%）即触发
+3. `shouldPreemptiveCompact(usageTokens, windowTokens, AUTOCOMPACT_PCT)`：窗口 = `resolveClaudeContextWindow()`（读 `~/.claude/settings.json` 的 `env.CLAUDE_CODE_MAX_CONTEXT_TOKENS`，为正整数则用之，缺省 200,000；不再按模型名 `[1m]` 后缀推断）；水位 ≥ 窗口 × 阈值%（`CC_WEB_AUTOCOMPACT_PCT` 可调，默认 80%）即触发
 4. 触发时发 `◎ 检测到上下文接近上限，先执行压缩再发送您的消息`，然后**复用 P0 注入链路**：写 `pendingCompactRetries`（`reason:'auto'`，text=原消息）+ `pendingSlashCommands`（`kind:'compact'`）+ 以 `/compact` 为输入走 `handleMessage` spawn；compact 完成后原消息由现有 `handleProcessComplete` 重放链路发送
 
 **零改变约束**：定位不到 jsonl / 无 usage / 解析异常 / 带附件（无法重放）/ 文本为空——一律静默走原流程。防循环护栏 `preemptCompactGuard`：预防压缩后直到观察到一次正常（非 slash 注入）运行完成、或用户手动 `/compact`、或删除会话之前，不再对同一会话重复预防压缩。

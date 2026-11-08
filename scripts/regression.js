@@ -19,7 +19,8 @@
  *   - Claude token 超限 → 自动 /compact + 重放（P0 正则补全，mock stderr 报 Prompt is too long）
  *   - Claude 预防性水位压缩：高水位 resume 会话先压缩再重放（P2）+ compact_boundary
  *     事件透传为含 token 数的 system_message（P1）
- *   - lib/context-usage 单元：jsonl 尾扫求和 / 无 usage / 文件缺失 / 1m-普通窗口四组合
+ *   - lib/context-usage 单元：jsonl 尾扫求和 / 无 usage / 文件缺失；窗口解析唯一尺子
+ *     （Claude settings.json env / Codex config.toml 顶层键 / 嵌套 table 不误匹配 / 缺省 200K-272K / 首读缓存）+ 阈值四组合
  *   - 附件上传 → 带图消息 → session JSON 持久化
  *   - 模式切换保 thread id（Codex + Claude 双侧）
  *   - Codex Profile 切换 → 隔离 runtime config.toml
@@ -395,9 +396,17 @@ async function testAuthStoreTokenMigration() {
 //   - estimateClaudeContextUsage 从文件末尾向前找最后一条含 usage 的 assistant 行，
 //     返回 input + cache_read + cache_creation 三项之和（更早的 usage 行、坏行不参与）
 //   - 无 usage / 文件不存在 → null（调用方必须跳过预防逻辑）
-//   - shouldPreemptiveCompact：[1m] 与普通窗口 × 高低水位四组合
+//   - v1.6.1 窗口解析唯一尺子：resolveClaudeContextWindow 读 settings.json
+//     env.CLAUDE_CODE_MAX_CONTEXT_TOKENS；resolveCodexContextWindow 读 config.toml
+//     顶层 model_context_window（嵌套 table 同名键不误匹配）；缺省 200000/272000；首读缓存
+//   - shouldPreemptiveCompact：窗口由调用方显式传入 × 高低水位四组合
 async function testContextUsage() {
-  const { estimateClaudeContextUsage, shouldPreemptiveCompact } = require('../lib/context-usage');
+  const {
+    estimateClaudeContextUsage,
+    shouldPreemptiveCompact,
+    resolveClaudeContextWindow,
+    resolveCodexContextWindow,
+  } = require('../lib/context-usage');
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-usage-'));
 
   const usageLine = (usage) => JSON.stringify({
@@ -422,12 +431,44 @@ async function testContextUsage() {
   assert(estimateClaudeContextUsage(noUsagePath) === null, 'jsonl without usage must return null');
   assert(estimateClaudeContextUsage(path.join(tempDir, 'missing.jsonl')) === null, 'missing file must return null');
 
-  // 4 combos: window size from model label × water level (threshold 80%)
-  assert(shouldPreemptiveCompact(200000, 'claude-opus-4-6[1m]', 80) === false, '1M window: 200k is below 80% threshold');
-  assert(shouldPreemptiveCompact(800000, 'claude-opus-4-6[1m]', 80) === true, '1M window: 800k reaches 80% threshold');
-  assert(shouldPreemptiveCompact(160000, 'claude-sonnet-4-6', 80) === true, '200k window: 160k reaches 80% threshold');
-  assert(shouldPreemptiveCompact(159999, 'claude-sonnet-4-6', 80) === false, '200k window: 159,999 is below 80% threshold');
-  assert(shouldPreemptiveCompact(null, 'claude-opus-4-6[1m]', 80) === false, 'null usage must never preempt');
+  // v1.6.1 窗口解析：Claude settings.json env（正整数生效，非法/缺失回退 200000，首读缓存）
+  const settingsPath = path.join(tempDir, 'settings.json');
+  fs.writeFileSync(settingsPath, JSON.stringify({ env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: 350000 } }));
+  assert(resolveClaudeContextWindow(settingsPath) === 350000, 'claude window should read env.CLAUDE_CODE_MAX_CONTEXT_TOKENS');
+  fs.writeFileSync(settingsPath, JSON.stringify({ env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: 999000 } }));
+  assert(resolveClaudeContextWindow(settingsPath) === 350000, 'claude window resolve must cache the first read');
+  const badSettingsPath = path.join(tempDir, 'settings-bad.json');
+  fs.writeFileSync(badSettingsPath, JSON.stringify({ env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: 'not-a-number' } }));
+  assert(resolveClaudeContextWindow(badSettingsPath) === 200000, 'non-integer claude window config must fall back to 200000');
+  assert(resolveClaudeContextWindow(path.join(tempDir, 'no-settings.json')) === 200000, 'missing claude settings must default to 200000');
+
+  // v1.6.1 窗口解析：Codex config.toml 顶层键（嵌套 table 同名键不得误匹配；缺失回退 272000）
+  const tomlPath = path.join(tempDir, 'config.toml');
+  fs.writeFileSync(tomlPath, [
+    'model = "gpt-5.5"',
+    'model_context_window = 400000',
+    '',
+    '[model_providers.openai_compat]',
+    'name = "OpenAI Compat"',
+    'model_context_window = 999999',
+    '',
+  ].join('\n'));
+  assert(resolveCodexContextWindow(tomlPath) === 400000, 'codex window must read the top-level key, not the nested table');
+  const tomlOnlyNestedPath = path.join(tempDir, 'config-nested.toml');
+  fs.writeFileSync(tomlOnlyNestedPath, [
+    '[model_providers.openai_compat]',
+    'model_context_window = 999999',
+    '',
+  ].join('\n'));
+  assert(resolveCodexContextWindow(tomlOnlyNestedPath) === 272000, 'nested-only key must fall back to default 272000');
+  assert(resolveCodexContextWindow(path.join(tempDir, 'no-config.toml')) === 272000, 'missing codex config must default to 272000');
+
+  // 4 combos: explicit window tokens × water level (threshold 80%)
+  assert(shouldPreemptiveCompact(200000, 1_000_000, 80) === false, '1M window: 200k is below 80% threshold');
+  assert(shouldPreemptiveCompact(800000, 1_000_000, 80) === true, '1M window: 800k reaches 80% threshold');
+  assert(shouldPreemptiveCompact(160000, 200_000, 80) === true, '200k window: 160k reaches 80% threshold');
+  assert(shouldPreemptiveCompact(159999, 200_000, 80) === false, '200k window: 159,999 is below 80% threshold');
+  assert(shouldPreemptiveCompact(null, 1_000_000, 80) === false, 'null usage must never preempt');
 
   fs.rmSync(tempDir, { recursive: true, force: true });
   console.log('Context usage estimation checks passed.');
@@ -471,6 +512,10 @@ async function main() {
     usage: { input_tokens: 150000, cache_read_input_tokens: 40000, cache_creation_input_tokens: 10000, output_tokens: 500 },
   });
   const codexFixture = createFakeCodexHistory(homeDir);
+  // C：伪造 HOME 带顶层 model_context_window 的 ~/.codex/config.toml——
+  // custom profile 生成的 Codex 运行时副本应继承该键；E2E 的 Codex usage 水位
+  // windowTokens 也应解析为该值（而非缺省 272000）
+  fs.writeFileSync(path.join(homeDir, '.codex', 'config.toml'), 'model_context_window = 400000\n');
 
   const port = await getFreePort();
   const password = 'Regression!234';
@@ -628,6 +673,7 @@ async function main() {
     assert(runtimeToml.includes('preferred_auth_method = "apikey"'), 'Codex custom profile should write isolated runtime auth mode');
     assert(runtimeToml.includes('base_url = "https://example.org/v1"'), 'Codex custom profile should write isolated runtime base_url');
     assert(runtimeToml.includes('model = "gpt-5.4"'), 'Codex custom profile should write isolated runtime model');
+    assert(runtimeToml.includes('model_context_window = 400000'), 'Codex runtime config should inherit user top-level model_context_window');
 
     // 保存模型配置触发全量模型重映射时，会话 updated 不得被刷新（时间戳批量污染回归）
     const remapSessionId = 'regression-remap-claude-session';
@@ -648,7 +694,7 @@ async function main() {
       },
     }));
     await nextMessage(messages, ws, (msg) => msg.type === 'model_config' && msg.config?.templates?.[0]?.opusModel === 'regression-opus-v1');
-    // 写入旧模板模型名的会话
+    // 写入旧模板模型名的会话（[1m] 后缀模拟 v1.6.1 之前旧版写入的历史遗留名）
     fs.writeFileSync(remapSessionPath, JSON.stringify({
       id: remapSessionId,
       title: 'Regression Remap Session',
@@ -675,7 +721,7 @@ async function main() {
     await nextMessage(messages, ws, (msg) => msg.type === 'model_config' && msg.config?.templates?.[0]?.opusModel === 'regression-opus-v2');
     await waitForFile(remapSessionPath, 15000);
     const remapStored = JSON.parse(fs.readFileSync(remapSessionPath, 'utf8'));
-    assert(remapStored.model === 'regression-opus-v2[1m]', '保存模型配置后旧模型名会话应被重映射为新模板模型名');
+    assert(remapStored.model === 'regression-opus-v2', '保存模型配置后旧模型名（含历史 [1m] 后缀）会话应被重映射为无 [1m] 的新模板模型名（v1.6.1 起不再追加 [1m]）');
     assert(remapStored.updated === remapUpdatedBefore, '模型重映射不得刷新会话 updated 时间戳（时间戳批量污染回归）');
     // 恢复 local 模式，避免影响后续测试的模型配置状态
     ws.send(JSON.stringify({
@@ -720,6 +766,14 @@ async function main() {
     });
     ws.send(JSON.stringify({ type: 'message', text: 'describe attachment', attachments: [claudeAttachment], mode: 'yolo', agent: 'claude' }));
     const claudeImageSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && msg.title === 'describe attachment');
+    // v1.6.1 水位快照：Claude result.usage 三项之和 120+3400+260=3780（单事件不累计），
+    // 窗口按伪造 HOME（无 ~/.claude/settings.json）缺省 200000；不得再携带累计字段。
+    // 谓词按 sessionId 定向匹配（多会话并发时不误取其他会话的 usage，与前端防串染同构）
+    const claudeUsageMsg = await nextMessage(messages, ws, (msg) => msg.type === 'usage' && msg.sessionId === claudeImageSession.sessionId);
+    assert(claudeUsageMsg.contextTokens === 3780, `Claude usage snapshot contextTokens should be 3780 (got ${claudeUsageMsg.contextTokens})`);
+    assert(claudeUsageMsg.windowTokens === 200000, `Claude usage snapshot windowTokens should default to 200000 (got ${claudeUsageMsg.windowTokens})`);
+    assert(claudeUsageMsg.sessionId === claudeImageSession.sessionId, `Claude usage message should carry matching sessionId (got ${claudeUsageMsg.sessionId})`);
+    assert(!('totalUsage' in claudeUsageMsg), 'usage message must not carry legacy accumulated totalUsage field');
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === claudeImageSession.sessionId);
     const claudeSpawnLine = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
       .trim()
@@ -729,6 +783,25 @@ async function main() {
     const storedClaudeSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
     assert(Array.isArray(storedClaudeSession.messages?.[0]?.attachments) && storedClaudeSession.messages[0].attachments.length === 1, 'Claude message should persist attachment metadata');
     assert(storedClaudeSession.claudeSessionId, 'Claude session id should be persisted after first run');
+    assert(storedClaudeSession.contextUsage?.contextTokens === 3780 && storedClaudeSession.contextUsage?.windowTokens === 200000, 'Claude session should persist contextUsage watermark snapshot');
+    assert(!('totalUsage' in storedClaudeSession), 'session JSON must not carry legacy accumulated totalUsage field');
+
+    // v1.6.1 Codex 水位快照：turn.completed.usage 只取 input_tokens = 12
+    // （cached_input_tokens=10 是 input 的子集，OpenAI 包含口径不重复计；旧实现相加得 22，
+    // 断言 12 即证明双计已修），窗口解析伪造 ~/.codex/config.toml 顶层 model_context_window = 400000
+    const codexUsageCwd = path.join(tempRoot, 'codex-usage-check');
+    mkdirp(codexUsageCwd);
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: codexUsageCwd, mode: 'yolo' }));
+    const codexUsageSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === codexUsageCwd);
+    ws.send(JSON.stringify({ type: 'message', text: 'codex usage snapshot check', sessionId: codexUsageSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    const codexUsageMsg = await nextMessage(messages, ws, (msg) => msg.type === 'usage' && msg.sessionId === codexUsageSession.sessionId);
+    assert(codexUsageMsg.contextTokens === 12, `Codex usage snapshot contextTokens should be input_tokens only=12, not input+cached=22 (got ${codexUsageMsg.contextTokens})`);
+    assert(codexUsageMsg.windowTokens === 400000, `Codex usage snapshot windowTokens should resolve user config 400000 (got ${codexUsageMsg.windowTokens})`);
+    assert(codexUsageMsg.sessionId === codexUsageSession.sessionId, `Codex usage message should carry matching sessionId (got ${codexUsageMsg.sessionId})`);
+    assert(!('totalUsage' in codexUsageMsg), 'Codex usage message must not carry legacy accumulated totalUsage field');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === codexUsageSession.sessionId);
+    const storedCodexUsageSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${codexUsageSession.sessionId}.json`), 'utf8'));
+    assert(storedCodexUsageSession.contextUsage?.contextTokens === 12 && storedCodexUsageSession.contextUsage?.windowTokens === 400000, 'Codex session should persist contextUsage watermark snapshot');
     const claudeSessionIdBeforeMode = storedClaudeSession.claudeSessionId;
 
     // Mode switching must not clear Claude runtime session id (resume should keep context).
@@ -896,7 +969,7 @@ async function main() {
     ws.send(JSON.stringify({ type: 'import_codex_session', threadId: importedCodexItem.threadId, rolloutPath: importedCodexItem.rolloutPath }));
     const importedCodex = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.title === 'Codex import prompt');
     assert(importedCodex.messages?.[0]?.content === 'Codex import prompt', 'Codex import kept wrapper instructions');
-    assert(importedCodex.totalUsage?.inputTokens === 20, 'Codex import usage parse failed');
+    assert(importedCodex.contextUsage == null, 'Codex import must not carry usage (v1.6.1 水位快照仅由运行期任务完成点产生)');
 
     const importedSessionId = importedCodex.sessionId;
     ws.send(JSON.stringify({ type: 'delete_session', sessionId: importedSessionId }));

@@ -35,7 +35,7 @@
     { cmd: '/clear', desc: '清除当前会话' },
     { cmd: '/model', desc: '查看/切换模型' },
     { cmd: '/mode', desc: '查看/切换权限模式' },
-    { cmd: '/cost', desc: '查看会话费用' },
+    { cmd: '/cost', desc: '查看会话 Token 用量' },
     { cmd: '/compact', desc: '压缩上下文' },
     { cmd: '/init', desc: '生成/更新 Agent 指南文件' },
     { cmd: '/goal', desc: '建立并持续维护目标' },
@@ -169,17 +169,18 @@
   const chatAgentMenu = $('#chat-agent-menu');
   const chatRuntimeState = $('#chat-runtime-state');
   const chatCwd = $('#chat-cwd');
-  const costDisplay = $('#cost-display');
+  const usageDisplay = $('#usage-display');
   const attachmentTray = $('#attachment-tray');
   const imageUploadInput = $('#image-upload-input');
+  const fileUploadInput = $('#file-upload-input');
   const attachBtn = $('#attach-btn');
+  const attachMenu = $('#attach-menu');
   const messagesDiv = $('#messages');
   const msgInput = $('#msg-input');
   const inputWrapper = msgInput.closest('.input-wrapper');
   const sendBtn = $('#send-btn');
   const abortBtn = $('#abort-btn');
   const cmdMenu = $('#cmd-menu');
-  const modeSelect = $('#mode-select');
 
   // --- Viewport height fix for mobile browsers ---
   function setVH() {
@@ -823,7 +824,7 @@
       hasUnread: !!payload.hasUnread,
       cwd: payload.cwd || null,
       totalCost: typeof payload.totalCost === 'number' ? payload.totalCost : 0,
-      totalUsage: payload.totalUsage ? deepClone(payload.totalUsage) : null,
+      contextUsage: payload.contextUsage ? deepClone(payload.contextUsage) : null,
       updated: payload.updated || null,
       isRunning: !!payload.isRunning,
       // 运行中会话的实时全量输出（仅服务端 session_info 携带；断线补齐守卫消费，见 case 'session_info'）
@@ -1020,7 +1021,7 @@
       // 仅依赖持久 token：无 token 直接拒绝，不再用密码重登
       const savedToken = localStorage.getItem('cc-web-token');
       if (!savedToken) {
-        reject(new Error('登录已过期，请重新登录后再上传图片。'));
+        reject(new Error('登录已过期，请重新登录后再上传附件。'));
         return;
       }
       const timeout = setTimeout(() => {
@@ -1038,7 +1039,7 @@
       };
       const onFailed = () => {
         cleanup();
-        reject(new Error('登录已过期，请重新登录后再上传图片。'));
+        reject(new Error('登录已过期，请重新登录后再上传附件。'));
       };
       document.addEventListener('cc-web-auth-restored', onRestored);
       document.addEventListener('cc-web-auth-failed', onFailed);
@@ -1054,7 +1055,11 @@
     if (!Array.isArray(attachments) || attachments.length === 0) return '';
     const labels = attachments.map((attachment) => {
       const stateSuffix = attachment.storageState === 'expired' ? '（已过期）' : '';
-      const name = escapeHtml(attachment.filename || 'image');
+      const name = escapeHtml(attachment.filename || (attachment.kind === 'file' ? 'attachment' : 'image'));
+      // kind='file' 用文件徽标区分（历史旧附件无 kind 时按图片渲染）
+      if (attachment.kind === 'file') {
+        return `<span class="msg-attachment-label file" title="${name}">📄 文件: ${name}${stateSuffix}</span>`;
+      }
       return `<span class="msg-attachment-label">图片: ${name}${stateSuffix}</span>`;
     }).join('');
     return `<div class="msg-attachments${options.compact ? ' compact' : ''}">${labels}</div>`;
@@ -1070,25 +1075,25 @@
     }
     attachmentTray.hidden = false;
     const uploadingHtml = uploadingAttachments.map((attachment) => `
-      <div class="attachment-chip uploading">
+      <div class="attachment-chip uploading${attachment.kind === 'file' ? ' file' : ''}">
         <div class="attachment-chip-meta">
-          <span class="attachment-chip-name">${escapeHtml(attachment.filename || 'image')}</span>
+          <span class="attachment-chip-name">${attachment.kind === 'file' ? '📄 ' : ''}${escapeHtml(attachment.filename || 'attachment')}</span>
           <span class="attachment-chip-note">上传中 · ${formatFileSize(attachment.size)}</span>
         </div>
       </div>
     `).join('');
     const readyHtml = pendingAttachments.map((attachment, index) => `
-      <div class="attachment-chip" data-index="${index}">
+      <div class="attachment-chip${attachment.kind === 'file' ? ' file' : ''}" data-index="${index}">
         <div class="attachment-chip-meta">
-          <span class="attachment-chip-name">${escapeHtml(attachment.filename || 'image')}</span>
-          <span class="attachment-chip-note">${formatFileSize(attachment.size)} · 将随下一条消息发送</span>
+          <span class="attachment-chip-name">${attachment.kind === 'file' ? '📄 ' : ''}${escapeHtml(attachment.filename || 'attachment')}</span>
+          <span class="attachment-chip-note">${attachment.kind === 'file' ? '文件' : '图片'} · ${formatFileSize(attachment.size)} · 将随下一条消息发送</span>
         </div>
         <button class="attachment-chip-remove" type="button" data-index="${index}" title="移除">✕</button>
       </div>
     `).join('');
     const noteHtml = [
       uploadingAttachments.length > 0
-        ? '<div class="attachment-tray-note">图片上传中，此时发送不会包含尚未完成的图片。</div>'
+        ? '<div class="attachment-tray-note">附件上传中，此时发送不会包含尚未完成的上传。</div>'
         : '',
     ].join('');
     attachmentTray.innerHTML = `${uploadingHtml}${readyHtml}${noteHtml}`;
@@ -1104,12 +1109,14 @@
     syncAttachmentActions();
   }
 
-  async function uploadImageFile(file) {
+  // 通用附件上传（v1.6.0）：图片与普通文件共用同一接口，服务端按
+  // Content-Type（图片 MIME 白名单）或 X-Filename 扩展名（文件白名单）判定 kind
+  async function uploadAttachmentFile(file) {
     await ensureAuthenticatedWs();
     const headers = {
       'Authorization': `Bearer ${authToken}`,
       'Content-Type': file.type || 'application/octet-stream',
-      'X-Filename': encodeURIComponent(file.name || 'image'),
+      'X-Filename': encodeURIComponent(file.name || 'attachment'),
     };
     const response = await fetch('/api/attachments', {
       method: 'POST',
@@ -1124,10 +1131,10 @@
       data = null;
     }
     if (response.status === 401) {
-      throw new Error('登录状态已失效，请刷新页面后重新登录再上传图片。');
+      throw new Error('登录状态已失效，请刷新页面后重新登录再上传附件。');
     }
     if (response.status === 413) {
-      throw new Error('图片大小超过当前上传限制，请压缩到 10MB 以内后重试。');
+      throw new Error('附件大小超过当前上传限制，请压缩到 10MB 以内后重试。');
     }
     if (!response.ok || !data?.ok) {
       throw new Error(data?.message || `上传失败 (${response.status})`);
@@ -1135,42 +1142,49 @@
     return data.attachment;
   }
 
-  async function handleSelectedImageFiles(fileList) {
-    const files = Array.from(fileList || []).filter((file) => file && /^image\//.test(file.type || ''));
+  // 统一入口：按 MIME 分流——image/* 走前端压缩管线后上传（现状不动），
+  // 其他文件跳过压缩直传；图片与文件混合计数，每条消息上限 4 个
+  async function handleSelectedFiles(fileList) {
+    const files = Array.from(fileList || []).filter(Boolean);
     if (!files.length) return;
     if (pendingAttachments.length + files.length > 4) {
-      appendError('单条消息最多附带 4 张图片。');
+      appendError('单条消息最多附带 4 个附件（图片与文件混合计数）。');
       return;
     }
     const batch = files.map((file, index) => ({
       id: `${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
-      filename: file.name || 'image',
+      filename: file.name || 'attachment',
       size: file.size || 0,
+      kind: /^image\//.test(file.type || '') ? 'image' : 'file',
     }));
     uploadingAttachments.push(...batch);
     renderPendingAttachments();
     try {
       const results = await Promise.allSettled(files.map(async (file) => {
-        const optimized = await compressImageFile(file);
-        return uploadImageFile(optimized);
+        if (/^image\//.test(file.type || '')) {
+          const optimized = await compressImageFile(file);
+          return uploadAttachmentFile(optimized);
+        }
+        return uploadAttachmentFile(file);
       }));
       const errors = [];
       for (const result of results) {
         if (result.status === 'fulfilled') {
           pendingAttachments.push(result.value);
         } else {
-          errors.push(result.reason?.message || '图片上传失败');
+          errors.push(result.reason?.message || '附件上传失败');
         }
       }
       if (errors.length > 0) {
         appendError(errors[0]);
       }
     } catch (err) {
-      appendError(err.message || '图片上传失败');
+      appendError(err.message || '附件上传失败');
     } finally {
       uploadingAttachments = uploadingAttachments.filter((item) => !batch.some((entry) => entry.id === item.id));
       renderPendingAttachments();
       if (imageUploadInput) imageUploadInput.value = '';
+      if (fileUploadInput) fileUploadInput.value = '';
     }
   }
 
@@ -1227,7 +1241,6 @@
     currentAgent = normalizeAgent(agent);
     localStorage.setItem('cc-web-agent', currentAgent);
     currentMode = localStorage.getItem(getAgentModeStorageKey(currentAgent)) || 'yolo';
-    modeSelect.value = currentMode;
     updateAgentScopedUI();
   }
 
@@ -1242,6 +1255,20 @@
     const willOpen = chatAgentMenu.hidden;
     chatAgentMenu.hidden = !willOpen;
     chatAgentBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+  }
+
+  // 上传菜单（上传图片 / 上传文件）：开关行为与 agent 菜单同族
+  function closeAttachMenu() {
+    if (!attachMenu) return;
+    attachMenu.hidden = true;
+    if (attachBtn) attachBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function toggleAttachMenu() {
+    if (!attachMenu || !attachBtn) return;
+    const willOpen = attachMenu.hidden;
+    attachMenu.hidden = !willOpen;
+    attachBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
   }
 
   function resetChatView(agent) {
@@ -1288,7 +1315,6 @@
     updateCwdBadge();
     if (snapshot.mode && MODE_LABELS[snapshot.mode]) {
       currentMode = snapshot.mode;
-      modeSelect.value = currentMode;
       localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
     }
     currentModel = snapshot.model || '';
@@ -1345,7 +1371,6 @@
     sessionLoadingOverlay.setAttribute('aria-hidden', showOverlay ? 'false' : 'true');
     sessionLoadingLabel.textContent = loading ? (options.label || getSessionLoadLabel(sessionId)) : '正在整理消息与上下文…';
     msgInput.disabled = showOverlay;
-    modeSelect.disabled = showOverlay;
     sendBtn.disabled = showOverlay;
     abortBtn.disabled = showOverlay;
     if (showOverlay && document.activeElement instanceof HTMLElement) {
@@ -1425,21 +1450,61 @@
     beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: options.force === true, label: options.label });
   }
 
-  function setStatsDisplay(msg) {
-    if (currentAgent === 'codex' && msg && msg.totalUsage) {
-      const usage = msg.totalUsage;
-      if ((usage.inputTokens || 0) > 0 || (usage.outputTokens || 0) > 0) {
-        const cacheText = usage.cachedInputTokens ? ` · cache ${usage.cachedInputTokens}` : '';
-        costDisplay.textContent = `in ${usage.inputTokens} · out ${usage.outputTokens}${cacheText}`;
-        return;
-      }
+  // 顶栏上下文窗口水位胶囊（v1.6.1）：默认只显示百分比（如 47%），点击在百分比与
+  // 94K/200K 式详情间切换（状态存内存）；水位 >75% 加 warn 色、>90% 加 danger 色；
+  // 无数据显示 —。彻底不显示累计消耗。
+  // K/M 自写格式化：<1M 取千位四舍五入的 K（94000 → 94K，3780 → 3.8K），≥1M 取 M
+  function formatTokensCompact(tokens) {
+    const n = Number(tokens);
+    if (!Number.isFinite(n) || n < 0) return '—';
+    if (n >= 1_000_000) {
+      const m = n / 1_000_000;
+      return `${m >= 100 ? Math.round(m) : Math.round(m * 10) / 10}M`;
     }
-    if (msg && typeof msg.totalCost === 'number' && msg.totalCost > 0) {
-      costDisplay.textContent = `$${msg.totalCost.toFixed(4)}`;
+    if (n >= 1_000) {
+      const k = n / 1_000;
+      return `${k >= 100 ? Math.round(k) : Math.round(k * 10) / 10}K`;
+    }
+    return String(Math.round(n));
+  }
+
+  let usageDetailShown = false;   // 百分比 ⇄ 详情 切换状态（仅内存，不持久化）
+  let lastContextUsage = null;    // 最近一次收到的水位快照（点击切换时重渲染用）
+
+  function renderUsageDisplay() {
+    const usage = lastContextUsage;
+    const contextTokens = Number(usage?.contextTokens);
+    const windowTokens = Number(usage?.windowTokens);
+    const hasData = usage
+      && Number.isFinite(contextTokens) && contextTokens > 0
+      && Number.isFinite(windowTokens) && windowTokens > 0;
+    usageDisplay.classList.remove('warn', 'danger');
+    if (!hasData) {
+      usageDisplay.textContent = '—';
+      usageDisplay.title = '上下文窗口水位';
+      usageDisplay.hidden = false;
       return;
     }
-    costDisplay.textContent = '';
+    const pct = Math.floor((contextTokens / windowTokens) * 100);
+    usageDisplay.textContent = usageDetailShown
+      ? `${formatTokensCompact(contextTokens)}/${formatTokensCompact(windowTokens)}`
+      : `${pct}%`;
+    usageDisplay.title = `上下文窗口水位 ${pct}%（点击切换详情）`;
+    if (pct > 90) usageDisplay.classList.add('danger');
+    else if (pct > 75) usageDisplay.classList.add('warn');
+    usageDisplay.hidden = false;
   }
+
+  function setStatsDisplay(msg) {
+    lastContextUsage = msg?.contextUsage || null;
+    renderUsageDisplay();
+  }
+
+  // 点击水位胶囊：百分比 ⇄ 94K/200K 式详情切换（状态仅存内存）
+  usageDisplay.addEventListener('click', () => {
+    usageDetailShown = !usageDetailShown;
+    renderUsageDisplay();
+  });
 
 	  function _splitCodexThinkingModel(model) {
 	    const raw = String(model || '').trim();
@@ -1878,18 +1943,26 @@
         break;
 
       case 'cost':
-        costDisplay.textContent = `$${msg.costUsd.toFixed(4)}`;
-        if (currentSessionId) {
+        // v1.6.0 起顶栏不再显示美元费用，仅保留会话快照内部累计（totalCost，不展示）
+        if (currentSessionId && typeof msg.costUsd === 'number') {
           updateCachedSession(currentSessionId, (snapshot) => { snapshot.totalCost = msg.costUsd; });
         }
         break;
 
       case 'usage':
-        if (msg.totalUsage) {
-          const cacheText = msg.totalUsage.cachedInputTokens ? ` · cache ${msg.totalUsage.cachedInputTokens}` : '';
-          costDisplay.textContent = `in ${msg.totalUsage.inputTokens} · out ${msg.totalUsage.outputTokens}${cacheText}`;
+        // v1.6.1 水位快照：contextTokens/windowTokens（不累计）。
+        // 多会话并发时服务端按 sessionId 定向；非当前查看会话的快照一律丢弃，
+        // 防止把别的会话的水位刷到当前会话显示并污染其缓存快照。
+        if (msg.sessionId && msg.sessionId === currentSessionId
+          && (msg.contextUsage
+            || (Number.isFinite(Number(msg.contextTokens)) && Number.isFinite(Number(msg.windowTokens))))) {
+          const contextUsage = msg.contextUsage || {
+            contextTokens: msg.contextTokens,
+            windowTokens: msg.windowTokens,
+          };
+          setStatsDisplay({ contextUsage });
           if (currentSessionId) {
-            updateCachedSession(currentSessionId, (snapshot) => { snapshot.totalUsage = deepClone(msg.totalUsage); });
+            updateCachedSession(currentSessionId, (snapshot) => { snapshot.contextUsage = deepClone(contextUsage); });
           }
         }
         break;
@@ -1927,7 +2000,6 @@
       case 'mode_changed':
         if (msg.mode && MODE_LABELS[msg.mode]) {
           currentMode = msg.mode;
-          modeSelect.value = currentMode;
           localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
           if (currentSessionId) {
             updateCachedSession(currentSessionId, (snapshot) => { snapshot.mode = msg.mode; });
@@ -3557,10 +3629,12 @@
   function showModePicker() {
     showOptionPicker('选择权限模式', MODE_PICKER_OPTIONS, currentMode, (value) => {
       currentMode = value;
-      modeSelect.value = currentMode;
       localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
       if (currentSessionId) {
         send({ type: 'set_mode', sessionId: currentSessionId, mode: currentMode });
+      }
+      if (currentMode === 'default') {
+        appendSystemMessage('⚠ 由于项目设计与 CLI 原生逻辑不同，默认模式的授权申请功能暂未实现，建议搭配 Plan 或 YOLO 模式使用。');
       }
     });
   }
@@ -3608,7 +3682,7 @@
     // Claude receives its native command; Codex receives a compatible goal-creation prompt.
     if (text.startsWith('/') && !/^\/goal(?:\s|$)/i.test(text)) {
       if (pendingAttachments.length > 0) {
-        appendError('命令消息暂不支持附带图片，请先移除图片或发送普通消息。');
+        appendError('命令消息暂不支持附带附件，请先移除附件或发送普通消息。');
         return;
       }
       // /model without argument → show interactive picker
@@ -3727,6 +3801,11 @@
         e.target !== chatAgentBtn) {
       closeAgentMenu();
     }
+    if (attachMenu && !attachMenu.hidden &&
+        !attachMenu.contains(e.target) &&
+        e.target !== attachBtn) {
+      closeAttachMenu();
+    }
   });
   sendBtn.addEventListener('click', sendMessage);
   abortBtn.addEventListener('click', () => send({ type: 'abort' }));
@@ -3744,10 +3823,31 @@
       send({ type: 'abort' });
     });
   }
-  if (attachBtn && imageUploadInput) {
-    attachBtn.addEventListener('click', () => imageUploadInput.click());
+  if (attachBtn) {
+    // 回形针按钮：弹出「上传图片 / 上传文件」菜单，菜单项分别触发对应文件选择器
+    attachBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleAttachMenu();
+    });
+  }
+  if (imageUploadInput) {
     imageUploadInput.addEventListener('change', () => {
-      handleSelectedImageFiles(imageUploadInput.files);
+      handleSelectedFiles(imageUploadInput.files);
+    });
+  }
+  if (fileUploadInput) {
+    fileUploadInput.addEventListener('change', () => {
+      handleSelectedFiles(fileUploadInput.files);
+    });
+  }
+  if (attachMenu) {
+    attachMenu.querySelectorAll('.attach-option').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeAttachMenu();
+        const target = btn.dataset.kind === 'file' ? fileUploadInput : imageUploadInput;
+        if (target) target.click();
+      });
     });
   }
   if (inputWrapper) {
@@ -3762,22 +3862,13 @@
     inputWrapper.addEventListener('drop', (e) => {
       e.preventDefault();
       inputWrapper.classList.remove('drag-active');
-      handleSelectedImageFiles(e.dataTransfer?.files);
+      // 拖拽自动分流（handleSelectedFiles 内按 MIME 判定）：图片走压缩管线，其他直传
+      handleSelectedFiles(e.dataTransfer?.files);
     });
   }
 
-  // Mode selector
-  modeSelect.value = currentMode;
-  modeSelect.addEventListener('change', () => {
-    currentMode = modeSelect.value;
-    localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
-    if (currentSessionId) {
-      send({ type: 'set_mode', sessionId: currentSessionId, mode: currentMode });
-    }
-    if (currentMode === 'default') {
-      appendSystemMessage('⚠ 由于项目设计与 CLI 原生逻辑不同，默认模式的授权申请功能暂未实现，建议搭配 Plan 或 YOLO 模式使用。');
-    }
-  });
+  // 权限模式切换入口已收敛到 /mode 命令 picker（原顶栏下拉于 v1.6.0 移除，
+  // 换位显示 token 用量胶囊）；default 模式的提示随 picker 回调发出
 
   msgInput.addEventListener('input', () => {
     autoResize();
@@ -3791,6 +3882,11 @@
   });
 
   msgInput.addEventListener('keydown', (e) => {
+    // Escape 优先关闭上传菜单
+    if (e.key === 'Escape' && attachMenu && !attachMenu.hidden) {
+      closeAttachMenu();
+      return;
+    }
     // Command menu navigation
     if (!cmdMenu.hidden) {
       if (e.key === 'ArrowDown') { e.preventDefault(); navigateCmdMenu(1); return; }
@@ -3818,6 +3914,7 @@
   });
 
   msgInput.addEventListener('paste', (e) => {
+    // 粘贴保持仅图片（现状不动）
     const items = Array.from(e.clipboardData?.items || []);
     const files = items
       .filter((item) => item.kind === 'file' && /^image\//.test(item.type || ''))
@@ -3825,7 +3922,7 @@
       .filter(Boolean);
     if (files.length > 0) {
       e.preventDefault();
-      handleSelectedImageFiles(files);
+      handleSelectedFiles(files);
     }
   });
 

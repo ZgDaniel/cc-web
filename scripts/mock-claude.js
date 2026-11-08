@@ -27,6 +27,16 @@ function readStdin() {
 
   process.stdout.write(`${JSON.stringify({ type: 'system', session_id: sessionId })}\n`);
 
+  // 真实 Claude CLI stream-json 的 result 事件带 usage（四字段均可能缺失），
+  // 这里给非零值，保证回归链路能走到 lib/agent-runtime.js 的水位快照逻辑
+  // （contextTokens = 120 + 3400 + 260 = 3780，regression 断言以此为准）
+  const resultUsage = {
+    input_tokens: 120,
+    cache_read_input_tokens: 3400,
+    cache_creation_input_tokens: 260,
+    output_tokens: 45,
+  };
+
   // Resolve effectiveInput so /goal detection works for both text stdin and stream-json input.
   let streamPayload = null;
   let effectiveInput = input;
@@ -70,6 +80,7 @@ function readStdin() {
       type: 'result',
       session_id: sessionId,
       total_cost_usd: 0,
+      usage: resultUsage,
     })}\n`);
     return;
   }
@@ -102,6 +113,7 @@ function readStdin() {
       type: 'result',
       session_id: sessionId,
       total_cost_usd: 0,
+      usage: resultUsage,
     })}\n`);
     return;
   }
@@ -129,5 +141,6 @@ function readStdin() {
     type: 'result',
     session_id: sessionId,
     total_cost_usd: 0,
+    usage: resultUsage,
   })}\n`);
 })();

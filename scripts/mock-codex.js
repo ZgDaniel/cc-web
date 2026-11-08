@@ -102,8 +102,10 @@ function readStdin() {
     try { fs.unlinkSync(statePath); } catch {}
   }
 
+  // usage 采用真实包含口径：cached_input_tokens 是 input_tokens 的子集（10 ⊂ 12），
+  // 水位快照只取 input_tokens = 12（旧实现相加得 22，可区分双计缺陷）
   process.stdout.write(`${JSON.stringify({
     type: 'turn.completed',
-    usage: { input_tokens: 10, cached_input_tokens: 2, output_tokens: 5 },
+    usage: { input_tokens: 12, cached_input_tokens: 10, output_tokens: 5 },
   })}\n`);
 })();

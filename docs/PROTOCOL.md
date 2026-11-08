@@ -11,7 +11,7 @@
 | 类型 | 用途 |
 |---|---|
 | `auth` | 鉴权握手（独立分支，在 WS `message` 事件回调顶部，switch 之前）。负载可选 `password` 或 `token`，两者其一即可 |
-| `message` | 用户消息（含文本/图片/斜杠命令） |
+| `message` | 用户消息（含文本/附件/斜杠命令）。`attachments` 为上传附件 id 数组（≤4 个，图片与文件混合计数），发送时由服务端按附件库 meta 还原 `kind: 'image' \| 'file'`；`kind='file'` 附件会被复制到会话 cwd 并在喂给 CLI 的文本末尾追加「已保存至 <绝对路径>」说明（会话历史保持原始文本不混入说明文字） |
 | `abort` | 中断当前生成（**服务端 kill 整个进程组**，详见 [RUNTIME.md](./RUNTIME.md)） |
 | `new_session` | 新建会话（local/remote） |
 | `load_session` | 加载会话 |
@@ -55,7 +55,8 @@
 | `mode_changed` / `model_changed` | 模式/模型切换通知 |
 | `text_delta` | 文本流增量（**经 DOMPurify sanitize 后注入 DOM**，详见 [ARCHITECTURE.md](./ARCHITECTURE.md)） |
 | `tool_start` / `tool_end` | 工具调用起止 |
-| `cost` / `usage` | 成本/用量更新 |
+| `cost` | 美元成本更新（v1.6.0 起前端不再显示美元，仅内部累计） |
+| `usage` | 上下文窗口水位快照 `{ sessionId, contextTokens, windowTokens }`（单事件，不累计）。`sessionId` 标识水位所属会话，前端仅在该值与当前查看会话一致时采纳（多会话并发防串染）。Claude 取 result 事件 `usage` 的 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`（Anthropic 并列口径），Codex 取 `turn.completed` `usage` 的 `input_tokens`（OpenAI 包含口径：`cached_input_tokens` 是 `input_tokens` 的子集，不重复相加）；窗口大小按两 CLI 自身配置解析（Claude 读 `~/.claude/settings.json` 的 `env.CLAUDE_CODE_MAX_CONTEXT_TOKENS`，Codex 读 `~/.codex/config.toml` 顶层 `model_context_window`），缺省 200K / 272K |
 | `done` | 生成完成 |
 | `background_done` | 后台完成（推送通知触发） |
 | `notify_config` / `notify_test_result` | 通知配置回执 |
@@ -119,7 +120,7 @@ compact 相关提示（`kind: 'compact'`，走已有 system_message 默认渲染
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `POST` | `/api/attachments` | 图片上传（10MB 上限） |
+| `POST` | `/api/attachments` | 附件上传（图片 MIME + 文件扩展名双白名单，10MB 上限） |
 | `DELETE` | `/api/attachments/:id` | 删除附件 |
 | `GET` | `*` | 静态文件（`public/`，含 SPA fallback，路径校验 `startsWith(PUBLIC_DIR)`） |
 
@@ -153,9 +154,14 @@ compact 相关提示（`kind: 'compact'`，走已有 system_message 默认渲染
 **上传协议**（非 multipart）：
 
 - `POST /api/attachments`
-- Header：`Authorization: Bearer <token>` + `Content-Type: image/png|jpeg|webp|gif` + `X-Filename: <原始文件名>`
-- Body：**原始图片字节流**（直接 `req.on('data')` 流式收集，10MB 上限）
-- 落盘：`sessions/_attachments/<uuid>.<ext>`（数据文件）+ `sessions/_attachments/<uuid>.json`（元数据）
+- Header：`Authorization: Bearer <token>` + `Content-Type` + `X-Filename: <原始文件名>`
+- Body：**原始字节流**（直接 `req.on('data')` 流式收集，10MB 上限）
+- **kind 双路判定**（v1.6.0）：
+  - `Content-Type` 命中图片 MIME 白名单（`image/png|jpeg|webp|gif`）→ `kind: 'image'`，沿用图片管线（stream-json base64 block / Codex `--image`）
+  - 否则 `X-Filename` 扩展名命中文件扩展名白名单 → `kind: 'file'`。白名单：文档（pdf/doc/docx/xls/xlsx/ppt/pptx/txt/md/csv/tsv/json/log/xml/yaml/yml/ini/conf/toml/html/htm）+ 代码（js/mjs/ts/jsx/tsx/py/go/rs/java/c/h/cpp/hpp/cc/cs/php/rb/kt/swift/sql/css/vue/svelte）+ 压缩包（zip/tar/gz/tgz/bz2/xz/7z/rar）；exe/bat/sh/svg 等可执行与风险类一律不在名单内
+  - 两者皆非 → `415` 拒绝
+- `kind='file'` 的发送链路：附件复制到会话 cwd（basename sanitize + 重名 `-1/-2` 序号），prompt 末尾追加每文件一行「已保存至 <绝对路径>」说明（SSH remote 会话额外提示可 scp 到 remoteCwd；复制失败降级为附件库本地路径，7 天 TTL）
+- 落盘：`sessions/_attachments/<uuid>.<ext>`（数据文件）+ `sessions/_attachments/<uuid>.json`（元数据，含 `kind: 'image' | 'file'`）
 - 返回：`{ ok, id, kind, filename, ... }`
 
 **删除**：`DELETE /api/attachments/:id` → 移除数据文件 + 元数据文件。
@@ -180,7 +186,7 @@ compact 相关提示（`kind: 'compact'`，走已有 system_message 默认渲染
 | `/clear` | 清空当前会话消息 |
 | `/mode` | 切换 permissionMode |
 | `/model` | 查看/切换 Claude 模型 |
-| `/cost` | 显示累计成本 |
+| `/cost` | 显示当前上下文水位 `X / 窗口 Y（Z%）`（v1.6.1 起为水位快照，不累计；数据不可用时如实提示"暂无水位数据（任务完成后才有）"） |
 | `/compact` | 执行原生上下文压缩 |
 | `/init` | 分析项目并生成/更新 Agent 指南文件 |
 | `/loop <间隔> <提示>` | 定期执行提示；支持 `s`、`m`、`h`（1 秒–24 小时） |

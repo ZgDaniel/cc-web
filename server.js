@@ -30,7 +30,7 @@ const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { createAgentRuntime } = require('./lib/agent-runtime');
-const { estimateClaudeContextUsage, shouldPreemptiveCompact } = require('./lib/context-usage');
+const { estimateClaudeContextUsage, shouldPreemptiveCompact, resolveClaudeContextWindow, resolveCodexContextWindow, readCodexModelContextWindow } = require('./lib/context-usage');
 const { createAuthStore } = require('./lib/auth');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
 const { createClientIpResolver } = require('./lib/client-ip');
@@ -56,6 +56,18 @@ const ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const MAX_MESSAGE_ATTACHMENTS = 4;
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+// 通用文件上传（v1.6.0）：非图片附件按扩展名白名单放行（取最后一段扩展名、小写比较，
+// tar.gz 经 gz 命中、tgz 单列；可执行/脚本/风险类不在名单内，白名单外一律 415 拒绝）
+const FILE_EXTENSION_WHITELIST = new Set([
+  // 文档
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'md', 'csv', 'tsv',
+  'json', 'log', 'xml', 'yaml', 'yml', 'ini', 'conf', 'toml', 'html', 'htm',
+  // 代码
+  'js', 'mjs', 'ts', 'jsx', 'tsx', 'py', 'go', 'rs', 'java', 'c', 'h', 'cpp',
+  'hpp', 'cc', 'cs', 'php', 'rb', 'kt', 'swift', 'sql', 'css', 'vue', 'svelte',
+  // 压缩包
+  'zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar',
+]);
 const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
 const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
 const TOKENS_PATH = path.join(CONFIG_DIR, 'tokens.json');
@@ -685,10 +697,10 @@ const activeProcesses = new Map();
 const wsSessionMap = new Map();
 
 // Default fallback MODEL_MAP (overridden by model config at runtime)
-// opus/sonnet use [1m] suffix to enable 1M context window by default
+// v1.6.1 起模型名原样传递，不再追加 [1m] 后缀（窗口大小由 lib/context-usage.js 按 CLI 配置解析）
 let MODEL_MAP = {
-  opus: 'claude-opus-4-6[1m]',
-  sonnet: 'claude-sonnet-4-6[1m]',
+  opus: 'claude-opus-4-6',
+  sonnet: 'claude-sonnet-4-6',
   haiku: 'claude-haiku-4-5-20251001',
 };
 
@@ -1098,11 +1110,17 @@ function prepareCodexCustomRuntime(config, session = null) {
   fs.mkdirSync(homeDir, { recursive: true });
   const modelSpec = splitCodexModelSpec(activeProfile.model || DEFAULT_CODEX_MODEL);
   const runtimeApiBase = normalizeCodexRuntimeApiBase(activeProfile.apiBase);
+  // 继承用户 ~/.codex/config.toml 顶层 model_context_window（C：存量 bug 修复）。
+  // 仅在用户显式配置时写入副本；无值不写该键，让 Codex 按自身内置表回退。
+  const userContextWindow = readCodexModelContextWindow(
+    path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'config.toml')
+  );
   const configToml = [
     'preferred_auth_method = "apikey"',
     'model_provider = "openai_compat"',
     ...(modelSpec.base ? [`model = ${tomlString(modelSpec.base)}`] : []),
     ...(modelSpec.reasoning ? [`model_reasoning_effort = ${tomlString(modelSpec.reasoning)}`] : []),
+    ...(userContextWindow ? [`model_context_window = ${userContextWindow}`] : []),
     '',
     '[model_providers.openai_compat]',
     `name = ${tomlString(activeProfile.name || 'OpenAI Compat')}`,
@@ -1136,12 +1154,12 @@ function loadClaudeJsonModelMap() {
     const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
     const env = raw?.env || {};
     const map = {};
-    // Append [1m] to opus/sonnet for 1M context window; haiku uses model name as-is
-    if (env.ANTHROPIC_DEFAULT_OPUS_MODEL) map.opus = env.ANTHROPIC_DEFAULT_OPUS_MODEL + '[1m]';
-    if (env.ANTHROPIC_DEFAULT_SONNET_MODEL) map.sonnet = env.ANTHROPIC_DEFAULT_SONNET_MODEL + '[1m]';
+    // v1.6.1 起模型名原样传递，不追加 [1m]（窗口大小按 CLI 自身配置解析）
+    if (env.ANTHROPIC_DEFAULT_OPUS_MODEL) map.opus = env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+    if (env.ANTHROPIC_DEFAULT_SONNET_MODEL) map.sonnet = env.ANTHROPIC_DEFAULT_SONNET_MODEL;
     if (env.ANTHROPIC_DEFAULT_HAIKU_MODEL) map.haiku = env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
     // Fallback: ANTHROPIC_MODEL maps to opus slot
-    if (!map.opus && env.ANTHROPIC_MODEL) map.opus = env.ANTHROPIC_MODEL + '[1m]';
+    if (!map.opus && env.ANTHROPIC_MODEL) map.opus = env.ANTHROPIC_MODEL;
     return Object.keys(map).length > 0 ? map : null;
   } catch {
     return null;
@@ -1183,8 +1201,9 @@ function applyModelConfig() {
   if (config.mode === 'custom' && config.activeTemplate) {
     const tpl = (config.templates || []).find(t => t.name === config.activeTemplate);
     if (tpl) {
-      if (tpl.opusModel) MODEL_MAP.opus = tpl.opusModel.endsWith('[1m]') ? tpl.opusModel : tpl.opusModel + '[1m]';
-      if (tpl.sonnetModel) MODEL_MAP.sonnet = tpl.sonnetModel.endsWith('[1m]') ? tpl.sonnetModel : tpl.sonnetModel + '[1m]';
+      // v1.6.1 起模板模型名原样写入，不追加 [1m]
+      if (tpl.opusModel) MODEL_MAP.opus = tpl.opusModel;
+      if (tpl.sonnetModel) MODEL_MAP.sonnet = tpl.sonnetModel;
       if (tpl.haikuModel) MODEL_MAP.haiku = tpl.haikuModel;
       return;
     }
@@ -1259,6 +1278,47 @@ function extFromMime(mime) {
   }
 }
 
+// 取文件名最后一段扩展名（小写）；无扩展名 / 以点开头的隐藏文件 / 以点结尾 → ''
+function fileExtensionOf(name) {
+  const base = path.basename(String(name || '')).toLowerCase();
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0 || dot === base.length - 1) return '';
+  return base.slice(dot + 1);
+}
+
+function isAllowedFileExtension(name) {
+  return FILE_EXTENSION_WHITELIST.has(fileExtensionOf(name));
+}
+
+// 会话工作目录落盘目标名：仅取 basename、剔除路径分隔符与控制字符、限 80 字符（保留扩展名）；
+// 空名 / '.' / '..' 兜底为 attachment（防路径穿越，normalize 前的 meta 文件名已过 safeFilename，
+// 此处为第二道防线）
+function sanitizeUploadTargetName(name) {
+  let base = path.basename(String(name || ''))
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[/\\]/g, '')
+    .trim();
+  if (base.length > 80) {
+    const ext = path.extname(base);
+    base = `${base.slice(0, Math.max(1, 80 - ext.length)).trim()}${ext}`;
+  }
+  if (!base || base === '.' || base === '..') return 'attachment';
+  return base;
+}
+
+// 会话工作目录重名冲突自动加 -1/-2 序号（保留扩展名）；999 次仍冲突用时间戳兜底
+function reserveUniqueTargetPath(dir, name) {
+  let candidate = path.join(dir, name);
+  if (!fs.existsSync(candidate)) return candidate;
+  const ext = path.extname(name);
+  const stem = ext ? name.slice(0, name.length - ext.length) : name;
+  for (let i = 1; i <= 999; i++) {
+    candidate = path.join(dir, `${stem}-${i}${ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(dir, `${stem}-${Date.now()}${ext}`);
+}
+
 function loadAttachmentMeta(id) {
   try {
     return JSON.parse(fs.readFileSync(attachmentMetaPath(id), 'utf8'));
@@ -1299,11 +1359,13 @@ function normalizeMessageAttachments(attachments) {
     const meta = loadAttachmentMeta(id);
     const state = currentAttachmentState(meta);
     if (state === 'expired') removeAttachmentById(id);
+    // kind 以附件库 meta 为准（'image' | 'file'）；旧附件无 meta 时回退为 image
+    const kind = meta?.kind === 'file' ? 'file' : 'image';
     normalized.push({
       id,
-      kind: 'image',
-      filename: meta?.filename || attachment?.filename || 'image',
-      mime: meta?.mime || attachment?.mime || 'image/png',
+      kind,
+      filename: meta?.filename || attachment?.filename || (kind === 'file' ? 'attachment' : 'image'),
+      mime: meta?.mime || attachment?.mime || (kind === 'file' ? 'application/octet-stream' : 'image/png'),
       size: meta?.size || attachment?.size || 0,
       createdAt: meta?.createdAt || attachment?.createdAt || null,
       expiresAt: meta?.expiresAt || attachment?.expiresAt || null,
@@ -1378,7 +1440,7 @@ function normalizeAgent(agent) {
  * **新增字段必须在此设默认值**，否则旧 session 加载时会是 undefined。
  *
  * 当前在此设默认值的字段：agent / claudeSessionId / codexThreadId /
- * codexHomeDir / codexRuntimeKey / totalCost / totalUsage / taskMode /
+ * codexHomeDir / codexRuntimeKey / totalCost / contextUsage / taskMode /
  * sshHostId / remoteCwd / messages。
  *
  * 注意：permissionMode / hasUnread / updated **不**在此设默认值：
@@ -1399,9 +1461,8 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'codexHomeDir')) session.codexHomeDir = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'codexRuntimeKey')) session.codexRuntimeKey = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'totalCost')) session.totalCost = 0;
-  if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
-    session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
-  }
+  // v1.6.1：上下文窗口水位快照（最近一次任务完成点的 contextTokens/windowTokens，不累计）
+  if (!Object.prototype.hasOwnProperty.call(session, 'contextUsage')) session.contextUsage = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'taskMode')) session.taskMode = 'local';
   if (!Object.prototype.hasOwnProperty.call(session, 'sshHostId')) session.sshHostId = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'remoteCwd')) session.remoteCwd = '';
@@ -2291,8 +2352,11 @@ const server = http.createServer((req, res) => {
     const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
     const rawName = decodeURIComponent(String(req.headers['x-filename'] || 'image'));
     const filename = safeFilename(rawName);
-    if (!IMAGE_MIME_TYPES.has(mime)) {
-      return jsonResponse(res, 400, { ok: false, message: '仅支持 PNG/JPG/WEBP/GIF 图片' });
+    // 双路判定（v1.6.0）：Content-Type 命中图片 MIME 白名单 → image；
+    // 否则 X-Filename 扩展名命中文件白名单 → file；两者皆非 → 415 拒绝
+    const kind = IMAGE_MIME_TYPES.has(mime) ? 'image' : (isAllowedFileExtension(rawName) ? 'file' : '');
+    if (!kind) {
+      return jsonResponse(res, 415, { ok: false, message: '仅支持 PNG/JPG/WEBP/GIF 图片或白名单内的文档/代码/压缩包文件' });
     }
 
     const chunks = [];
@@ -2309,19 +2373,23 @@ const server = http.createServer((req, res) => {
     });
     req.on('end', () => {
       if (aborted) {
-        return jsonResponse(res, 413, { ok: false, message: '图片大小不能超过 10MB' });
+        return jsonResponse(res, 413, { ok: false, message: '附件大小不能超过 10MB' });
       }
       const buffer = Buffer.concat(chunks);
       if (buffer.length === 0) {
-        return jsonResponse(res, 400, { ok: false, message: '图片内容为空' });
+        return jsonResponse(res, 400, { ok: false, message: '附件内容为空' });
       }
       const id = crypto.randomUUID();
-      const ext = extFromMime(mime) || path.extname(filename) || '';
+      // 落盘扩展名：image 用 MIME 推断兜底原文件名；file 保留原文件名对应扩展（小写、限字母数字与点）
+      const rawExt = kind === 'image'
+        ? (extFromMime(mime) || path.extname(filename) || '')
+        : path.extname(rawName).toLowerCase();
+      const ext = /^\.?[a-z0-9]+(\.[a-z0-9]+)*$/.test(rawExt) ? rawExt : '';
       const dataPath = attachmentDataPath(id, ext);
       const now = new Date();
       const meta = {
         id,
-        kind: 'image',
+        kind,
         filename,
         mime,
         size: buffer.length,
@@ -2336,7 +2404,7 @@ const server = http.createServer((req, res) => {
           ok: true,
           attachment: {
             id,
-            kind: 'image',
+            kind,
             filename,
             mime,
             size: buffer.length,
@@ -2734,8 +2802,10 @@ function handleSaveModelConfig(ws, newConfig) {
   // Build reverse map from BOTH pre-save and post-save template model names:
   // - current.templates: identifies sessions created under old model names (including edited/renamed)
   // - merged.templates: keeps post-save model names in the lookup as well
-  // Include both raw and [1m]-suffixed keys: applyModelConfig() appends [1m] to
-  // opus/sonnet when storing into session.model, so we need both forms to match.
+  // [1m]-suffixed keys are legacy-compat only: versions before v1.6.1 appended [1m] to
+  // opus/sonnet when storing into session.model, so old sessions may still carry the
+  // suffix. Matching them lets the remap migrate legacy names to the current suffix-free
+  // MODEL_MAP value; no new [1m] names are ever produced here.
   const modelToTier = new Map();
   const lookupTemplates = [
     ...(Array.isArray(current.templates) ? current.templates : []),
@@ -3026,7 +3096,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           agent: getSessionAgent(session),
           cwd: session.cwd || null,
           totalCost: session.totalCost || 0,
-          totalUsage: session.totalUsage || null,
+          contextUsage: session.contextUsage || null,
           taskMode: session.taskMode || 'local',
           sshHostId: session.sshHostId || '',
           remoteCwd: session.remoteCwd || '',
@@ -3106,15 +3176,19 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
     }
 
     case '/cost': {
-      if (agent === 'codex') {
-        const usage = session?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+      // v1.6.1 起显示上下文窗口水位（最近一次任务完成点的快照，不累计）
+      const usage = session?.contextUsage;
+      const contextTokens = Number(usage?.contextTokens);
+      const windowTokens = Number(usage?.windowTokens);
+      if (usage && Number.isFinite(contextTokens) && contextTokens > 0 && Number.isFinite(windowTokens) && windowTokens > 0) {
+        const pct = Math.floor((contextTokens / windowTokens) * 100);
+        const fmt = (n) => n.toLocaleString('en-US');
         wsSend(ws, {
           type: 'system_message',
-          message: `当前会话累计 Token: 输入 ${usage.inputTokens}，缓存 ${usage.cachedInputTokens}，输出 ${usage.outputTokens}`,
+          message: `当前上下文水位: ${fmt(contextTokens)} / ${fmt(windowTokens)}（${pct}%）`,
         });
       } else {
-        const cost = session?.totalCost || 0;
-        wsSend(ws, { type: 'system_message', message: `当前会话累计费用: $${cost.toFixed(4)}` });
+        wsSend(ws, { type: 'system_message', message: '暂无水位数据（任务完成后才有）' });
       }
       break;
     }
@@ -3359,7 +3433,7 @@ function handleNewSession(ws, msg) {
     model: agent === 'codex' ? resolveDefaultCodexModel() : MODEL_MAP.opus,
     permissionMode: requestedMode,
     totalCost: 0,
-    totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    contextUsage: null,
     messages: [],
     cwd: resolvedCwd,
     taskMode,
@@ -3378,7 +3452,7 @@ function handleNewSession(ws, msg) {
     agent,
     cwd: session.cwd,
     totalCost: 0,
-    totalUsage: session.totalUsage,
+    contextUsage: session.contextUsage,
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
@@ -3458,7 +3532,7 @@ function handleLoadSession(ws, sessionId) {
     hasUnread: hadUnread,
     cwd: effectiveCwd,
     totalCost: session.totalCost || 0,
-    totalUsage: session.totalUsage || null,
+    contextUsage: session.contextUsage || null,
     historyTotal: session.messages.length,
     historyBuffered: recentMessages.length,
     historyPending: olderChunks.length > 0,
@@ -3691,13 +3765,13 @@ function handleMessage(ws, msg, options = {}) {
   const normalizedText = textValue.trim();
   const resolvedAttachments = resolveMessageAttachments(attachments);
   if (attachments.length > 0 && resolvedAttachments.length === 0) {
-    return wsSend(ws, { type: 'error', message: '图片附件已过期或不可用，请重新上传后再发送。' });
+    return wsSend(ws, { type: 'error', message: '附件已过期或不可用，请重新上传后再发送。' });
   }
   if (!normalizedText && resolvedAttachments.length === 0) return;
 
   const savedAttachments = resolvedAttachments.map((attachment) => ({
     id: attachment.id,
-    kind: 'image',
+    kind: attachment.kind,
     filename: attachment.filename,
     mime: attachment.mime,
     size: attachment.size,
@@ -3712,7 +3786,7 @@ function handleMessage(ws, msg, options = {}) {
 
   const derivedTitle = normalizedText
     ? textValue.slice(0, 60).replace(/\n/g, ' ')
-    : `图片: ${savedAttachments[0]?.filename || 'image'}`;
+    : `${savedAttachments[0]?.kind === 'file' ? '文件' : '图片'}: ${savedAttachments[0]?.filename || (savedAttachments[0]?.kind === 'file' ? 'attachment' : 'image')}`;
 
   let session;
   if (sessionId) session = loadSession(sessionId);
@@ -3731,7 +3805,7 @@ function handleMessage(ws, msg, options = {}) {
 	      model: agent === 'codex' ? resolveDefaultCodexModel() : null,
 	      permissionMode: mode || 'yolo',
 	      totalCost: 0,
-	      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+	      contextUsage: null,
 	      messages: [],
 	      cwd: resolvedCwd,
 	    };
@@ -3739,7 +3813,7 @@ function handleMessage(ws, msg, options = {}) {
   normalizeSession(session);
 
   if (normalizedText.startsWith('/') && !/^\/goal(?:\s|$)/i.test(normalizedText) && resolvedAttachments.length > 0) {
-    return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片。请先发送图片说明，再单独使用 /model 或 /mode。' });
+    return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带附件。请先发送附件说明，再单独使用 /model 或 /mode。' });
   }
 
   if (mode && ['default', 'plan', 'yolo'].includes(mode)) {
@@ -3764,14 +3838,16 @@ function handleMessage(ws, msg, options = {}) {
     try {
       const jsonlPath = locateClaudeSessionJsonl(session.claudeSessionId);
       const usageTokens = jsonlPath ? estimateClaudeContextUsage(jsonlPath) : null;
-      if (usageTokens !== null && shouldPreemptiveCompact(usageTokens, session.model, AUTOCOMPACT_PCT)) {
+      // 窗口大小唯一尺子：按 Claude Code 自身配置解析（v1.6.1 起废除模型名 [1m] 推断）
+      const windowTokens = resolveClaudeContextWindow();
+      if (usageTokens !== null && shouldPreemptiveCompact(usageTokens, windowTokens, AUTOCOMPACT_PCT)) {
         preemptCompactGuard.add(session.id);
         session.updated = new Date().toISOString();
         saveSession(session);
         plog('INFO', 'preemptive_compact', {
           sessionId: session.id.slice(0, 8),
           usageTokens,
-          windowTokens: /1m/i.test(String(session.model || '')) ? 1_000_000 : 200_000,
+          windowTokens,
           pct: AUTOCOMPACT_PCT,
           model: session.model || 'default',
         });
@@ -3823,7 +3899,7 @@ function handleMessage(ws, msg, options = {}) {
       agent: getSessionAgent(session),
       cwd: session.cwd || null,
       totalCost: session.totalCost || 0,
-      totalUsage: session.totalUsage || null,
+      contextUsage: session.contextUsage || null,
       updated: session.updated,
       hasUnread: false,
       historyPending: false,
@@ -3838,7 +3914,7 @@ function handleMessage(ws, msg, options = {}) {
   const codexGoalMatch = getSessionAgent(session) === 'codex'
     ? normalizedText.match(/^\/goal(?:\s+(.+))?$/i)
     : null;
-  const spawnText = codexGoalMatch
+  let spawnText = codexGoalMatch
     ? (codexGoalMatch[1]
       ? `Create and persist a durable goal for this thread: ${codexGoalMatch[1].trim()}\n\nWork autonomously toward this goal now. Keep the goal updated with meaningful progress, and only mark it complete when the stated condition is satisfied.`
       : 'Clear the durable goal for this thread. Confirm that it has been removed.')
@@ -3851,6 +3927,42 @@ function handleMessage(ws, msg, options = {}) {
   }
   saveSession(session);
 
+  // === 通用文件附件落盘（v1.6.0）===
+  // kind='file' 附件在发送时复制到会话工作目录（spawn cwd；保留原始文件名、重名自动加序号），
+  // 并把说明文字追加到喂给 CLI 的文本末尾——Claude 与 Codex 均靠该文字 + 工具自行读取；
+  // 会话历史 push 与消息广播（上方 textValue / savedAttachments）不混入说明文字。
+  // 复制失败降级：说明文字改用附件库本地绝对路径（7 天 TTL 内可读），不阻断发送。
+  const fileNotes = [];
+  const remoteNotes = [];
+  for (const attachment of resolvedAttachments) {
+    if (attachment.kind !== 'file') continue;
+    const targetName = sanitizeUploadTargetName(attachment.filename);
+    let savedPath = '';
+    try {
+      fs.mkdirSync(spawnSpec.cwd, { recursive: true });
+      const targetPath = reserveUniqueTargetPath(spawnSpec.cwd, targetName);
+      fs.copyFileSync(attachment.path, targetPath);
+      savedPath = targetPath;
+    } catch (err) {
+      plog('WARN', 'file_attachment_copy_fail', {
+        sessionId: currentSessionId.slice(0, 8),
+        filename: targetName,
+        error: err.message,
+      });
+    }
+    const notePath = savedPath || attachment.path;
+    const ttlSuffix = savedPath ? '' : '（临时副本，7 天内有效）';
+    fileNotes.push(`[用户上传了文件 ${targetName}，已保存至 ${notePath}${ttlSuffix}，可自行读取]`);
+    // SSH 远程会话：CLI 本地跑、文件落在本地 hostDir，提示模型可自行 scp 到 remoteCwd
+    if (session.taskMode === 'remote') {
+      remoteNotes.push(`[远程会话：文件在本地 ${notePath}，如需在远程 ${session.remoteCwd || 'SSH 默认目录'} 使用请自行传输]`);
+    }
+  }
+  if (fileNotes.length > 0) {
+    const noteBlock = remoteNotes.length > 0 ? fileNotes.concat(remoteNotes) : fileNotes;
+    spawnText = spawnText ? `${spawnText}\n\n${noteBlock.join('\n')}` : noteBlock.join('\n');
+  }
+
   // === Detached process with file-based I/O ===
   const dir = runDir(currentSessionId);
   fs.mkdirSync(dir, { recursive: true });
@@ -3859,12 +3971,15 @@ function handleMessage(ws, msg, options = {}) {
   const outputPath = path.join(dir, 'output.jsonl');
   const errorPath = path.join(dir, 'error.log');
 
-  const useStreamJson = isClaudeSession(session) && resolvedAttachments.length > 0;
+  // stream-json 仅在存在图片附件时开启（Claude 图片走 stdin base64 block）；
+  // file 类附件信息已在 spawnText 文字说明里，走普通 stdin 路径即可
+  const imageAttachments = resolvedAttachments.filter((attachment) => attachment.kind !== 'file');
+  const useStreamJson = isClaudeSession(session) && imageAttachments.length > 0;
 
   if (useStreamJson) {
     const content = [];
     if (spawnText) content.push({ type: 'text', text: spawnText });
-    for (const attachment of resolvedAttachments) {
+    for (const attachment of imageAttachments) {
       const data = fs.readFileSync(attachment.path).toString('base64');
       content.push({
         type: 'image',
@@ -4329,7 +4444,7 @@ function handleImportNativeSession(ws, msg) {
     model: existingSession?.model || null,
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
-    totalUsage: existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    contextUsage: existingSession?.contextUsage || null,
     messages,
     cwd: cwd || existingSession?.cwd || null,
   };
@@ -4345,7 +4460,7 @@ function handleImportNativeSession(ws, msg) {
     agent: getSessionAgent(session),
     cwd: session.cwd,
     totalCost: session.totalCost || 0,
-    totalUsage: session.totalUsage || null,
+    contextUsage: session.contextUsage || null,
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
@@ -4430,7 +4545,7 @@ function handleImportCodexSession(ws, msg) {
     model: existingSession?.model || null,
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
-    totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    contextUsage: existingSession?.contextUsage || null,
     messages: parsed.messages,
     cwd: parsed.meta.cwd || existingSession?.cwd || null,
   };
@@ -4447,7 +4562,7 @@ function handleImportCodexSession(ws, msg) {
     agent: getSessionAgent(session),
     cwd: session.cwd,
     totalCost: session.totalCost || 0,
-    totalUsage: session.totalUsage || null,
+    contextUsage: session.contextUsage || null,
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
