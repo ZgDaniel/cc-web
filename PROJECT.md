@@ -41,17 +41,17 @@ node --check public/app.js   # 前端语法检查
 
 ## 前后端契约红线（无 schema 驱动）
 
-- WebSocket 消息契约：客户端→服务端 31 个 type（含 auth）、服务端→客户端 30 个 type，与 server.js / public/app.js 双向 switch 完整对称
+- WebSocket 消息契约：客户端→服务端 35 个 type（含 auth）、服务端→客户端 31 个 type，与 server.js / public/app.js 双向 switch 完整对称
 - Session JSON 结构持久化在 `sessions/*.json`，字段默认值在 `normalizeSession()`（**新增字段必须设默认值**）
-- 附件 API：`POST /api/attachments` + `DELETE /api/attachments/:id`（HTTP 仅此 2 个非静态端点）
-- 斜杠命令：`/clear` `/mode` `/model` `/cost` `/compact` `/init` `/loop` `/github` `/ssh` `/help` 走 `handleSlashCommand`；**`/goal` 走 `handleMessage` 独立路径**（绕过分发器；Claude 透传原生命令，Codex 转换为目标创建/清除提示）
+- 附件 API：`POST /api/attachments` + `DELETE /api/attachments/:id`（HTTP 仅此 2 个非静态端点）。上传双白名单（图片 MIME / 文件扩展名 50 余种，单文件 10MB、单消息 ≤4 个混合计数），附件分 `kind: 'image' | 'file'` 两路——图片走既有注入管线，文件复制到会话 cwd（重名加序号）并在 prompt 末尾追加「已保存至 <绝对路径>」
+- 斜杠命令：`/clear` `/mode` `/model` `/cost` `/compact` `/init` `/loop` `/github` `/ssh` `/cf` `/help` 走 `handleSlashCommand`；**`/goal` 走 `handleMessage` 独立路径**（绕过分发器；Claude 透传原生命令，Codex 转换为目标创建/清除提示）
 - 完整契约见 [docs/PROTOCOL.md](./docs/PROTOCOL.md)
 
 ## 敏感目录（本地运行时状态，非源码真相源）
 
 - `config/` — 鉴权 / 通知 / 模板 / Codex profile / Dev 配置 / 封禁 IP
 - `sessions/` — 会话 JSON + `*-run/` 运行时输出
-- `sessions/_attachments/` — 上传的图片（原始字节 + 元数据 JSON，TTL 清理）
+- `sessions/_attachments/` — 上传的图片与文件（原始字节 + 元数据 JSON，7 天 TTL 清理）
 - `logs/` — `process.log` 进程日志（2MB 轮转）
 - `.env` — 环境变量
 
@@ -68,15 +68,16 @@ node --check public/app.js   # 前端语法检查
 
 | 文件 | 行数 | 职责 | 入口锚点（行号会随重构漂移，按函数名定位最稳） |
 |---|---|---|---|
-| `server.js` | ~4295 | 主应用 | `normalizeSession` / `FileTailer` / `handleProcessComplete` / `recoverProcesses` / WS switch / `handleSlashCommand` / `handleMessage` / `/loop` 调度（`scheduleSessionLoop` / `runSessionLoop` / `restoreSessionLoops`） |
-| `public/app.js` | ~5273 | 整个前端 | `handleServerMessage` / `flushRender` / `renderMarkdown` / `sendMessage`（含断线守卫 `isWsConnected`） / `applySessionSnapshot` |
-| `lib/agent-runtime.js` | ~545 | Claude/Codex 适配器 | `buildClaudeSpawnSpec` / `buildCodexSpawnSpec` / `processClaudeEvent` / `processCodexEvent` / `processRuntimeEvent` |
-| `lib/auth.js` | ~230 | 鉴权存储工厂（scrypt 哈希 + token 指纹 + 原子撤销） | `createAuthStore` / `hashPassword` / `verifyPassword` / `issueToken` / `loadTokens` / `revokeAllTokens` |
-| `lib/client-ip.js` | ~90 | 客户端 IP 解析（防 XFF 伪造，从右往左跳过可信代理） | `createClientIpResolver` / `resolveClientIP` / `isTrustedProxy` |
-| `lib/codex-rollouts.js` | ~242 | Codex 历史 JSONL 解析 | `parseCodexRolloutLines` / `getCodexRolloutFiles` / `parseCodexRolloutFile` |
-| `scripts/regression.js` | ~1179 | 端到端隔离测试 | 顶部模块头含完整覆盖矩阵；新增 `testAuthStoreTokenMigration` / `testXssHardening` / `testWsReconnectPreservesState` / `testRobustnessHardening` / `testClientIpResolution` / `testIpBanEnforcement` / Codex /goal 兼容 + /loop 断言 |
-| `scripts/mock-claude.js` | ~88 | mock Claude CLI | — |
-| `scripts/mock-codex.js` | ~109 | mock Codex CLI | — |
+| `server.js` | ~4712 | 主应用 | `normalizeSession` / `FileTailer` / `handleProcessComplete` / `recoverProcesses` / WS switch / `handleSlashCommand` / `handleMessage` / `/loop` 调度（`scheduleSessionLoop` / `runSessionLoop` / `restoreSessionLoops`） |
+| `public/app.js` | ~5698 | 整个前端 | `handleServerMessage` / `flushRender` / `renderMarkdown` / `sendMessage`（含断线守卫 `isWsConnected`） / `applySessionSnapshot` |
+| `lib/agent-runtime.js` | ~608 | Claude/Codex 适配器 | `buildClaudeSpawnSpec` / `buildCodexSpawnSpec` / `processClaudeEvent` / `processCodexEvent` / `processRuntimeEvent` |
+| `lib/auth.js` | ~241 | 鉴权存储工厂（scrypt 哈希 + token 指纹 + 原子撤销） | `createAuthStore` / `hashPassword` / `verifyPassword` / `issueToken` / `loadTokens` / `revokeAllTokens` |
+| `lib/client-ip.js` | ~113 | 客户端 IP 解析（防 XFF 伪造，从右往左跳过可信代理） | `createClientIpResolver` / `resolveClientIP` / `isTrustedProxy` |
+| `lib/codex-rollouts.js` | ~231 | Codex 历史 JSONL 解析 | `parseCodexRolloutLines` / `getCodexRolloutFiles` / `parseCodexRolloutFile` |
+| `lib/context-usage.js` | ~190 | 上下文水位估算（Claude JSONL 尾扫求和；窗口解析唯一尺子：Claude 读 settings.json env、Codex 读 config.toml，缺省 200K/272K，不篡改模型名） | `estimateClaudeContextUsage` / `resolveClaudeContextWindow` / `resolveCodexContextWindow` / `shouldPreemptiveCompact` |
+| `scripts/regression.js` | ~1699 | 端到端隔离测试 | 顶部模块头含完整覆盖矩阵；新增 `testAuthStoreTokenMigration` / `testXssHardening` / `testWsReconnectPreservesState` / `testRobustnessHardening` / `testClientIpResolution` / `testIpBanEnforcement` / `testContextUsage`（水位估算 + 窗口解析）/ Codex /goal 兼容 + /loop 断言 |
+| `scripts/mock-claude.js` | ~146 | mock Claude CLI | — |
+| `scripts/mock-codex.js` | ~111 | mock Codex CLI | — |
 
 ## 修改时的高风险区域
 
